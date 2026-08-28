@@ -1,0 +1,48 @@
+name: factory-tick
+
+on:
+  schedule:
+    - cron: '0 14 * * 1-5' # 14:00 UTC weekdays; the tick is idempotent, so cadence is a policy knob
+  workflow_dispatch: {}
+
+concurrency:
+  group: factory
+  cancel-in-progress: false
+
+# The tick commits telemetry back to this repo; without this the default
+# GITHUB_TOKEN is read-only and the persist step fails after the work is done.
+permissions:
+  contents: write
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm ci
+      - run: npm run check
+      # A deployment commits its factory.config.json; the upstream repo has
+      # none, so the tick is skipped there and the schedule is a no-op.
+      - if: hashFiles('factory.config.json') != ''
+        run: npm run factory -- run
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          # PAT with repo scope on the target repo; the default GITHUB_TOKEN
+          # is scoped to this repo and cannot label/PR the target repo.
+          GH_TOKEN: ${{ secrets.FACTORY_GH_TOKEN }}
+      # Telemetry lives in the runner unless persisted; commit it back so
+      # outcome reconciliation works across ticks.
+      - name: Persist telemetry
+        if: hashFiles('factory.config.json') != ''
+        run: |
+          if [[ -n "$(git status --porcelain telemetry/ 2>/dev/null)" ]]; then
+            git config user.name "conveyor"
+            git config user.email "conveyor@users.noreply.github.com"
+            git add -f telemetry/runs.jsonl
+            git commit -m "telemetry: factory tick $(date -u +%Y-%m-%dT%H:%M)"
+            git push
+          fi

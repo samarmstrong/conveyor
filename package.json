@@ -1,0 +1,19 @@
+{
+  "name": "conveyor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "An opinionated software factory: agents groom the backlog, one PR in flight, humans merge. Cursor cloud agents do the coding.",
+  "scripts": {
+    "factory": "tsx src/cli.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm run test"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0"
+  }
+}

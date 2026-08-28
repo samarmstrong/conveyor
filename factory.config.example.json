@@ -1,0 +1,27 @@
+{
+  "repo": {
+    "owner": "acme",
+    "name": "widgets",
+    "url": "https://github.com/acme/widgets"
+  },
+  "worker": {
+    "model": null,
+    "pollIntervalSeconds": 30,
+    "maxRunMinutes": 90
+  },
+  "labels": {
+    "factoryPr": "factory",
+    "issueInProgress": "factory:wip",
+    "groomed": "factory:groomed",
+    "needsWork": "factory:needs-work"
+  },
+  "groom": {
+    "maxPerTick": 5,
+    "principlesFile": "principles.md"
+  },
+  "selector": {
+    "maxCandidates": 100
+  },
+  "telemetryDir": "telemetry",
+  "staleRunHours": 24
+}
