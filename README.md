@@ -104,14 +104,20 @@ its own policy on top:
 ```bash
 npm install
 cp factory.config.example.json factory.config.json   # point it at your target repo
-$EDITOR principles.md                                 # the highest-leverage file here
+cp principles.example.md principles.md               # then rewrite it — highest-leverage file here
+$EDITOR factory.config.json                          # set groom.principlesFile to principles.md
 cp .env.example .env       # put your Cursor API key in it (cursor.com/dashboard → API Keys)
 gh auth status             # gh must be authenticated with repo scope on the target repo
 ```
 
-Commit `factory.config.json` and your rewritten `principles.md` to your fork —
-they *are* your deployment. Because the upstream repo ships only the example
-config, pulling upstream stays conflict-free.
+Commit `factory.config.json` and your `principles.md` to your fork — they *are*
+your deployment. Upstream ships only `*.example` versions of both and gitignores
+`telemetry/`, so your policy never collides with an engine change:
+
+```bash
+git remote add upstream https://github.com/samarmstrong/conveyor.git
+git pull upstream main     # engine updates; your policy files are untouched
+```
 
 ## Commands
 
@@ -176,7 +182,7 @@ tasks whose historical human-rejection rate is ~zero).
 ## Architecture
 
 ```
-principles.md      what is worth building  ← factory policy
+principles.md      what is worth building  ← factory policy (ships as principles.example.md)
 src/types.ts       CodingWorker / WorkSource boundaries + telemetry records
 src/worker.ts      CursorWorker (Cursor Cloud Agents v1 API) — the only Cursor-aware file
 src/workSource.ts  GitHubIssueSource (incl. writing groom verdicts back to issues)

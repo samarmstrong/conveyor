@@ -17,7 +17,7 @@
   },
   "groom": {
     "maxPerTick": 5,
-    "principlesFile": "principles.md"
+    "principlesFile": "principles.example.md"
   },
   "selector": {
     "maxCandidates": 100
