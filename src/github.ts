@@ -46,12 +46,13 @@ export interface IssueData {
   body: string;
   url: string;
   labels: { name: string }[];
+  comments: { body: string }[];
 }
 
 export async function listOpenIssues(repo: string, limit: number): Promise<IssueData[]> {
   return ghJson<IssueData[]>([
     'issue', 'list', '-R', repo, '--state', 'open',
-    '--limit', String(limit), '--json', 'number,title,body,url,labels',
+    '--limit', String(limit), '--json', 'number,title,body,url,labels,comments',
   ]);
 }
 
@@ -119,7 +120,12 @@ export async function addPrLabels(repo: string, prUrl: string, labels: string[])
 }
 
 export async function commentOnIssue(repo: string, issue: number, body: string): Promise<void> {
-  await gh(['issue', 'comment', String(issue), '-R', repo, '--body', body]);
+  // Via stdin: groom rationales are longer than argv is worth trusting.
+  await ghStdin(['issue', 'comment', String(issue), '-R', repo, '--body-file', '-'], body);
+}
+
+export async function commentOnPr(repo: string, prUrl: string, body: string): Promise<void> {
+  await ghStdin(['pr', 'comment', prUrl, '-R', repo, '--body-file', '-'], body);
 }
 
 /** Extract "Closes #N" / "#N" issue references from a PR body. */

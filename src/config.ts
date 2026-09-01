@@ -16,11 +16,23 @@ export interface FactoryConfig {
     issueInProgress: string;
     groomed: string;
     needsWork: string;
+    /** Carried by the environment agent's PRs, and by nothing else — this is
+     *  what keeps them out of the `maxConcurrentJobs` count. */
+    environmentPr: string;
   };
   groom: { maxPerTick: number; principlesFile: string };
   selector: { maxCandidates: number };
+  /** The environment phase: an agent that reads the factory's own PRs looking
+   *  for checks the implementer could not run, and fixes the cloud-agent
+   *  environment so the next one can. `maxPrsPerPass` bounds how many PRs one
+   *  pass reads; only one environment PR is ever open at a time. */
+  environment: { enabled: boolean; maxPrsPerPass: number };
   telemetryDir: string;
   staleRunHours: number;
+  /** The throttle, in one number: how many jobs may exist at once, counting
+   *  open factory PRs awaiting a human and pipelines still running. It is also
+   *  the most pipelines one tick will start. 1 = strict one-at-a-time. */
+  maxConcurrentJobs: number;
 }
 
 export const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -45,7 +57,25 @@ export function loadConfig(root: string = projectRoot): FactoryConfig {
       `factory.config.json not found at ${path} — copy factory.config.example.json and point it at your target repo.`,
     );
   }
-  return JSON.parse(readFileSync(path, 'utf8')) as FactoryConfig;
+  const config = JSON.parse(readFileSync(path, 'utf8')) as FactoryConfig;
+  // Deployments commit their own factory.config.json and pull engine updates on
+  // top, so a field added upstream is simply absent in older ones. Default to
+  // the original one-job-at-a-time throttle rather than failing their next tick.
+  config.maxConcurrentJobs ??= 1;
+  if (!Number.isInteger(config.maxConcurrentJobs) || config.maxConcurrentJobs < 1) {
+    throw new Error(
+      `maxConcurrentJobs must be a positive integer, got ${JSON.stringify(config.maxConcurrentJobs)}`,
+    );
+  }
+  config.labels.environmentPr ??= 'factory:env';
+  config.environment ??= { enabled: true, maxPrsPerPass: 3 };
+  config.environment.maxPrsPerPass ??= 3;
+  if (!Number.isInteger(config.environment.maxPrsPerPass) || config.environment.maxPrsPerPass < 1) {
+    throw new Error(
+      `environment.maxPrsPerPass must be a positive integer, got ${JSON.stringify(config.environment.maxPrsPerPass)}`,
+    );
+  }
+  return config;
 }
 
 /** The product-direction principles grooming judges against. Factory-local by

@@ -8,6 +8,7 @@ function task(issueNumber: number, labels: string[] = []): Task {
     issueNumber,
     title: `task ${issueNumber}`,
     body: 'some description',
+    comments: [],
     labels,
     url: `https://github.com/o/r/issues/${issueNumber}`,
   };

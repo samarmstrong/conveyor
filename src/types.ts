@@ -6,8 +6,14 @@ export interface Task {
   issueNumber: number;
   title: string;
   body: string;
+  /** In chronological order. Grooming judges the description and these together. */
+  comments: IssueComment[];
   labels: string[];
   url: string;
+}
+
+export interface IssueComment {
+  body: string;
 }
 
 export interface ModelSpec {
@@ -75,8 +81,8 @@ export interface WorkSource {
   eligibleTasks(): Promise<Task[]>;
   markStarted(task: Task): Promise<void>;
   markFinished(task: Task): Promise<void>;
-  /** Persist a groom verdict onto the issue: stamped body, label, and — for
-   *  needs-work — a visible comment saying why. */
+  /** Publish a groom verdict on the issue: a stamped comment saying what the
+   *  factory concluded and why, plus a label mirroring it. */
   recordGroom(task: Task, reply: { verdict: GroomVerdict; notes: string | undefined; reasoning: string }): Promise<void>;
 }
 
@@ -122,6 +128,9 @@ export interface GroomRecord {
 export interface OutcomeRecord {
   type: 'outcome';
   prUrl: string;
+  /** Which pipeline opened it. Absent on records written before env passes
+   *  existed, which were all implementer PRs. */
+  source?: 'implementer' | 'environment';
   issueNumber: number | null;
   merged: boolean;
   closedAt: string;
@@ -130,7 +139,28 @@ export interface OutcomeRecord {
   recordedAt: string;
 }
 
-export type TelemetryRecord = RunRecord | GroomRecord | OutcomeRecord;
+/**
+ * One pass of the environment agent: it read some factory PRs and either found
+ * a gap the cloud-agent environment could close (and opened a PR closing it) or
+ * did not. `prsExamined` is what makes a pass idempotent — those PRs are never
+ * read again — so a failed pass records none of them and they are retried.
+ */
+export interface EnvRecord {
+  type: 'env';
+  prsExamined: string[];
+  outcome: 'pr-opened' | 'no-gap' | 'failed';
+  prUrl: string | null;
+  failureReason?: string;
+  worker: string;
+  model: ModelSpec | null;
+  agentId: string;
+  startedAt: string;
+  finishedAt: string;
+  usage: TokenUsage | null;
+  durationMs: number;
+}
+
+export type TelemetryRecord = RunRecord | GroomRecord | OutcomeRecord | EnvRecord;
 
 // --- Pipeline state for crash detection ---
 

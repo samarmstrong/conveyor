@@ -13,7 +13,8 @@
     "factoryPr": "factory",
     "issueInProgress": "factory:wip",
     "groomed": "factory:groomed",
-    "needsWork": "factory:needs-work"
+    "needsWork": "factory:needs-work",
+    "environmentPr": "factory:env"
   },
   "groom": {
     "maxPerTick": 5,
@@ -22,6 +23,11 @@
   "selector": {
     "maxCandidates": 100
   },
+  "environment": {
+    "enabled": true,
+    "maxPrsPerPass": 3
+  },
   "telemetryDir": "telemetry",
-  "staleRunHours": 24
+  "staleRunHours": 24,
+  "maxConcurrentJobs": 1
 }
