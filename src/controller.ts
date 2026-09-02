@@ -27,11 +27,11 @@ import { CursorWorker } from './worker.ts';
 import { GitHubIssueSource } from './workSource.ts';
 import { FactoryState } from './state.ts';
 import { Telemetry } from './telemetry.ts';
-import { filterClaimed, parseSelection, type Selection } from './selector.ts';
+import { filterAssigned, filterClaimed, parseSelection, type Selection } from './selector.ts';
 import { environmentPrompt, groomPrompt, implementPrompt, selectPrompt } from './prompts.ts';
 import { factoryComment, groomState, isGroomed, needsGroom, parseGroomReply, verdict } from './groom.ts';
-import { addPrLabels, commentOnIssue, commentOnPr, ensureLabel, findPrByBranch, listPrsByLabel } from './github.ts';
-import { skipReason, unexaminedPrUrls } from './environment.ts';
+import { addPrLabels, commentOnIssue, commentOnPr, defaultBranchHead, ensureLabel, findPrByBranch, listPrsByLabel } from './github.ts';
+import { environmentChangedAt, skipReason, unreadFactoryPrs } from './environment.ts';
 
 export function log(msg: string): void {
   console.log(`[${new Date().toISOString()}] ${msg}`);
@@ -53,10 +53,17 @@ export function buildContext(): FactoryContext {
   return { config, telemetry, state, source };
 }
 
-export function buildWorker(config: FactoryConfig): CursorWorker {
+/**
+ * Resolves the base once, here, so every agent a tick launches starts from the
+ * same commit and none can be handed a stale clone.
+ */
+export async function buildWorker(config: FactoryConfig): Promise<CursorWorker> {
+  const { branch, sha } = await defaultBranchHead(repoSlug(config));
+  log(`agents will start from ${branch} @ ${sha.slice(0, 8)}`);
   return new CursorWorker({
     apiKey: requireCursorApiKey(),
     repoUrl: config.repo.url,
+    startingRef: sha,
     model: config.worker.model,
     pollIntervalSeconds: config.worker.pollIntervalSeconds,
     maxRunMinutes: config.worker.maxRunMinutes,
@@ -68,6 +75,15 @@ export function buildWorker(config: FactoryConfig): CursorWorker {
 export async function candidateTasks(ctx: FactoryContext): Promise<Task[]> {
   const tasks = await ctx.source.eligibleTasks();
   return filterClaimed(tasks, ctx.config.labels.issueInProgress);
+}
+
+/**
+ * The candidates one phase may act on. Both phases start from the same list —
+ * an extra issue-list call per phase would only widen the window in which the
+ * two disagree — and differ only in whether a human's assignment excludes it.
+ */
+export function admissible(ctx: FactoryContext, tasks: Task[], phase: 'groom' | 'implement'): Task[] {
+  return ctx.config.assignedIssues[phase] ? tasks : filterAssigned(tasks);
 }
 
 /**
@@ -184,14 +200,15 @@ export async function runEnvironmentPhase(
   const openEnvPrs = config.environment.enabled
     ? await listPrsByLabel(repoSlug(config), config.labels.environmentPr, 'open')
     : [];
-  const unexamined = unexaminedPrUrls(ctx.telemetry.runs(), ctx.telemetry.envPasses());
-  const skip = skipReason(config.environment.enabled, openEnvPrs, unexamined);
+  const changedAt = environmentChangedAt(ctx.telemetry.outcomes());
+  const unread = unreadFactoryPrs(ctx.telemetry.runs(), ctx.telemetry.envPasses(), changedAt);
+  const skip = skipReason(config.environment.enabled, openEnvPrs, unread, changedAt);
   if (skip) {
     log(`environment: skipped — ${skip}.`);
     return null;
   }
 
-  const prUrls = unexamined.slice(0, config.environment.maxPrsPerPass);
+  const prUrls = unread.fresh.slice(0, config.environment.maxPrsPerPass);
   log(`environment: reading ${prUrls.length} factory PR(s) for verification the agents could not run: ${prUrls.join(' ')}`);
 
   const startedAt = new Date().toISOString();
@@ -271,11 +288,11 @@ export async function tick(opts: { dryRun: boolean }): Promise<void> {
     return;
   }
 
-  const worker = buildWorker(config);
+  const worker = await buildWorker(config);
 
   // 2. Grooming: vet part of the backlog. Deliberately ahead of the
   //    capacity gate — it produces no code, so it cannot collide.
-  if (candidates.length > 0) await runGroomPhase(ctx, worker, candidates);
+  if (candidates.length > 0) await runGroomPhase(ctx, worker, admissible(ctx, candidates, 'groom'));
 
   // 3. Environment: fix the machine the implementers run on, from what the
   //    implementers themselves said about it. Also ahead of the capacity gate,
@@ -307,7 +324,7 @@ export async function tick(opts: { dryRun: boolean }): Promise<void> {
 
   // 5. Selector agents fill the free slots. Re-fetch, since the groom phase
   //    just rewrote some of the bodies we hold.
-  const tasks = (await candidateTasks(ctx)).filter((t) => isGroomed(t, ctx.config.labels));
+  const tasks = admissible(ctx, await candidateTasks(ctx), 'implement').filter((t) => isGroomed(t, ctx.config.labels));
   if (tasks.length === 0) {
     log('no groomed issues available to implement. Nothing to do.');
     return;
@@ -378,10 +395,17 @@ async function pickTasks(
 }
 
 /** What the tick would do, and the exact prompts it would send. Spends nothing. */
-async function dryRun(ctx: FactoryContext, candidates: Task[]): Promise<void> {
+async function dryRun(ctx: FactoryContext, allCandidates: Task[]): Promise<void> {
+  const candidates = admissible(ctx, allCandidates, 'groom');
   const pending = needsGroom(candidates, ctx.config.labels);
-  const groomed = candidates.filter((t) => isGroomed(t, ctx.config.labels));
+  const groomed = admissible(ctx, allCandidates, 'implement').filter((t) => isGroomed(t, ctx.config.labels));
+  const heldBack = allCandidates.length - candidates.length;
+  if (heldBack > 0) log(`${heldBack} assigned issue(s) held back from grooming.`);
   const needsWork = candidates.filter((t) => verdict(t, ctx.config.labels) === 'needs-work').length;
+  const assignedGroomed = allCandidates.filter((t) => t.assignees.length > 0 && isGroomed(t, ctx.config.labels)).length;
+  if (!ctx.config.assignedIssues.implement && assignedGroomed > 0) {
+    log(`${assignedGroomed} groomed issue(s) withheld from the selector: assigned to a human.`);
+  }
   // The buckets overlap: a groomed issue someone has since replied to is both
   // implementable and queued for another look.
   log(`dry run: ${candidates.length} unclaimed issue(s) — ${groomed.length} groomed, ${needsWork} needs-work, ${candidates.length - groomed.length - needsWork} never groomed (${pending.length} queued for a groom)`);
@@ -400,14 +424,15 @@ async function dryRun(ctx: FactoryContext, candidates: Task[]): Promise<void> {
   const openEnvPrs = config.environment.enabled
     ? await listPrsByLabel(repoSlug(config), config.labels.environmentPr, 'open')
     : [];
-  const unexamined = unexaminedPrUrls(ctx.telemetry.runs(), ctx.telemetry.envPasses());
-  const skip = skipReason(config.environment.enabled, openEnvPrs, unexamined);
+  const changedAt = environmentChangedAt(ctx.telemetry.outcomes());
+  const unread = unreadFactoryPrs(ctx.telemetry.runs(), ctx.telemetry.envPasses(), changedAt);
+  const skip = skipReason(config.environment.enabled, openEnvPrs, unread, changedAt);
   if (skip) {
     log(`environment: would skip — ${skip}.`);
     return;
   }
-  const prUrls = unexamined.slice(0, config.environment.maxPrsPerPass);
-  log(`environment: would read ${prUrls.length} of ${unexamined.length} unread factory PR(s). Its prompt would be:`);
+  const prUrls = unread.fresh.slice(0, config.environment.maxPrsPerPass);
+  log(`environment: would read ${prUrls.length} of ${unread.fresh.length} unread factory PR(s)${unread.stale.length ? `, ignoring ${unread.stale.length} written before the environment changed` : ''}. Its prompt would be:`);
   console.log(`\n${environmentPrompt(prUrls)}\n`);
 }
 

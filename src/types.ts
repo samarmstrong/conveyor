@@ -9,6 +9,8 @@ export interface Task {
   /** In chronological order. Grooming judges the description and these together. */
   comments: IssueComment[];
   labels: string[];
+  /** GitHub logins. A non-empty list is a human's claim on the issue. */
+  assignees: string[];
   url: string;
 }
 

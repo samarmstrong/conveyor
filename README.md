@@ -27,6 +27,10 @@ Plenty of tools point an agent at a backlog. This one takes positions:
   beyond two one-line handoffs, no controller-orchestrated review gates, no
   evidence protocols. Prompt lines exist only where we are specifically
   opinionated.
+- **An assignee is a stop sign.** An issue a human has taken is not the factory's to
+  implement — it cannot tell "assigned and untouched" from "assigned and half-written
+  locally", and guessing wrong wastes a person's work, not an agent's. It will still
+  groom it, because a verdict costs the assignee nothing and may be useful to them.
 - **The factory owns the machine it builds on.** When an agent cannot verify its own
   change because the sandbox lacks something, that is the factory's bug, not the
   reviewer's problem. An agent reads the factory's own PRs and fixes the environment.
@@ -47,9 +51,9 @@ reconcile outcomes of previously opened PRs (merged/rejected → telemetry, rele
 count the jobs already in flight (open factory PRs + running pipelines)
    → no free slot under maxConcurrentJobs? stop here
 for each free slot:
-   → SELECTOR agent: gets the GROOMED issues (minus factory:wip claims and the
-      picks made earlier this tick) and picks the most well-scoped one by
-      judgment — no scores, no weights
+   → SELECTOR agent: gets the GROOMED issues (minus factory:wip claims, issues
+      assigned to a human, and the picks made earlier this tick) and picks the most
+      well-scoped one by judgment — no scores, no weights
    label the pick factory:wip
 → handoff to a FRESH implementer agent per pick, running concurrently, each with a
    short workflow prompt and the issue LINK (not its text — the agent reads the
@@ -172,13 +176,23 @@ the other only product code — so a full review queue never leaves the agents' 
 broken. The cost is honest: it is a second thing that can be awaiting your review. Set
 `environment.enabled` to `false` to turn the phase off entirely.
 
-The phase runs at most once per tick, only when there are unread factory PRs and no
-environment PR already open, and reads at most `environment.maxPrsPerPass` of them —
-newest first, the same ordering grooming uses and for the same reason. A gap reported
-months ago is a claim about an environment that has since changed, so oldest-first would
-spend the pass on the reports least likely to still be true while the live one waits
-several ticks for its turn. The old tail is starved on a busy factory, deliberately: an
-unread old PR costs nothing, a stale environment costs every run.
+**A merged environment PR voids every report written before it.** A report is a claim
+about the machine the agent ran on, so once that machine changes the claim is about
+something that no longer exists — the same move the groom fingerprint makes when a human
+replies to an issue. Without this the phase re-fixes what it just fixed: our first
+environment PR merged, and the next pass was handed seven reports of "no Docker" all
+written on the pre-Docker machine, and dutifully added Docker again. A run that *started*
+before the change necessarily ran on the old machine, so `startedAt` is the cutoff.
+
+Voided reports are dropped, not deferred. If the gap one describes still exists, the next
+implementer hits it and says so in a PR opened after the change, and that one is read.
+Only evidence about the current machine counts.
+
+The phase runs at most once per tick, only when there are unread factory PRs with reports
+about the current machine and no environment PR already open, and reads at most
+`environment.maxPrsPerPass` of them — newest first, the same ordering grooming uses and
+for the same reason. The old tail is starved on a busy factory, deliberately: an unread
+old PR costs nothing, a stale environment costs every run.
 
 ## Deploying
 
@@ -241,6 +255,11 @@ so the workflow is inert in the upstream repo.
   `groom.maxPerTick` (how much backlog to vet per tick), `maxConcurrentJobs` (how many
   jobs may be in flight at once — the whole implementation throttle), stale-run cutoff,
   labels.
+- `factory.config.json` → `assignedIssues` — whether each phase may act on an issue a
+  human has assigned to themselves. Defaults to `{ "groom": true, "implement": false }`:
+  vetting an assigned issue costs its assignee nothing, implementing one collides with
+  them. Set `implement` to `true` for a repo where assignment means triage rather than
+  intent.
 - `factory.config.json` → `environment` — `enabled` (default true) and `maxPrsPerPass`
   (default 3): the phase that owns the cloud-agent environment. Off means the factory
   keeps opening PRs whose verification was blocked and never fixes the cause.
@@ -248,12 +267,14 @@ so the workflow is inert in the upstream repo.
   lines. Add lines only for specific opinions where the model's default behavior isn't
   what you want. **Widening autonomy later = widening this policy, not adding
   machinery.**
-- `src/selector.ts` — only the mechanical bits: filter `factory:wip` claims and
-  parse the selector's `SELECTED: #N` handoff line.
+- `src/selector.ts` — only the mechanical bits: filter the claims (`factory:wip`, and
+  assignees when `assignedIssues` says so) and parse the selector's `SELECTED: #N`
+  handoff line.
 - `src/groom.ts` — only the mechanical bits: the verdict labels, the fingerprint that
   dates them, the backlog filters, and `VERDICT`-line parsing.
 - `src/environment.ts` — only the mechanical bits: which factory PRs a pass has not read
-  yet, and why a pass is not running. No parsing at all.
+  yet, which of their reports still describe the current machine, and why a pass is not
+  running. No parsing at all.
 
 ## Telemetry
 
@@ -284,10 +305,11 @@ tasks whose historical human-rejection rate is ~zero).
 principles.md      what is worth building  ← factory policy (ships as principles.example.md)
 src/types.ts       CodingWorker / WorkSource boundaries + telemetry records
 src/worker.ts      CursorWorker (Cursor Cloud Agents v1 API) — the only Cursor-aware file
+                   Every agent is pinned to one `startingRef`, resolved per tick
 src/workSource.ts  GitHubIssueSource (incl. writing groom verdicts back to issues)
 src/groom.ts       verdict labels + fingerprint, backlog filters, VERDICT parsing
-src/environment.ts unread-PR bookkeeping for the environment phase (no parsing)
-src/selector.ts    wip filter + SELECTED-line parsing (mechanical only)
+src/environment.ts unread-PR bookkeeping + report freshness for the environment phase
+src/selector.ts    wip + assignee filters, SELECTED-line parsing (mechanical only)
 src/prompts.ts     groom + selector + implementer + environment prompts  ← factory policy
 src/state.ts       capacity gate (open PRs + in-flight runs), outcome reconciliation
 src/controller.ts  the tick

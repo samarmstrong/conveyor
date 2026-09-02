@@ -47,12 +47,13 @@ export interface IssueData {
   url: string;
   labels: { name: string }[];
   comments: { body: string }[];
+  assignees: { login: string }[];
 }
 
 export async function listOpenIssues(repo: string, limit: number): Promise<IssueData[]> {
   return ghJson<IssueData[]>([
     'issue', 'list', '-R', repo, '--state', 'open',
-    '--limit', String(limit), '--json', 'number,title,body,url,labels,comments',
+    '--limit', String(limit), '--json', 'number,title,body,url,labels,comments,assignees',
   ]);
 }
 
@@ -89,6 +90,17 @@ export async function findPrByBranch(repo: string, branch: string): Promise<PrDa
 
 export async function viewPr(repo: string, prUrl: string): Promise<PrData> {
   return ghJson<PrData>(['pr', 'view', prUrl, '-R', repo, '--json', PR_FIELDS]);
+}
+
+/**
+ * The target's default branch and the commit it currently points at. Agents are
+ * launched pinned to that sha rather than letting the worker resolve "the
+ * default branch" itself — see `CursorWorkerOptions.startingRef`.
+ */
+export async function defaultBranchHead(repo: string): Promise<{ branch: string; sha: string }> {
+  const { default_branch: branch } = await ghJson<{ default_branch: string }>(['api', `repos/${repo}`]);
+  const { sha } = await ghJson<{ sha: string }>(['api', `repos/${repo}/commits/${branch}`]);
+  return { branch, sha };
 }
 
 export async function ensureLabel(repo: string, name: string, color: string, description: string): Promise<void> {

@@ -2,10 +2,10 @@
 // factory CLI — the daily trigger runs `factory run`; everything else is
 // for humans operating the factory.
 
-import { buildContext, buildWorker, candidateTasks, log, runEnvironmentPhase, runGroomPhase, runSelector, tick } from './controller.ts';
+import { admissible, buildContext, buildWorker, candidateTasks, log, runEnvironmentPhase, runGroomPhase, runSelector, tick } from './controller.ts';
 import { repoSlug, requireCursorApiKey } from './config.ts';
 import { isGroomed, needsGroom, verdict } from './groom.ts';
-import { skipReason, unexaminedPrUrls } from './environment.ts';
+import { environmentChangedAt, skipReason, unreadFactoryPrs } from './environment.ts';
 import { listPrsByLabel } from './github.ts';
 import type { CurrentRun } from './types.ts';
 
@@ -28,8 +28,8 @@ Usage:
 
 async function groom(opts: { limit?: number; force?: boolean }): Promise<void> {
   const ctx = buildContext();
-  const candidates = await candidateTasks(ctx);
-  const records = await runGroomPhase(ctx, buildWorker(ctx.config), candidates, opts);
+  const candidates = admissible(ctx, await candidateTasks(ctx), 'groom');
+  const records = await runGroomPhase(ctx, await buildWorker(ctx.config), candidates, opts);
   if (records.length === 0) {
     log('nothing to groom.');
     return;
@@ -44,7 +44,8 @@ async function groom(opts: { limit?: number; force?: boolean }): Promise<void> {
 async function status(): Promise<void> {
   const ctx = buildContext();
 
-  const candidates = await candidateTasks(ctx);
+  const allCandidates = await candidateTasks(ctx);
+  const candidates = admissible(ctx, allCandidates, 'groom');
   const { labels } = ctx.config;
   const groomed = candidates.filter((t) => isGroomed(t, labels)).length;
   const needsWork = candidates.filter((t) => verdict(t, labels) === 'needs-work').length;
@@ -52,6 +53,17 @@ async function status(): Promise<void> {
   // implementable and queued for another look.
   const pending = needsGroom(candidates, labels).length;
   log(`backlog: ${candidates.length} unclaimed — ${groomed} groomed, ${needsWork} needs-work, ${candidates.length - groomed - needsWork} never groomed (${pending} queued for a groom)`);
+
+  const implementable = admissible(ctx, allCandidates, 'implement').filter((t) => isGroomed(t, labels)).length;
+  const assigned = allCandidates.filter((t) => t.assignees.length > 0);
+  if (assigned.length > 0) {
+    const held = [
+      ...(ctx.config.assignedIssues.groom ? [] : ['grooming']),
+      ...(ctx.config.assignedIssues.implement ? [] : ['implementation']),
+    ];
+    log(`assigned to a human: ${assigned.length} issue(s)${held.length ? ` — withheld from ${held.join(' and ')}` : ' — not withheld from anything'}`);
+  }
+  log(`implementable now: ${implementable} groomed issue(s) the selector may draw from`);
 
   const capacity = await ctx.state.capacity(log);
   log(`capacity: ${capacity.slots} of ${capacity.limit} slot(s) free`);
@@ -77,9 +89,11 @@ async function status(): Promise<void> {
     log('environment: disabled.');
   } else {
     const openEnvPrs = await listPrsByLabel(repoSlug(ctx.config), labels.environmentPr, 'open');
-    const unexamined = unexaminedPrUrls(ctx.telemetry.runs(), ctx.telemetry.envPasses());
-    const skip = skipReason(true, openEnvPrs, unexamined);
-    log(`environment: ${skip ?? `${unexamined.length} factory PR(s) unread; next pass reads ${Math.min(unexamined.length, environment.maxPrsPerPass)}`}.`);
+    const changedAt = environmentChangedAt(ctx.telemetry.outcomes());
+    const unread = unreadFactoryPrs(ctx.telemetry.runs(), ctx.telemetry.envPasses(), changedAt);
+    const skip = skipReason(true, openEnvPrs, unread, changedAt);
+    log(`environment: ${skip ?? `${unread.fresh.length} factory PR(s) unread; next pass reads ${Math.min(unread.fresh.length, environment.maxPrsPerPass)}`}.`);
+    if (changedAt) log(`  environment last changed ${changedAt}${unread.stale.length ? `; ${unread.stale.length} older report(s) void` : ''}`);
     const last = ctx.telemetry.envPasses().at(-1);
     if (last) log(`  last pass: ${last.startedAt} → ${last.outcome}${last.prUrl ? ` ${last.prUrl}` : ''} (read ${last.prsExamined.length} PR(s))`);
   }
@@ -87,20 +101,20 @@ async function status(): Promise<void> {
 
 async function env(): Promise<void> {
   const ctx = buildContext();
-  const record = await runEnvironmentPhase(ctx, buildWorker(ctx.config));
+  const record = await runEnvironmentPhase(ctx, await buildWorker(ctx.config));
   if (!record) return;
   log(`environment pass → ${record.outcome}${record.prUrl ? ` ${record.prUrl}` : ''}${record.failureReason ? ` (${record.failureReason})` : ''}`);
 }
 
 async function select(): Promise<void> {
   const ctx = buildContext();
-  const tasks = (await candidateTasks(ctx)).filter((t) => isGroomed(t, ctx.config.labels));
+  const tasks = admissible(ctx, await candidateTasks(ctx), 'implement').filter((t) => isGroomed(t, ctx.config.labels));
   if (tasks.length === 0) {
     log('no groomed issues. Run `factory groom` first.');
     return;
   }
   log(`handing ${tasks.length} groomed issue(s) to the selector agent`);
-  const picked = await runSelector(buildWorker(ctx.config), tasks);
+  const picked = await runSelector(await buildWorker(ctx.config), tasks);
   console.log(`\n${picked.reply}\n`);
   if (picked.selection.kind === 'picked') {
     log(`pick: #${picked.selection.task.issueNumber} "${picked.selection.task.title}"`);

@@ -11,6 +11,14 @@ const TERMINAL: RunStatus[] = ['FINISHED', 'ERROR', 'CANCELLED', 'EXPIRED'];
 export interface CursorWorkerOptions {
   apiKey: string;
   repoUrl: string;
+  /**
+   * Commit to start every agent from. Without it Cursor resolves the base
+   * itself and can serve a cached clone — we saw an agent branch from an
+   * hour-old main and re-add files a merged PR had already landed, which then
+   * conflicted. Pinning a sha means the base cannot be stale, and every agent
+   * in one tick shares it.
+   */
+  startingRef: string | null;
   model: ModelSpec | null;
   pollIntervalSeconds: number;
   maxRunMinutes: number;
@@ -52,7 +60,10 @@ export class CursorWorker implements CodingWorker {
   async start(prompt: string, opts: StartOptions = {}): Promise<RunHandle> {
     const body: Record<string, unknown> = {
       prompt: { text: prompt },
-      repos: [{ url: this.opts.repoUrl }],
+      repos: [{
+        url: this.opts.repoUrl,
+        ...(this.opts.startingRef ? { startingRef: this.opts.startingRef } : {}),
+      }],
       autoCreatePR: opts.autoCreatePR ?? false,
     };
     if (opts.name) body['name'] = opts.name;

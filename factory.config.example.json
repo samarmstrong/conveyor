@@ -27,6 +27,10 @@
     "enabled": true,
     "maxPrsPerPass": 3
   },
+  "assignedIssues": {
+    "groom": true,
+    "implement": false
+  },
   "telemetryDir": "telemetry",
   "staleRunHours": 24,
   "maxConcurrentJobs": 1

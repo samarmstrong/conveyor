@@ -26,6 +26,7 @@ function config(maxConcurrentJobs: number): FactoryConfig {
     groom: { maxPerTick: 5, principlesFile: 'principles.example.md' },
     selector: { maxCandidates: 100 },
     environment: { enabled: true, maxPrsPerPass: 3 },
+    assignedIssues: { groom: true, implement: false },
     telemetryDir: 'telemetry',
     staleRunHours: 24,
     maxConcurrentJobs,

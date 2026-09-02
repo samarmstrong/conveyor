@@ -17,32 +17,64 @@
 // The only state is telemetry. Each pass records the PRs it read, so the next
 // one reads only what is new; a pass that failed records none of them, and
 // they come back around.
+//
+// Telemetry also dates the environment itself. A report is a claim about the
+// machine the agent ran on, so a merged environment PR voids every report
+// written before it — the same move the groom fingerprint makes when a human
+// replies to an issue. Without that, a pass reads complaints about a machine
+// that no longer exists and "fixes" what is already fixed.
 
-import type { EnvRecord, RunRecord } from './types.ts';
+import type { EnvRecord, OutcomeRecord, RunRecord } from './types.ts';
+
+/**
+ * When the agents' machine last actually changed: the merge time of the most
+ * recent merged environment PR, or null if none has ever merged.
+ */
+export function environmentChangedAt(outcomes: OutcomeRecord[]): string | null {
+  const merged = outcomes
+    .filter((o) => o.source === 'environment' && o.merged)
+    .map((o) => o.closedAt)
+    .sort();
+  return merged.at(-1) ?? null;
+}
+
+/** Unread factory PRs, split by whether their reports are still about this machine. */
+export interface UnreadPrs {
+  /** Opened by an agent that ran on the environment as it stands. Worth reading. */
+  fresh: string[];
+  /** Opened before the environment last changed, so never read at all. */
+  stale: string[];
+}
 
 /**
  * Factory PRs no environment pass has read yet, newest first — the same
- * ordering grooming uses, for the same reason. A gap reported months ago is a
- * claim about an environment that has since changed, so oldest-first would
- * spend the pass on the reports least likely to still be true while the live
- * one waits several ticks for its turn.
+ * ordering grooming uses, for the same reason.
  *
- * The tail is therefore starved on a busy factory, and that is the intended
- * trade: an unread old PR costs nothing, a stale environment costs every run.
+ * `changedAt` splits them. A run that *started* before the environment changed
+ * necessarily ran on the old machine, whatever it later said, so `startedAt` is
+ * the honest cutoff rather than when its PR happened to open.
+ *
+ * Stale reports are dropped, not deferred: if the gap one describes still
+ * exists, the next implementer hits it and says so in a PR opened after the
+ * change, and that one is read. Only evidence about the current machine counts.
  *
  * Run records outnumber PRs (a retry and its failure can name the same one), so
  * this de-duplicates rather than trusting one record per PR.
  */
-export function unexaminedPrUrls(runs: RunRecord[], passes: EnvRecord[]): string[] {
+export function unreadFactoryPrs(
+  runs: RunRecord[],
+  passes: EnvRecord[],
+  changedAt: string | null,
+): UnreadPrs {
   const seen = new Set(passes.flatMap((p) => p.prsExamined));
-  const urls: string[] = [];
+  const unread: UnreadPrs = { fresh: [], stale: [] };
   for (let i = runs.length - 1; i >= 0; i--) {
-    const prUrl = runs[i]!.prUrl;
+    const { prUrl, startedAt } = runs[i]!;
     if (prUrl === null || seen.has(prUrl)) continue;
     seen.add(prUrl);
-    urls.push(prUrl);
+    (changedAt !== null && startedAt < changedAt ? unread.stale : unread.fresh).push(prUrl);
   }
-  return urls;
+  return unread;
 }
 
 /**
@@ -57,12 +89,16 @@ export function unexaminedPrUrls(runs: RunRecord[], passes: EnvRecord[]): string
 export function skipReason(
   enabled: boolean,
   openEnvPrs: { url: string }[],
-  unexamined: string[],
+  unread: UnreadPrs,
+  changedAt: string | null = null,
 ): string | null {
   if (!enabled) return 'environment phase is disabled in factory.config.json';
   if (openEnvPrs.length > 0) {
     return `an environment PR is already awaiting a human (${openEnvPrs.map((p) => p.url).join(', ')})`;
   }
-  if (unexamined.length === 0) return 'no factory PRs the environment agent has not already read';
-  return null;
+  if (unread.fresh.length > 0) return null;
+  if (unread.stale.length > 0) {
+    return `${unread.stale.length} unread factory PR(s), but all opened before the environment last changed (${changedAt}) — their reports describe a machine that no longer exists`;
+  }
+  return 'no factory PRs the environment agent has not already read';
 }

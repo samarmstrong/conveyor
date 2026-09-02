@@ -22,6 +22,7 @@ export class GitHubIssueSource implements WorkSource {
       body: i.body ?? '',
       comments: (i.comments ?? []).map((c) => ({ body: c.body ?? '' })),
       labels: i.labels.map((l) => l.name),
+      assignees: (i.assignees ?? []).map((a) => a.login),
       url: i.url,
     }));
   }

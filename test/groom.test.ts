@@ -13,6 +13,7 @@ function task(issueNumber: number, body: string, comments: string[] = [], labels
     body,
     comments: comments.map((c): IssueComment => ({ body: c })),
     labels,
+    assignees: [],
     url: `https://github.com/o/r/issues/${issueNumber}`,
   };
 }
