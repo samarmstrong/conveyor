@@ -1,37 +1,39 @@
 // The factory controller: one idempotent tick.
 //
 //   reconcile outcomes → groom ungroomed issues → fix the agents' environment →
-//   measure free capacity → for each free slot, a selector agent picks the most
-//   well-scoped GROOMED issue → hand each to a FRESH implementer agent → label
-//   the resulting PRs → record telemetry → yield to a human.
+//   measure free capacity → for each free slot, a selector agent picks the
+//   best-defined GROOMED issue → hand each to a FRESH implementer agent → label
+//   the resulting PRs (or, if the attempt refuted the groom, retract the
+//   verdict) → record telemetry → yield to a human.
 //
 // `maxConcurrentJobs` is the whole throttle: a job is an open factory PR
 // awaiting a human or a pipeline still running, at most that many exist at
 // once, and so one tick starts at most that many pipelines. Default 1 keeps the
 // strict one-at-a-time factory.
 //
-// Grooming and the environment phase both run before the capacity gate on
-// purpose: neither touches product code, so a PR sitting in review is no reason
-// to stop vetting the backlog or to leave the agents' machine broken. An
-// environment PR is its own one-deep queue and never spends an implementer's
-// slot — the two can never collide, since one touches only `.cursor/`.
+// Grooming, the environment phase, and the simplification phase all run before
+// the capacity gate on purpose: a PR sitting in review is no reason to stop
+// vetting the backlog, to leave the agents' machine broken, or to let the code
+// keep accreting. Environment and simplification PRs are each their own
+// one-deep queue and never spend an implementer's slot.
 //
 // Every judgment call (is this worth building, which issue, how to
 // implement/verify/review it) lives in an agent; the controller only sequences
 // the handoffs and keeps the capacity gate.
 
 import { resolve } from 'node:path';
-import type { CodingWorker, CurrentRun, EnvRecord, GroomRecord, Task, TokenUsage } from './types.ts';
+import type { CodingWorker, CurrentRun, EnvRecord, GroomRecord, RunResult, SimplifyRecord, Task, TokenUsage } from './types.ts';
 import { loadConfig, loadDotEnv, loadPrinciples, projectRoot, repoSlug, requireCursorApiKey, type FactoryConfig } from './config.ts';
-import { CursorWorker } from './worker.ts';
+import { CursorWorker, RunBudgetExceeded } from './worker.ts';
 import { GitHubIssueSource } from './workSource.ts';
 import { FactoryState } from './state.ts';
 import { Telemetry } from './telemetry.ts';
 import { filterAssigned, filterClaimed, parseSelection, type Selection } from './selector.ts';
-import { environmentPrompt, groomPrompt, implementPrompt, selectPrompt } from './prompts.ts';
+import { environmentPrompt, groomPrompt, implementPrompt, selectPrompt, simplifyPrompt } from './prompts.ts';
 import { factoryComment, groomState, isGroomed, needsGroom, parseGroomReply, verdict } from './groom.ts';
-import { addPrLabels, commentOnIssue, commentOnPr, defaultBranchHead, ensureLabel, findPrByBranch, listPrsByLabel } from './github.ts';
+import { addPrLabels, closePr, commentOnIssue, commentOnPr, defaultBranchHead, ensureLabel, findPrByBranch, listPrsByLabel, viewPr } from './github.ts';
 import { environmentChangedAt, skipReason, unreadFactoryPrs } from './environment.ts';
+import { declinedSimplifications, recentlyMergedFactoryPrs, shrinks, skipReason as simplifySkipReason } from './simplify.ts';
 
 export function log(msg: string): void {
   console.log(`[${new Date().toISOString()}] ${msg}`);
@@ -121,7 +123,7 @@ async function groomOne(
   principles: string,
 ): Promise<GroomRecord> {
   const startedAt = new Date().toISOString();
-  const handle = await worker.start(groomPrompt(task, principles), {
+  const handle = await worker.start(groomPrompt(task, principles, ctx.config.worker), {
     autoCreatePR: false,
     name: `factory-groom: #${task.issueNumber}`.slice(0, 100),
   });
@@ -157,6 +159,13 @@ async function groomOne(
   };
   ctx.telemetry.append(record);
   return record;
+}
+
+/** The PR an agent's run produced, if any: Cursor reports it, or the branch it pushed has one. */
+async function openedPr(config: FactoryConfig, result: RunResult): Promise<string | null> {
+  return result.prUrl
+    ?? (result.branch ? (await findPrByBranch(repoSlug(config), result.branch))?.url : undefined)
+    ?? null;
 }
 
 /** First agent flow: the selector reads the open issues and picks one. */
@@ -245,10 +254,7 @@ export async function runEnvironmentPhase(
     return record({ outcome: 'failed', prsExamined: [], failureReason: reason });
   }
 
-  const envPrUrl =
-    result.prUrl ??
-    (result.branch ? (await findPrByBranch(repoSlug(config), result.branch))?.url : undefined) ??
-    null;
+  const envPrUrl = await openedPr(config, result);
 
   if (envPrUrl) {
     await ensureLabel(repoSlug(config), config.labels.environmentPr, '1D76DB', 'Cloud-agent environment, opened by the software factory');
@@ -273,6 +279,92 @@ export async function runEnvironmentPhase(
   return record({ outcome: envPrUrl ? 'pr-opened' : 'no-gap', prUrl: envPrUrl });
 }
 
+/** Why the simplification pass is not running against `baseSha`, or null if it should. */
+export async function simplifySkip(ctx: FactoryContext, baseSha: string | null): Promise<string | null> {
+  const { config } = ctx;
+  const openPrs = config.simplify.enabled ? await listPrsByLabel(repoSlug(config), config.labels.simplifyPr, 'open') : [];
+  return simplifySkipReason(config.simplify.enabled, openPrs, ctx.telemetry.simplifyPasses(), baseSha);
+}
+
+function simplifyPromptFor(ctx: FactoryContext): string {
+  const outcomes = ctx.telemetry.outcomes();
+  return simplifyPrompt({
+    recentPrs: recentlyMergedFactoryPrs(outcomes, 5),
+    declinedPrs: declinedSimplifications(outcomes),
+    budget: ctx.config.worker,
+  });
+}
+
+/**
+ * The simplification phase: one agent, no issue, one job — open a PR that
+ * removes more code than it adds. The line count is the only thing the
+ * controller judges, because it is one number GitHub already computes and the
+ * failure it guards against is specific: an agent that simplifies by adding.
+ * A PR that grew the code is closed here, with the numbers, before a human
+ * spends a review on it.
+ *
+ * Returns the record it wrote, or null when the pass did not run.
+ */
+export async function runSimplifyPhase(ctx: FactoryContext, worker: CursorWorker): Promise<SimplifyRecord | null> {
+  const { config } = ctx;
+  const repo = repoSlug(config);
+  const baseSha = worker.startingRef;
+  const skip = await simplifySkip(ctx, baseSha);
+  if (skip) {
+    log(`simplify: skipped — ${skip}.`);
+    return null;
+  }
+
+  log(`simplify: looking for one simplification PR at ${baseSha?.slice(0, 8) ?? 'the default branch'}`);
+  const startedAt = new Date().toISOString();
+  const handle = await worker.start(simplifyPromptFor(ctx), { autoCreatePR: true, name: 'factory-simplify' });
+
+  const record = async (over: Partial<SimplifyRecord>): Promise<SimplifyRecord> => {
+    const full: SimplifyRecord = {
+      type: 'simplify',
+      baseSha,
+      outcome: 'no-change',
+      prUrl: null,
+      worker: 'cursor',
+      model: config.worker.model,
+      agentId: handle.agentId,
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      usage: (await worker.usage(handle.agentId)) ?? null,
+      durationMs: Date.now() - Date.parse(startedAt),
+      ...over,
+    };
+    ctx.telemetry.append(full);
+    return full;
+  };
+
+  const result = await worker.awaitResult(handle).catch((err: Error) => err);
+  if (result instanceof Error || result.status !== 'FINISHED') {
+    const reason = result instanceof Error ? result.message : `run ended with status ${result.status}`;
+    log(`simplify: pass failed — ${reason}`);
+    return record({ outcome: 'failed', failureReason: reason });
+  }
+
+  const prUrl = await openedPr(config, result);
+  if (!prUrl) {
+    log(`simplify: nothing proposed. Agent's report:\n${result.resultText.trim() || '_(no report)_'}`);
+    return record({ outcome: 'no-change' });
+  }
+
+  const { additions, deletions } = await viewPr(repo, prUrl);
+  if (!shrinks({ additions, deletions })) {
+    await closePr(repo, prUrl, factoryComment(
+      `🏭 **Factory simplification — closed.** A simplification PR has to remove more lines than it adds; this one adds ${additions} and removes ${deletions}. The branch is left for anyone who wants it. The next pass starts over once the code changes.`));
+    log(`simplify: closed ${prUrl} — it added ${additions} and removed ${deletions} lines.`);
+    return record({ outcome: 'grew', prUrl, additions, deletions });
+  }
+
+  await ensureLabel(repo, config.labels.simplifyPr, 'FBCA04', 'Simplification opened by the software factory; removes more than it adds');
+  await addPrLabels(repo, prUrl, [config.labels.simplifyPr]);
+  log(`simplify: opened ${prUrl} (−${deletions} +${additions}); it awaits a human and does not spend an implementer slot.`);
+  return record({ outcome: 'pr-opened', prUrl, additions, deletions });
+}
+
 export async function tick(opts: { dryRun: boolean }): Promise<void> {
   const ctx = buildContext();
   const { config } = ctx;
@@ -294,16 +386,23 @@ export async function tick(opts: { dryRun: boolean }): Promise<void> {
   //    capacity gate — it produces no code, so it cannot collide.
   if (candidates.length > 0) await runGroomPhase(ctx, worker, admissible(ctx, candidates, 'groom'));
 
-  // 3. Environment: fix the machine the implementers run on, from what the
-  //    implementers themselves said about it. Also ahead of the capacity gate,
-  //    and its PR is its own one-deep queue. Deliberately independent of the
-  //    backlog too: a machine that cannot verify stays broken whether or not
-  //    there is anything to build on it today, and the tick that notices is the
-  //    idle one.
-  await runEnvironmentPhase(ctx, worker).catch((err: Error) => {
-    log(`environment phase error: ${err.message}`);
-    return null;
-  });
+  // 3. Environment and simplification, together: fix the machine the
+  //    implementers run on from what they said about it, and take back some of
+  //    the complexity they added. Both ahead of the capacity gate, each its own
+  //    one-deep PR queue, and both deliberately independent of the backlog: a
+  //    broken machine or an accreting codebase is a problem whether or not
+  //    there is anything to build today, and the tick that notices is the idle
+  //    one. Concurrent because each may use the whole run budget.
+  await Promise.all([
+    runEnvironmentPhase(ctx, worker).catch((err: Error) => {
+      log(`environment phase error: ${err.message}`);
+      return null;
+    }),
+    runSimplifyPhase(ctx, worker).catch((err: Error) => {
+      log(`simplify phase error: ${err.message}`);
+      return null;
+    }),
+  ]);
 
   if (candidates.length === 0) {
     log('no open unclaimed issues. Nothing to implement.');
@@ -341,7 +440,7 @@ export async function tick(opts: { dryRun: boolean }): Promise<void> {
     picks.map((pick) =>
       runPipeline(ctx, worker, pick.task, pick.agentId, pick.usage).catch(async (err) => {
         log(`pipeline error for #${pick.task.issueNumber}: ${(err as Error).message}`);
-        await failRun(ctx, worker, pick.task, (err as Error).message);
+        await failRun(ctx, worker, pick.task, err as Error);
       }),
     ),
   );
@@ -372,7 +471,10 @@ async function pickTasks(
     const picked = await runSelector(worker, remaining);
 
     if (picked.selection.kind === 'none') {
-      log(`selector picked nothing. Its reasoning:\n${picked.reply}`);
+      // The selector has no veto — size was grooming's call — so this is a
+      // refusal against instruction. Logged rather than acted on: nothing here
+      // should change an issue's verdict except an attempt to build it.
+      log(`selector declined to pick, which it is told never to do; ending the round. Its reasoning:\n${picked.reply}`);
       break;
     }
     if (picked.selection.kind === 'unparseable') {
@@ -413,7 +515,7 @@ async function dryRun(ctx: FactoryContext, allCandidates: Task[]): Promise<void>
   const next = pending.slice(0, ctx.config.groom.maxPerTick);
   if (next.length > 0) {
     log(`would groom: ${next.map((t) => `#${t.issueNumber}`).join(' ')}. Groom prompt for #${next[0]!.issueNumber}:`);
-    console.log(`\n${groomPrompt(next[0]!, loadPrinciples(ctx.config))}\n`);
+    console.log(`\n${groomPrompt(next[0]!, loadPrinciples(ctx.config), ctx.config.worker)}\n`);
   }
   if (groomed.length > 0) {
     log('selector prompt would be:');
@@ -429,11 +531,20 @@ async function dryRun(ctx: FactoryContext, allCandidates: Task[]): Promise<void>
   const skip = skipReason(config.environment.enabled, openEnvPrs, unread, changedAt);
   if (skip) {
     log(`environment: would skip — ${skip}.`);
+  } else {
+    const prUrls = unread.fresh.slice(0, config.environment.maxPrsPerPass);
+    log(`environment: would read ${prUrls.length} of ${unread.fresh.length} unread factory PR(s)${unread.stale.length ? `, ignoring ${unread.stale.length} written before the environment changed` : ''}. Its prompt would be:`);
+    console.log(`\n${environmentPrompt(prUrls)}\n`);
+  }
+
+  const { sha } = await defaultBranchHead(repoSlug(config));
+  const simplifySkipped = await simplifySkip(ctx, sha);
+  if (simplifySkipped) {
+    log(`simplify: would skip — ${simplifySkipped}.`);
     return;
   }
-  const prUrls = unread.fresh.slice(0, config.environment.maxPrsPerPass);
-  log(`environment: would read ${prUrls.length} of ${unread.fresh.length} unread factory PR(s)${unread.stale.length ? `, ignoring ${unread.stale.length} written before the environment changed` : ''}. Its prompt would be:`);
-  console.log(`\n${environmentPrompt(prUrls)}\n`);
+  log(`simplify: would look for one simplification at ${sha.slice(0, 8)}. Its prompt would be:`);
+  console.log(`\n${simplifyPromptFor(ctx)}\n`);
 }
 
 async function runPipeline(
@@ -466,18 +577,16 @@ async function runPipeline(
   }
 
   const usage = (await worker.usage(handle.agentId)) ?? null;
-  const prUrl =
-    result.prUrl ??
-    (result.branch ? (await findPrByBranch(repoSlug(config), result.branch))?.url : undefined) ??
-    null;
+  const prUrl = await openedPr(config, result);
 
   if (!prUrl) {
-    // The agent chose not to open a PR; surface its explanation on the issue.
-    log(`no PR opened for #${task.issueNumber}; relaying the agent's explanation to the issue`);
-    if (result.resultText.trim()) {
-      await commentOnIssue(repoSlug(config), task.issueNumber, factoryComment(
-        `🏭 The factory attempted this issue but did not open a PR. Agent's report:\n\n${result.resultText}`));
-    }
+    // The agent finished without a PR: it judged the issue not buildable as
+    // scoped, or could not finish it. Either way the groom verdict is refuted
+    // by the one test that counts, so it is retracted along with the report —
+    // leaving the label would hand the same issue to the next selector.
+    log(`no PR opened for #${task.issueNumber}; retracting the groom verdict and relaying the agent's report`);
+    await ctx.source.recordFailedAttempt(task,
+      `Agent's report:\n\n${result.resultText.trim() || '_(the agent gave no report)_'}`);
     await ctx.source.markFinished(task);
   } else {
     current.prUrl = prUrl;
@@ -516,7 +625,8 @@ function pauseNote(config: FactoryConfig): string {
     : `the factory runs up to ${config.maxConcurrentJobs} jobs at a time`;
 }
 
-async function failRun(ctx: FactoryContext, worker: CodingWorker, task: Task, reason: string): Promise<void> {
+async function failRun(ctx: FactoryContext, worker: CodingWorker, task: Task, err: Error): Promise<void> {
+  const reason = err.message;
   const current = ctx.state.readRun(task.id);
   ctx.telemetry.append({
     type: 'run',
@@ -534,9 +644,19 @@ async function failRun(ctx: FactoryContext, worker: CodingWorker, task: Task, re
     usage: current ? ((await worker.usage(current.agentId).catch(() => undefined)) ?? null) : null,
     durationMs: current ? Date.now() - Date.parse(current.startedAt) : 0,
   });
-  // Release the issue so a future tick can retry or pick something else. If a
-  // PR was created before the failure, it carries the factory label and holds
-  // its slot until a human deals with it.
+  // A run that used its whole time budget without finishing is evidence about
+  // the issue, not the machinery: the groom said one PR and the attempt says
+  // otherwise, so the verdict is retracted. Any other failure — Cursor errors,
+  // a cancelled run, a GitHub hiccup — says nothing about the issue and only
+  // releases it for a later tick.
+  if (err instanceof RunBudgetExceeded && !current?.prUrl) {
+    await ctx.source.recordFailedAttempt(task,
+      `The implementer ran out of its ${err.maxRunMinutes}-minute budget without opening a PR.`).catch((e: Error) => {
+        log(`could not retract the groom verdict on #${task.issueNumber}: ${e.message}`);
+      });
+  }
+  // Release the issue. If a PR was created before the failure, it carries the
+  // factory label and holds its slot until a human deals with it.
   await ctx.source.markFinished(task);
   ctx.state.clearRun(task.id);
 }

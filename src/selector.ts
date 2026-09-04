@@ -1,8 +1,11 @@
-// Selection is an agent flow, not a formula: the selector agent reads the open
-// issues and picks the most well-scoped one. The only mechanical parts are
-// filtering out issues someone has already claimed — the factory itself, via
-// the wip label, or a human, via an assignee — and parsing the handoff line
-// from the selector's reply.
+// Selection is an agent flow, not a formula: the selector agent reads the
+// groomed issues and picks the best-defined one. It ranks; it does not re-vet.
+// Grooming is the only judge of whether an issue is one PR, so the selector is
+// told to always pick — a `none` reply is a refusal against instruction, kept
+// parseable only so that it is never mistaken for a pick. The only mechanical
+// parts are filtering out issues someone has already claimed — the factory
+// itself, via the wip label, or a human, via an assignee — and parsing the
+// handoff line from the selector's reply.
 
 import type { Task } from './types.ts';
 

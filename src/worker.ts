@@ -8,6 +8,18 @@ import type {
 const BASE_URL = 'https://api.cursor.com';
 const TERMINAL: RunStatus[] = ['FINISHED', 'ERROR', 'CANCELLED', 'EXPIRED'];
 
+/**
+ * The factory's own `maxRunMinutes` ran out. Distinct from Cursor's terminal
+ * statuses because it means something different: an ERROR is the machinery, a
+ * blown budget is evidence about the size of the work.
+ */
+export class RunBudgetExceeded extends Error {
+  constructor(readonly runId: string, readonly maxRunMinutes: number) {
+    super(`Run ${runId} exceeded ${maxRunMinutes} minutes; cancelled.`);
+    this.name = 'RunBudgetExceeded';
+  }
+}
+
 export interface CursorWorkerOptions {
   apiKey: string;
   repoUrl: string;
@@ -36,6 +48,11 @@ interface RunPayload {
 
 export class CursorWorker implements CodingWorker {
   constructor(private readonly opts: CursorWorkerOptions) {}
+
+  /** The commit every agent this worker launches starts from. */
+  get startingRef(): string | null {
+    return this.opts.startingRef;
+  }
 
   private log(msg: string): void {
     this.opts.log?.(msg);
@@ -112,9 +129,7 @@ export class CursorWorker implements CodingWorker {
       }
       if (Date.now() > deadline) {
         await this.api('POST', `/v1/agents/${handle.agentId}/runs/${handle.runId}/cancel`).catch(() => {});
-        throw new Error(
-          `Run ${handle.runId} exceeded ${this.opts.maxRunMinutes} minutes; cancelled.`,
-        );
+        throw new RunBudgetExceeded(handle.runId, this.opts.maxRunMinutes);
       }
       this.log(`agent ${handle.agentId} run ${handle.runId}: ${run.status}`);
       await new Promise((r) => setTimeout(r, intervalMs));

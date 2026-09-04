@@ -2,11 +2,11 @@
 // factory CLI — the daily trigger runs `factory run`; everything else is
 // for humans operating the factory.
 
-import { admissible, buildContext, buildWorker, candidateTasks, log, runEnvironmentPhase, runGroomPhase, runSelector, tick } from './controller.ts';
+import { admissible, buildContext, buildWorker, candidateTasks, log, runEnvironmentPhase, runGroomPhase, runSelector, runSimplifyPhase, simplifySkip, tick } from './controller.ts';
 import { repoSlug, requireCursorApiKey } from './config.ts';
 import { isGroomed, needsGroom, verdict } from './groom.ts';
 import { environmentChangedAt, skipReason, unreadFactoryPrs } from './environment.ts';
-import { listPrsByLabel } from './github.ts';
+import { defaultBranchHead, listPrsByLabel } from './github.ts';
 import type { CurrentRun } from './types.ts';
 
 const USAGE = `conveyor — thin software-factory control plane around Cursor
@@ -21,6 +21,9 @@ Usage:
   npm run factory -- env               Run just the environment phase: an agent reads the factory PRs it has not read yet,
                                        looking for checks the implementer could not run, and fixes .cursor/environment.json
                                        in the target repo so the next one can. Opens a PR only if it finds a gap it can close.
+  npm run factory -- simplify          Run just the simplification phase: an agent reads the codebase, starting from the
+                                       factory's own merged PRs, and opens one PR that removes more code than it adds.
+                                       A PR that grows the code is closed by the factory before a human sees it.
   npm run factory -- status            Show grooming progress, capacity, in-flight jobs, pending PRs, and recent telemetry.
   npm run factory -- abort [--issue N] Abandon stuck local pipelines — all of them, or just issue N's
                                        (cancels the Cursor runs if possible).
@@ -97,6 +100,23 @@ async function status(): Promise<void> {
     const last = ctx.telemetry.envPasses().at(-1);
     if (last) log(`  last pass: ${last.startedAt} → ${last.outcome}${last.prUrl ? ` ${last.prUrl}` : ''} (read ${last.prsExamined.length} PR(s))`);
   }
+
+  const { sha } = await defaultBranchHead(repoSlug(ctx.config));
+  const simplifySkipped = await simplifySkip(ctx, sha);
+  log(`simplify: ${simplifySkipped ?? `next tick looks for one simplification at ${sha.slice(0, 8)}`}.`);
+  const lastSimplify = ctx.telemetry.simplifyPasses().at(-1);
+  if (lastSimplify) {
+    const lines = lastSimplify.additions !== undefined ? ` (−${lastSimplify.deletions} +${lastSimplify.additions})` : '';
+    log(`  last pass: ${lastSimplify.startedAt} → ${lastSimplify.outcome}${lastSimplify.prUrl ? ` ${lastSimplify.prUrl}` : ''}${lines}`);
+  }
+}
+
+async function simplify(): Promise<void> {
+  const ctx = buildContext();
+  const record = await runSimplifyPhase(ctx, await buildWorker(ctx.config));
+  if (!record) return;
+  const lines = record.additions !== undefined ? ` (−${record.deletions} +${record.additions})` : '';
+  log(`simplification pass → ${record.outcome}${record.prUrl ? ` ${record.prUrl}` : ''}${lines}${record.failureReason ? ` (${record.failureReason})` : ''}`);
 }
 
 async function env(): Promise<void> {
@@ -202,6 +222,9 @@ async function main(): Promise<void> {
       break;
     case 'env':
       await env();
+      break;
+    case 'simplify':
+      await simplify();
       break;
     case 'status':
       await status();

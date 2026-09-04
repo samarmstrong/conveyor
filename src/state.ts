@@ -87,7 +87,7 @@ export class FactoryState {
       if (!pr || pr.state === 'OPEN') continue;
 
       const changeRequests = pr.reviews.filter((r) => r.state === 'CHANGES_REQUESTED').length;
-      const issueNumber = job.issueNumber ?? (job.source === 'environment' ? null : linkedIssueNumber(pr.body));
+      const issueNumber = job.issueNumber ?? ((job.source ?? 'implementer') === 'implementer' ? linkedIssueNumber(pr.body) : null);
       const outcome: OutcomeRecord = {
         type: 'outcome',
         prUrl: job.prUrl,
@@ -103,7 +103,7 @@ export class FactoryState {
       recorded += 1;
       log(`outcome recorded: ${job.prUrl} → ${pr.state}`);
 
-      // Environment PRs claim no issue, so there is no wip label to release.
+      // Environment and simplification PRs claim no issue, so there is no wip label to release.
       if (issueNumber !== null) {
         await removeIssueLabels(this.repo, issueNumber, [this.config.labels.issueInProgress]).catch(() => {});
       }

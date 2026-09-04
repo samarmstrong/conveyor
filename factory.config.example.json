@@ -14,7 +14,8 @@
     "issueInProgress": "factory:wip",
     "groomed": "factory:groomed",
     "needsWork": "factory:needs-work",
-    "environmentPr": "factory:env"
+    "environmentPr": "factory:env",
+    "simplifyPr": "factory:simplify"
   },
   "groom": {
     "maxPerTick": 5,
@@ -26,6 +27,9 @@
   "environment": {
     "enabled": true,
     "maxPrsPerPass": 3
+  },
+  "simplify": {
+    "enabled": true
   },
   "assignedIssues": {
     "groom": true,

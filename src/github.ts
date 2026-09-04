@@ -69,9 +69,11 @@ export interface PrData {
   reviews: { state: string }[];
   comments: { author: { login: string } }[];
   headRefName: string;
+  additions: number;
+  deletions: number;
 }
 
-const PR_FIELDS = 'number,url,title,state,isDraft,mergedAt,closedAt,body,reviews,comments,headRefName';
+const PR_FIELDS = 'number,url,title,state,isDraft,mergedAt,closedAt,body,reviews,comments,headRefName,additions,deletions';
 
 export async function listPrsByLabel(repo: string, label: string, state: 'open' | 'closed' | 'merged' | 'all'): Promise<PrData[]> {
   return ghJson<PrData[]>([
@@ -138,6 +140,10 @@ export async function commentOnIssue(repo: string, issue: number, body: string):
 
 export async function commentOnPr(repo: string, prUrl: string, body: string): Promise<void> {
   await ghStdin(['pr', 'comment', prUrl, '-R', repo, '--body-file', '-'], body);
+}
+
+export async function closePr(repo: string, prUrl: string, comment: string): Promise<void> {
+  await gh(['pr', 'close', prUrl, '-R', repo, '--comment', comment]);
 }
 
 /** Extract "Closes #N" / "#N" issue references from a PR body. */

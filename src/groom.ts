@@ -139,6 +139,18 @@ export function groomComment(task: Task, reply: GroomReply): string {
 }
 
 /**
+ * The factory retracting its own groomed verdict after an implementation attempt
+ * refuted it. A factory comment, not a groom stamp: the fingerprint keeps
+ * pointing at what the groom read, so only a human reply or edit queues a
+ * re-groom, and that re-groom reads this report as evidence.
+ */
+export function failedAttemptComment(report: string): string {
+  return factoryComment(
+    `🏭 **Factory attempt — needs work.** The factory tried to implement this as groomed and did not land a PR, so it is no longer picking it up as scoped. Edit the description or reply here and it gets groomed again on a later tick, with this attempt in view.\n\n${report.trim()}`,
+  );
+}
+
+/**
  * Never groomed, or groomed against an issue that has since changed.
  *
  * Newest first. A stale issue's premises are false by construction — the code

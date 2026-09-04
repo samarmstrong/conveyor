@@ -31,9 +31,19 @@ Plenty of tools point an agent at a backlog. This one takes positions:
   implement — it cannot tell "assigned and untouched" from "assigned and half-written
   locally", and guessing wrong wastes a person's work, not an agent's. It will still
   groom it, because a verdict costs the assignee nothing and may be useful to them.
+- **Every change is tested live, and every PR says what was checked.** Unit tests stand
+  in for nothing: the implementer starts the app and exercises the change through its real
+  entry point, with `agent-browser` for anything that has a UI, and ends its PR with a
+  Verification section listing each check it ran and each it did not, with the reason.
+  The groomer budgets for that and may not scope it away to make an issue fit.
 - **The factory owns the machine it builds on.** When an agent cannot verify its own
   change because the sandbox lacks something, that is the factory's bug, not the
   reviewer's problem. An agent reads the factory's own PRs and fixes the environment.
+- **Something has to push the other way.** Autonomous implementers accrete complexity:
+  every PR is locally reasonable and the sum becomes unwieldy. So one agent's only job
+  is to remove code, in a simplification PR that must delete more lines than it adds or
+  the factory closes it before a human sees it. A test proving something is gone, or a
+  helper standing in for three plain lines, is not simpler.
 - **Telemetry exists to earn autonomy.** Every groom, run, environment pass, and PR
   outcome is recorded so that "which classes of task can automerge?" becomes an
   empirical question, not a leap of faith.
@@ -48,17 +58,24 @@ reconcile outcomes of previously opened PRs (merged/rejected → telemetry, rele
 → ENVIRONMENT agent: reads the factory PRs it has not read yet, looking for a check the
    implementer could not run, and fixes .cursor/environment.json in the target repo so the
    next one can. Opens a PR only when it finds a gap it can close; one open at a time
+→ SIMPLIFY agent, alongside it: reads the codebase, starting from the factory's own merged
+   PRs, and opens one PR that removes more code than it adds — abstractions with one
+   caller, fallback paths nothing reaches, hand-rolled copies of what the SDK ships. A PR
+   that grows the code is closed by the factory, unseen. One open at a time; a commit the
+   last pass already judged is not looked at again
 count the jobs already in flight (open factory PRs + running pipelines)
    → no free slot under maxConcurrentJobs? stop here
 for each free slot:
-   → SELECTOR agent: gets the GROOMED issues (minus factory:wip claims, issues
-      assigned to a human, and the picks made earlier this tick) and picks the most
-      well-scoped one by judgment — no scores, no weights
+   → SELECTOR agent: gets LINKS to the GROOMED issues (minus factory:wip claims,
+      issues assigned to a human, and the picks made earlier this tick), reads them,
+      and picks the best-defined one by judgment — no scores, no weights, no veto
    label the pick factory:wip
 → handoff to a FRESH implementer agent per pick, running concurrently, each with a
    short workflow prompt and the issue LINK (not its text — the agent reads the
    issue itself, notes and all)
 label the resulting PRs `factory`, comment on the issues, record telemetry
+   → a run that ends with NO PR, or runs out of worker.maxRunMinutes, retracts the
+      groom verdict: the issue is relabelled needs-work with the agent's report
 stop — a human merging or closing a PR is what frees the next slot
 ```
 
@@ -66,6 +83,31 @@ Grooming sits ahead of the capacity gate on purpose: it produces no code, so a P
 awaiting review is no reason to stop vetting the backlog. Nothing is implemented until
 it has been groomed, which makes the pipeline self-throttling — an empty groomed set
 means the factory idles rather than picking something unvetted.
+
+Agents get links, not excerpts. No prompt pastes an issue's text, truncated or
+otherwise: the agent opens the issue and reads what is actually there — the comments,
+the groom notes, whatever a human added since. An excerpt is a second, staler copy of
+the issue that the prompt author had to decide how to cut.
+
+## One judge of size
+
+"Is this one PR?" is asked exactly once, by grooming, and it is asked with the real
+constraint in hand: the groom prompt states the implementer's run budget
+(`worker.maxRunMinutes`), that it is a single fresh agent, and that it can use
+subagents. The selector does not ask again. It is told grooming already settled size,
+that it is ranking rather than re-vetting, and that it must always pick one — a
+selector that could decline would be a second gate with no record of its verdict,
+and a factory whose two gates disagree stalls forever on the same issue with the
+same log line.
+
+What tests the groom's judgment is the attempt. An implementer that finishes without a
+PR, or runs out of its budget, has produced the one piece of evidence that matters, so
+the factory retracts the verdict: `factory:groomed` comes off, `factory:needs-work`
+goes on, and a comment carries the agent's report. That comment is not a new groom
+stamp, so the fingerprint still points at what the groom read — the issue is groomed
+again when a human replies or edits, and that groom is told to weigh the failed
+attempt. Failures that say nothing about the issue (a Cursor error, a cancelled run, a
+GitHub hiccup) only release it for a later tick.
 
 ## Grooming
 
@@ -146,8 +188,9 @@ An implementer that cannot verify its own change says so, plainly, in the PR it 
 > Could not run the job itself here: it pulls the just-built GHCR images, and this
 > environment has no Docker.
 
-That is a real finding about the factory, and until it is acted on it is only prose in a
-PR body. The environment phase acts on it. An agent is handed the factory PRs it has not
+The implementer is required to write that section — every check run, every check not run,
+and why — so a blocked live test cannot go unmentioned. That is a real finding about the
+factory, and until it is acted on it is only prose in a PR body. The environment phase acts on it. An agent is handed the factory PRs it has not
 read yet and reads them itself, looking for one thing: **a check the author would have run
 and could not, because the machine lacked something.** If the environment can close the
 gap, it commits `.cursor/environment.json` (and any Dockerfile it needs) to the target repo
@@ -194,6 +237,44 @@ about the current machine and no environment PR already open, and reads at most
 for the same reason. The old tail is starved on a busy factory, deliberately: an unread
 old PR costs nothing, a stale environment costs every run.
 
+## Simplification
+
+Everything else in the factory adds code. Grooming lets more of the backlog through,
+implementers land it, the environment phase makes sure it can be verified — and every
+one of those PRs is locally reasonable. The sum is not. Our first week of merged factory
+PRs ran roughly +260/−15, +370/−5, +490/−130: an autonomous codebase accretes helpers,
+fallback paths, hand-rolled loops the SDK already ships, and tests for all of it, until a
+person can no longer hold it in their head and progress slows to match. The
+simplification phase is the counterweight: one agent whose only job is to take code out.
+
+It is handed no issue. Finding the accretion is the work, so the agent reads the codebase
+itself, pointed first at the factory's most recently merged PRs — where the newest
+complexity most likely is — and told what to look for: abstractions with one caller,
+legacy and fallback paths nothing reaches, two implementations of one idea, features
+nobody asked for, and hand-rolled versions of what the framework provides. It has the
+same run budget as an implementer, so the PR can be substantial, and it works to the same
+rules: verify live, get a subagent review, report every check in the PR.
+
+**The one rule the factory enforces itself is that the PR must remove more lines than it
+adds**, as GitHub counts them over the whole diff. This is enforced mechanically, not
+just asked for, because the failure mode is specific and common: an agent asked to
+simplify introduces an abstraction, or deletes a path and adds a test asserting the path
+is gone, and calls the result cleaner. The controller reads the PR's additions and
+deletions — one number GitHub already computes, no prose parsed — and a PR that grew the
+code is closed with the numbers in a comment before any human spends a review on it. The
+branch is left in place; the telemetry records it as `grew`. If that becomes common, the
+prompt is what to tune.
+
+Simplification PRs are their own queue, one deep, like environment PRs: they carry
+`factory:simplify` rather than `factory`, so they never spend an implementer's slot. They
+*can* touch the same files as an in-flight implementer — that is the same collision two
+concurrent implementers can have, and it is resolved the same way, by the human at review
+time. A pass that reached a conclusion on a commit — opened a PR, found nothing, or grew
+the code — is not repeated until the default branch moves, so an idle repo does not buy a
+fresh 90-minute search every day. A simplification a human closes unmerged is recorded
+like any other rejected PR, and the next pass is handed its link and told not to propose
+it again. Set `simplify.enabled` to `false` to turn the phase off.
+
 ## Deploying
 
 A deployment is a fork (or "Use this template" copy) of this repo that commits
@@ -225,6 +306,7 @@ npm run factory -- run --dry-run   # grooming/backlog state + the exact prompts,
 npm run factory -- groom           # run just the grooming phase
 npm run factory -- select          # run just the selector agent over the groomed issues
 npm run factory -- env             # run just the environment phase over the unread factory PRs
+npm run factory -- simplify        # run just the simplification phase: one PR that removes more than it adds
 npm run factory -- status          # grooming progress, capacity, in-flight jobs, recent telemetry
 npm run factory -- abort           # abandon every stuck pipeline (cancels the Cursor runs)
 npm run factory -- abort --issue 42  # ...or just the one working issue #42
@@ -263,8 +345,11 @@ so the workflow is inert in the upstream repo.
 - `factory.config.json` → `environment` — `enabled` (default true) and `maxPrsPerPass`
   (default 3): the phase that owns the cloud-agent environment. Off means the factory
   keeps opening PRs whose verification was blocked and never fixes the cause.
-- `src/prompts.ts` — all four prompts (groom / selector / implementer / environment), each a few
-  lines. Add lines only for specific opinions where the model's default behavior isn't
+- `factory.config.json` → `simplify` — `enabled` (default true): the phase that removes
+  code. Off means the factory only ever adds.
+- `src/prompts.ts` — all five prompts (groom / selector / implementer / environment /
+  simplify), each a few lines. The implementer and simplifier share one block of working
+  rules so a simplification is held to exactly the standard the code it removes was built to. Add lines only for specific opinions where the model's default behavior isn't
   what you want. **Widening autonomy later = widening this policy, not adding
   machinery.**
 - `src/selector.ts` — only the mechanical bits: filter the claims (`factory:wip`, and
@@ -275,6 +360,9 @@ so the workflow is inert in the upstream repo.
 - `src/environment.ts` — only the mechanical bits: which factory PRs a pass has not read
   yet, which of their reports still describe the current machine, and why a pass is not
   running. No parsing at all.
+- `src/simplify.ts` — only the mechanical bits: which merged PRs to point the agent at,
+  which declined ones to warn it off, whether a PR shrank the code, and why a pass is not
+  running.
 
 ## Telemetry
 
@@ -287,14 +375,19 @@ Append-only JSONL at `telemetry/runs.jsonl`:
 - `env` records: which factory PRs the pass read, whether it opened a PR and which,
   agent id, token usage, duration. A failed pass records no PRs as read, so they are
   offered to the next one.
+- `simplify` records: the commit the pass read, whether it opened a PR (`pr-opened`),
+  opened one the factory closed for growing the code (`grew`), or proposed nothing
+  (`no-change`), the PR's additions and deletions, agent id, token usage, duration.
 - `outcome` records: per PR — merged or rejected, human change requests, human
-  comment count, time to close, and which pipeline opened it (`implementer` or
-  `environment`).
+  comment count, time to close, and which pipeline opened it (`implementer`,
+  `environment`, or `simplify`).
 
 Joining `groom` to `outcome` is the question worth measuring: do issues that carried
 grooming notes get merged with fewer human change requests than ones that passed clean?
 Joining `env` to the `run` records after it is the second: once an environment PR merges,
-do the implementers that follow stop reporting checks they could not run?
+do the implementers that follow stop reporting checks they could not run? The `simplify`
+records answer a third: what does the factory's net line count look like once something
+is pushing the other way, and how often does an agent asked to simplify grow the code?
 
 This is the dataset for deciding what V2 should be (e.g. automerge for classes of
 tasks whose historical human-rejection rate is ~zero).
@@ -309,13 +402,14 @@ src/worker.ts      CursorWorker (Cursor Cloud Agents v1 API) — the only Cursor
 src/workSource.ts  GitHubIssueSource (incl. writing groom verdicts back to issues)
 src/groom.ts       verdict labels + fingerprint, backlog filters, VERDICT parsing
 src/environment.ts unread-PR bookkeeping + report freshness for the environment phase
+src/simplify.ts    the shrink rule, what to point the simplifier at, when not to run it
 src/selector.ts    wip + assignee filters, SELECTED-line parsing (mechanical only)
-src/prompts.ts     groom + selector + implementer + environment prompts  ← factory policy
+src/prompts.ts     groom + selector + implementer + environment + simplify prompts  ← factory policy
 src/state.ts       capacity gate (open PRs + in-flight runs), outcome reconciliation
 src/controller.ts  the tick
 src/github.ts      thin `gh` CLI wrapper
 src/telemetry.ts   JSONL groom/run/outcome log
-src/cli.ts         run / groom / select / env / status / abort
+src/cli.ts         run / groom / select / env / simplify / status / abort
 ```
 
 Non-goals (V1, on purpose): custom agent runtime, custom sandboxes, multi-agent

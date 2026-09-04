@@ -4,7 +4,7 @@ import { repoSlug } from './config.ts';
 import {
   addIssueLabels, commentOnIssue, editIssueBody, ensureLabel, listOpenIssues, removeIssueLabels,
 } from './github.ts';
-import { groomComment, hasLegacyBlock, stripLegacyBlock, type GroomReply } from './groom.ts';
+import { failedAttemptComment, groomComment, hasLegacyBlock, stripLegacyBlock, type GroomReply } from './groom.ts';
 
 export class GitHubIssueSource implements WorkSource {
   constructor(private readonly config: FactoryConfig) {}
@@ -39,6 +39,25 @@ export class GitHubIssueSource implements WorkSource {
 
   async markFinished(task: Task): Promise<void> {
     await removeIssueLabels(this.repo, task.issueNumber, [this.config.labels.issueInProgress]).catch(() => {});
+  }
+
+  /**
+   * Grooming is the only judge of whether an issue is one PR, and an attempt is
+   * the only test of that judgment. When the attempt fails the verdict is
+   * retracted here — label flipped, reason posted — rather than left standing
+   * for the next selector to pick and the next implementer to fail on.
+   *
+   * The comment is a plain factory comment, not a new groom stamp, so the
+   * fingerprint still points at the human content the groom read: the issue is
+   * groomed again only when a human replies or edits, and that groom sees this
+   * report among the comments.
+   */
+  async recordFailedAttempt(task: Task, report: string): Promise<void> {
+    await commentOnIssue(this.repo, task.issueNumber, failedAttemptComment(report));
+    const { groomed, needsWork } = this.config.labels;
+    await ensureLabel(this.repo, needsWork, 'D93F0B', 'Not ready for the factory as written; edit the issue to have it re-reviewed');
+    await addIssueLabels(this.repo, task.issueNumber, [needsWork]);
+    await removeIssueLabels(this.repo, task.issueNumber, [groomed]).catch(() => {});
   }
 
   /**

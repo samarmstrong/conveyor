@@ -19,6 +19,8 @@ export interface FactoryConfig {
     /** Carried by the environment agent's PRs, and by nothing else — this is
      *  what keeps them out of the `maxConcurrentJobs` count. */
     environmentPr: string;
+    /** Likewise for the simplification agent's PRs. */
+    simplifyPr: string;
   };
   groom: { maxPerTick: number; principlesFile: string };
   selector: { maxCandidates: number };
@@ -27,6 +29,9 @@ export interface FactoryConfig {
    *  environment so the next one can. `maxPrsPerPass` bounds how many PRs one
    *  pass reads; only one environment PR is ever open at a time. */
   environment: { enabled: boolean; maxPrsPerPass: number };
+  /** The simplification phase: an agent whose only job is to open a PR that
+   *  removes more code than it adds. One such PR is open at a time. */
+  simplify: { enabled: boolean };
   /**
    * Whether a phase may act on an issue a human has assigned to themselves.
    * Grooming defaults to true — vetting costs the assignee nothing and the
@@ -75,6 +80,8 @@ export function loadConfig(root: string = projectRoot): FactoryConfig {
     );
   }
   config.labels.environmentPr ??= 'factory:env';
+  config.labels.simplifyPr ??= 'factory:simplify';
+  config.simplify ??= { enabled: true };
   // Narrowing what the factory touches is the safe direction for a deployment
   // that pulls this in without asking for it, so this defaults on rather than
   // preserving the old take-anything behavior.
