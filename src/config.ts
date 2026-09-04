@@ -16,11 +16,35 @@ export interface FactoryConfig {
     issueInProgress: string;
     groomed: string;
     needsWork: string;
+    /** Carried by the environment agent's PRs, and by nothing else — this is
+     *  what keeps them out of the `maxConcurrentJobs` count. */
+    environmentPr: string;
+    /** Likewise for the simplification agent's PRs. */
+    simplifyPr: string;
   };
   groom: { maxPerTick: number; principlesFile: string };
   selector: { maxCandidates: number };
+  /** The environment phase: an agent that reads the factory's own PRs looking
+   *  for checks the implementer could not run, and fixes the cloud-agent
+   *  environment so the next one can. `maxPrsPerPass` bounds how many PRs one
+   *  pass reads; only one environment PR is ever open at a time. */
+  environment: { enabled: boolean; maxPrsPerPass: number };
+  /** The simplification phase: an agent whose only job is to open a PR that
+   *  removes more code than it adds. One such PR is open at a time. */
+  simplify: { enabled: boolean };
+  /**
+   * Whether a phase may act on an issue a human has assigned to themselves.
+   * Grooming defaults to true — vetting costs the assignee nothing and the
+   * verdict is useful to them — and implementation to false, because two agents
+   * on one issue is the collision the factory exists to avoid.
+   */
+  assignedIssues: { groom: boolean; implement: boolean };
   telemetryDir: string;
   staleRunHours: number;
+  /** The throttle, in one number: how many jobs may exist at once, counting
+   *  open factory PRs awaiting a human and pipelines still running. It is also
+   *  the most pipelines one tick will start. 1 = strict one-at-a-time. */
+  maxConcurrentJobs: number;
 }
 
 export const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -45,7 +69,31 @@ export function loadConfig(root: string = projectRoot): FactoryConfig {
       `factory.config.json not found at ${path} — copy factory.config.example.json and point it at your target repo.`,
     );
   }
-  return JSON.parse(readFileSync(path, 'utf8')) as FactoryConfig;
+  const config = JSON.parse(readFileSync(path, 'utf8')) as FactoryConfig;
+  // Deployments commit their own factory.config.json and pull engine updates on
+  // top, so a field added upstream is simply absent in older ones. Default to
+  // the original one-job-at-a-time throttle rather than failing their next tick.
+  config.maxConcurrentJobs ??= 1;
+  if (!Number.isInteger(config.maxConcurrentJobs) || config.maxConcurrentJobs < 1) {
+    throw new Error(
+      `maxConcurrentJobs must be a positive integer, got ${JSON.stringify(config.maxConcurrentJobs)}`,
+    );
+  }
+  config.labels.environmentPr ??= 'factory:env';
+  config.labels.simplifyPr ??= 'factory:simplify';
+  config.simplify ??= { enabled: true };
+  // Narrowing what the factory touches is the safe direction for a deployment
+  // that pulls this in without asking for it, so this defaults on rather than
+  // preserving the old take-anything behavior.
+  config.assignedIssues ??= { groom: true, implement: false };
+  config.environment ??= { enabled: true, maxPrsPerPass: 3 };
+  config.environment.maxPrsPerPass ??= 3;
+  if (!Number.isInteger(config.environment.maxPrsPerPass) || config.environment.maxPrsPerPass < 1) {
+    throw new Error(
+      `environment.maxPrsPerPass must be a positive integer, got ${JSON.stringify(config.environment.maxPrsPerPass)}`,
+    );
+  }
+  return config;
 }
 
 /** The product-direction principles grooming judges against. Factory-local by

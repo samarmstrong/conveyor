@@ -1,10 +1,10 @@
-import type { GroomVerdict, Task, WorkSource } from './types.ts';
+import type { Task, WorkSource } from './types.ts';
 import type { FactoryConfig } from './config.ts';
 import { repoSlug } from './config.ts';
 import {
   addIssueLabels, commentOnIssue, editIssueBody, ensureLabel, listOpenIssues, removeIssueLabels,
 } from './github.ts';
-import { stampBody } from './groom.ts';
+import { failedAttemptComment, groomComment, hasLegacyBlock, stripLegacyBlock, type GroomReply } from './groom.ts';
 
 export class GitHubIssueSource implements WorkSource {
   constructor(private readonly config: FactoryConfig) {}
@@ -20,7 +20,9 @@ export class GitHubIssueSource implements WorkSource {
       issueNumber: i.number,
       title: i.title,
       body: i.body ?? '',
+      comments: (i.comments ?? []).map((c) => ({ body: c.body ?? '' })),
       labels: i.labels.map((l) => l.name),
+      assignees: (i.assignees ?? []).map((a) => a.login),
       url: i.url,
     }));
   }
@@ -40,32 +42,48 @@ export class GitHubIssueSource implements WorkSource {
   }
 
   /**
-   * The stamped body is the machine-readable record; the labels mirror it for
-   * humans browsing the issue list, and the code always re-derives state from
-   * the body, so a hand-edited label cannot make the factory act wrongly.
+   * Grooming is the only judge of whether an issue is one PR, and an attempt is
+   * the only test of that judgment. When the attempt fails the verdict is
+   * retracted here — label flipped, reason posted — rather than left standing
+   * for the next selector to pick and the next implementer to fail on.
+   *
+   * The comment is a plain factory comment, not a new groom stamp, so the
+   * fingerprint still points at the human content the groom read: the issue is
+   * groomed again only when a human replies or edits, and that groom sees this
+   * report among the comments.
    */
-  async recordGroom(
-    task: Task,
-    reply: { verdict: GroomVerdict; notes: string | undefined; reasoning: string },
-  ): Promise<void> {
-    await editIssueBody(this.repo, task.issueNumber, stampBody(task.body, reply.verdict, reply.notes));
+  async recordFailedAttempt(task: Task, report: string): Promise<void> {
+    await commentOnIssue(this.repo, task.issueNumber, failedAttemptComment(report));
+    const { groomed, needsWork } = this.config.labels;
+    await ensureLabel(this.repo, needsWork, 'D93F0B', 'Not ready for the factory as written; edit the issue to have it re-reviewed');
+    await addIssueLabels(this.repo, task.issueNumber, [needsWork]);
+    await removeIssueLabels(this.repo, task.issueNumber, [groomed]).catch(() => {});
+  }
+
+  /**
+   * A verdict is a comment plus a label, never an edit: both outcomes are the
+   * factory's own words, signed and timestamped as such, and nothing a human
+   * wrote is touched.
+   *
+   * The comment goes first because it carries the fingerprint the label is read
+   * against. Either half failing therefore leaves the issue looking ungroomed or
+   * stale — it gets groomed again next tick, which is the safe way to fail.
+   */
+  async recordGroom(task: Task, reply: GroomReply): Promise<void> {
+    await commentOnIssue(this.repo, task.issueNumber, groomComment(task, reply));
 
     const { groomed, needsWork } = this.config.labels;
     const [add, remove] = reply.verdict === 'groomed' ? [groomed, needsWork] : [needsWork, groomed];
     await ensureLabel(this.repo, groomed, '0E8A16', 'Vetted by the factory; eligible for an agent to implement');
-    await ensureLabel(this.repo, needsWork, 'D93F0B', 'Not ready for the factory as written; edit the description to have it re-reviewed');
+    await ensureLabel(this.repo, needsWork, 'D93F0B', 'Not ready for the factory as written; edit the issue to have it re-reviewed');
+    // The label is the verdict of record: remove one by hand and the issue is groomed again.
     await addIssueLabels(this.repo, task.issueNumber, [add]);
     await removeIssueLabels(this.repo, task.issueNumber, [remove]).catch(() => {});
 
-    // needs-work is advice, not a verdict on the underlying problem, so it goes
-    // in the open where the author can argue with it. A pass stays silent: the
-    // stamped body already says everything.
-    if (reply.verdict === 'needs-work') {
-      await commentOnIssue(
-        this.repo,
-        task.issueNumber,
-        `🏭 The factory reviewed this issue and is **not** picking it up as written.\n\n${reply.reasoning}\n\n---\nEdit the description and the factory will review it again on a later tick.`,
-      );
+    // Migration: verdicts used to be stamped into the description. Now that this
+    // issue's verdict lives in a comment, give the author their description back.
+    if (hasLegacyBlock(task.body)) {
+      await editIssueBody(this.repo, task.issueNumber, `${stripLegacyBlock(task.body).trimEnd()}\n`).catch(() => {});
     }
   }
 }

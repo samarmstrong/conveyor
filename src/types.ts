@@ -6,8 +6,16 @@ export interface Task {
   issueNumber: number;
   title: string;
   body: string;
+  /** In chronological order. Grooming judges the description and these together. */
+  comments: IssueComment[];
   labels: string[];
+  /** GitHub logins. A non-empty list is a human's claim on the issue. */
+  assignees: string[];
   url: string;
+}
+
+export interface IssueComment {
+  body: string;
 }
 
 export interface ModelSpec {
@@ -75,33 +83,40 @@ export interface WorkSource {
   eligibleTasks(): Promise<Task[]>;
   markStarted(task: Task): Promise<void>;
   markFinished(task: Task): Promise<void>;
-  /** Persist a groom verdict onto the issue: stamped body, label, and — for
-   *  needs-work — a visible comment saying why. */
+  /** Publish a groom verdict on the issue: a stamped comment saying what the
+   *  factory concluded and why, plus a label mirroring it. */
   recordGroom(task: Task, reply: { verdict: GroomVerdict; notes: string | undefined; reasoning: string }): Promise<void>;
+  /** An implementation attempt refuted the groomed verdict: flip the label to
+   *  needs-work and say why, so the issue is not picked again as scoped. */
+  recordFailedAttempt(task: Task, report: string): Promise<void>;
 }
 
 // --- Telemetry records (append-only JSONL) ---
 
-export interface RunRecord {
+/** What every agent the factory launches leaves behind, whatever it was for. */
+interface AgentPass {
+  worker: string;
+  model: ModelSpec | null;
+  agentId: string;
+  startedAt: string;
+  finishedAt: string;
+  usage: TokenUsage | null;
+  durationMs: number;
+}
+
+export interface RunRecord extends AgentPass {
   type: 'run';
   taskId: string;
   issueNumber: number;
   issueTitle: string;
-  worker: string;
-  model: ModelSpec | null;
-  agentId: string;
   selectorAgentId?: string;
-  startedAt: string;
-  finishedAt: string;
   outcome: 'pr-opened' | 'no-pr' | 'failed' | 'aborted';
   failureReason?: string;
   prUrl: string | null;
-  usage: TokenUsage | null;
   selectorUsage?: TokenUsage | null;
-  durationMs: number;
 }
 
-export interface GroomRecord {
+export interface GroomRecord extends AgentPass {
   type: 'groom';
   taskId: string;
   issueNumber: number;
@@ -110,18 +125,14 @@ export interface GroomRecord {
   /** True when the issue had been groomed before and its description changed. */
   regroom: boolean;
   hadNotes: boolean;
-  worker: string;
-  model: ModelSpec | null;
-  agentId: string;
-  startedAt: string;
-  finishedAt: string;
-  usage: TokenUsage | null;
-  durationMs: number;
 }
 
 export interface OutcomeRecord {
   type: 'outcome';
   prUrl: string;
+  /** Which pipeline opened it. Absent on records written before env passes
+   *  existed, which were all implementer PRs. */
+  source?: 'implementer' | 'environment' | 'simplify';
   issueNumber: number | null;
   merged: boolean;
   closedAt: string;
@@ -130,7 +141,38 @@ export interface OutcomeRecord {
   recordedAt: string;
 }
 
-export type TelemetryRecord = RunRecord | GroomRecord | OutcomeRecord;
+/**
+ * One pass of the environment agent: it read some factory PRs and either found
+ * a gap the cloud-agent environment could close (and opened a PR closing it) or
+ * did not. `prsExamined` is what makes a pass idempotent — those PRs are never
+ * read again — so a failed pass records none of them and they are retried.
+ */
+export interface EnvRecord extends AgentPass {
+  type: 'env';
+  prsExamined: string[];
+  outcome: 'pr-opened' | 'no-gap' | 'failed';
+  prUrl: string | null;
+  failureReason?: string;
+}
+
+/**
+ * One pass of the simplification agent. It opened a PR that removes more lines
+ * than it adds, or one that did not (`grew` — the factory closed it before a
+ * human saw it), or proposed nothing. `baseSha` is the commit it read: a pass
+ * that reached a conclusion is not repeated on the same one.
+ */
+export interface SimplifyRecord extends AgentPass {
+  type: 'simplify';
+  baseSha: string | null;
+  outcome: 'pr-opened' | 'grew' | 'no-change' | 'failed';
+  prUrl: string | null;
+  /** GitHub's count for the PR, when one was opened. */
+  additions?: number;
+  deletions?: number;
+  failureReason?: string;
+}
+
+export type TelemetryRecord = RunRecord | GroomRecord | OutcomeRecord | EnvRecord | SimplifyRecord;
 
 // --- Pipeline state for crash detection ---
 

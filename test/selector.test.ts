@@ -1,14 +1,16 @@
 import { describe, expect, it } from 'vitest';
-import { filterClaimed, parseSelection } from '../src/selector.ts';
+import { filterAssigned, filterClaimed, parseSelection } from '../src/selector.ts';
 import type { Task } from '../src/types.ts';
 
-function task(issueNumber: number, labels: string[] = []): Task {
+function task(issueNumber: number, labels: string[] = [], assignees: string[] = []): Task {
   return {
     id: `o/r#${issueNumber}`,
     issueNumber,
     title: `task ${issueNumber}`,
     body: 'some description',
+    comments: [],
     labels,
+    assignees,
     url: `https://github.com/o/r/issues/${issueNumber}`,
   };
 }
@@ -57,5 +59,21 @@ describe('parseSelection', () => {
 
   it('is unparseable when nothing matches', () => {
     expect(parseSelection('I could not decide.', tasks)).toEqual({ kind: 'unparseable' });
+  });
+});
+
+describe('filterAssigned', () => {
+  it('drops issues a human has taken', () => {
+    const kept = filterAssigned([task(1), task(2, [], ['alice']), task(3)]);
+    expect(kept.map((t) => t.issueNumber)).toEqual([1, 3]);
+  });
+
+  it('drops an issue with several assignees', () => {
+    expect(filterAssigned([task(1, [], ['alice', 'bob'])])).toEqual([]);
+  });
+
+  it('keeps everything when nobody is assigned', () => {
+    const tasks = [task(1), task(2)];
+    expect(filterAssigned(tasks)).toEqual(tasks);
   });
 });

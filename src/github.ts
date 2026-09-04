@@ -46,12 +46,14 @@ export interface IssueData {
   body: string;
   url: string;
   labels: { name: string }[];
+  comments: { body: string }[];
+  assignees: { login: string }[];
 }
 
 export async function listOpenIssues(repo: string, limit: number): Promise<IssueData[]> {
   return ghJson<IssueData[]>([
     'issue', 'list', '-R', repo, '--state', 'open',
-    '--limit', String(limit), '--json', 'number,title,body,url,labels',
+    '--limit', String(limit), '--json', 'number,title,body,url,labels,comments,assignees',
   ]);
 }
 
@@ -67,9 +69,11 @@ export interface PrData {
   reviews: { state: string }[];
   comments: { author: { login: string } }[];
   headRefName: string;
+  additions: number;
+  deletions: number;
 }
 
-const PR_FIELDS = 'number,url,title,state,isDraft,mergedAt,closedAt,body,reviews,comments,headRefName';
+const PR_FIELDS = 'number,url,title,state,isDraft,mergedAt,closedAt,body,reviews,comments,headRefName,additions,deletions';
 
 export async function listPrsByLabel(repo: string, label: string, state: 'open' | 'closed' | 'merged' | 'all'): Promise<PrData[]> {
   return ghJson<PrData[]>([
@@ -88,6 +92,17 @@ export async function findPrByBranch(repo: string, branch: string): Promise<PrDa
 
 export async function viewPr(repo: string, prUrl: string): Promise<PrData> {
   return ghJson<PrData>(['pr', 'view', prUrl, '-R', repo, '--json', PR_FIELDS]);
+}
+
+/**
+ * The target's default branch and the commit it currently points at. Agents are
+ * launched pinned to that sha rather than letting the worker resolve "the
+ * default branch" itself — see `CursorWorkerOptions.startingRef`.
+ */
+export async function defaultBranchHead(repo: string): Promise<{ branch: string; sha: string }> {
+  const { default_branch: branch } = await ghJson<{ default_branch: string }>(['api', `repos/${repo}`]);
+  const { sha } = await ghJson<{ sha: string }>(['api', `repos/${repo}/commits/${branch}`]);
+  return { branch, sha };
 }
 
 export async function ensureLabel(repo: string, name: string, color: string, description: string): Promise<void> {
@@ -119,7 +134,16 @@ export async function addPrLabels(repo: string, prUrl: string, labels: string[])
 }
 
 export async function commentOnIssue(repo: string, issue: number, body: string): Promise<void> {
-  await gh(['issue', 'comment', String(issue), '-R', repo, '--body', body]);
+  // Via stdin: groom rationales are longer than argv is worth trusting.
+  await ghStdin(['issue', 'comment', String(issue), '-R', repo, '--body-file', '-'], body);
+}
+
+export async function commentOnPr(repo: string, prUrl: string, body: string): Promise<void> {
+  await ghStdin(['pr', 'comment', prUrl, '-R', repo, '--body-file', '-'], body);
+}
+
+export async function closePr(repo: string, prUrl: string, comment: string): Promise<void> {
+  await gh(['pr', 'close', prUrl, '-R', repo, '--comment', comment]);
 }
 
 /** Extract "Closes #N" / "#N" issue references from a PR body. */
