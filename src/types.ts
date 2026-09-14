@@ -85,7 +85,17 @@ export interface WorkSource {
   markFinished(task: Task): Promise<void>;
   /** Publish a groom verdict on the issue: a stamped comment saying what the
    *  factory concluded and why, plus a label mirroring it. */
-  recordGroom(task: Task, reply: { verdict: GroomVerdict; notes: string | undefined; reasoning: string }): Promise<void>;
+  recordGroom(
+    task: Task,
+    reply: { verdict: GroomVerdict; notes: string | undefined; reasoning: string; blocked?: number },
+    /** What the stamp carries beyond the fingerprint: for a child, the epic
+     *  record it was judged against; for an epic, its open children. Both are
+     *  what lets the verdict be revisited when the world moves. */
+    extras?: { premise?: { epic: number; sha: string } | null; children?: number[] },
+  ): Promise<void>;
+  /** File the children a groomed epic's groomer wrote, each linked back to the
+   *  epic, and note them on the epic. Returns what was filed. */
+  fileChildren(epic: Task, children: { title: string; body: string }[]): Promise<{ number: number; url: string }[]>;
   /** An implementation attempt refuted the groomed verdict: flip the label to
    *  needs-work and say why, so the issue is not picked again as scoped. */
   recordFailedAttempt(task: Task, report: string): Promise<void>;
@@ -125,6 +135,12 @@ export interface GroomRecord extends AgentPass {
   /** True when the issue had been groomed before and its description changed. */
   regroom: boolean;
   hadNotes: boolean;
+  /** The issue was groomed as an epic: a direction, not a PR. */
+  epic?: boolean;
+  /** Children filed under a groomed epic. */
+  childrenFiled?: number;
+  /** The issue a needs-work verdict is waiting on. */
+  blockedOn?: number;
 }
 
 export interface OutcomeRecord {

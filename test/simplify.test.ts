@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { declinedSimplifications, recentlyMergedFactoryPrs, shrinks, skipReason } from '../src/simplify.ts';
-import type { OutcomeRecord, SimplifyRecord } from '../src/types.ts';
+import type { SimplifyRecord } from '../src/types.ts';
 
 const pr = (n: number) => `https://github.com/o/r/pull/${n}`;
 
@@ -17,21 +17,6 @@ function pass(outcome: SimplifyRecord['outcome'], baseSha = 'aaaaaaaa', prUrl: s
     finishedAt: '2026-01-02T00:00:00Z',
     usage: null,
     durationMs: 1,
-  };
-}
-
-function outcome(prUrl: string, over: Partial<OutcomeRecord> = {}): OutcomeRecord {
-  return {
-    type: 'outcome',
-    prUrl,
-    source: 'implementer',
-    issueNumber: 1,
-    merged: true,
-    closedAt: '2026-01-02T00:00:00Z',
-    humanChangeRequests: 0,
-    humanCommentCount: 0,
-    recordedAt: '2026-01-02T00:00:00Z',
-    ...over,
   };
 }
 
@@ -71,30 +56,22 @@ describe('shrinks', () => {
 });
 
 describe('what the agent is pointed at', () => {
-  it('recently merged implementer PRs, newest first, capped', () => {
-    const outcomes = [
-      outcome(pr(1), { closedAt: '2026-01-01T00:00:00Z' }),
-      outcome(pr(3), { closedAt: '2026-03-01T00:00:00Z' }),
-      outcome(pr(2), { closedAt: '2026-02-01T00:00:00Z' }),
-      outcome(pr(4), { closedAt: '2026-04-01T00:00:00Z', merged: false }),
-      outcome(pr(5), { closedAt: '2026-05-01T00:00:00Z', source: 'environment' }),
-      outcome(pr(6), { closedAt: '2026-06-01T00:00:00Z', source: 'simplify' }),
-    ];
-    expect(recentlyMergedFactoryPrs(outcomes, 2)).toEqual([pr(3), pr(2)]);
+  const merged = (n: number, mergedAt: string | null) => ({ url: pr(n), mergedAt });
+
+  it('recently merged implementer PRs, newest first, capped, however GitHub orders them', () => {
+    const prs = [merged(1, '2026-01-01T00:00:00Z'), merged(3, '2026-03-01T00:00:00Z'), merged(2, '2026-02-01T00:00:00Z'), merged(4, null)];
+    expect(recentlyMergedFactoryPrs(prs, 2)).toEqual([pr(3), pr(2)]);
   });
 
-  it('treats a record with no source as an implementer PR', () => {
-    const legacy = outcome(pr(1));
-    delete legacy.source;
-    expect(recentlyMergedFactoryPrs([legacy], 5)).toEqual([pr(1)]);
-  });
+  const closed = (n: number, state: string, additions: number, deletions: number) => ({ url: pr(n), state, additions, deletions });
 
-  it('declined simplifications are the unmerged simplify outcomes', () => {
-    const outcomes = [
-      outcome(pr(1), { source: 'simplify', merged: false }),
-      outcome(pr(2), { source: 'simplify' }),
-      outcome(pr(3), { merged: false }),
+  it('declined simplifications are the closed ones a human could have merged', () => {
+    const prs = [
+      closed(1, 'CLOSED', 3, 40), // a human declined this
+      closed(2, 'MERGED', 3, 40),
+      closed(3, 'OPEN', 3, 40),
+      closed(4, 'CLOSED', 40, 3), // grew: the factory closed it, not a human
     ];
-    expect(declinedSimplifications(outcomes)).toEqual([pr(1)]);
+    expect(declinedSimplifications(prs)).toEqual([pr(1)]);
   });
 });

@@ -4,25 +4,25 @@ import { resolve } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const listPrsByLabel = vi.fn();
-const viewPr = vi.fn();
+const listIssuesByLabel = vi.fn<(...args: unknown[]) => Promise<{ number: number }[]>>(async () => []);
 const removeIssueLabels = vi.fn(async (_repo: string, _issue: number, _labels: string[]) => {});
-vi.mock('../src/github.ts', () => ({
+vi.mock('../src/github.ts', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/github.ts')>()),
   listPrsByLabel: (...args: unknown[]) => listPrsByLabel(...args),
+  listIssuesByLabel: (...args: unknown[]) => listIssuesByLabel(...args as [string, string]),
   removeIssueLabels: (repo: string, issue: number, labels: string[]) => removeIssueLabels(repo, issue, labels),
-  viewPr: (...args: unknown[]) => viewPr(...args),
-  linkedIssueNumber: () => null,
 }));
 
 const { FactoryState } = await import('../src/state.ts');
 const { Telemetry } = await import('../src/telemetry.ts');
 import type { FactoryConfig } from '../src/config.ts';
-import type { CurrentRun, EnvRecord, RunRecord } from '../src/types.ts';
+import type { CurrentRun } from '../src/types.ts';
 
 function config(maxConcurrentJobs: number): FactoryConfig {
   return {
     repo: { owner: 'o', name: 'r', url: 'https://github.com/o/r' },
     worker: { model: null, pollIntervalSeconds: 30, maxRunMinutes: 90 },
-    labels: { factoryPr: 'factory', issueInProgress: 'factory:wip', groomed: 'factory:groomed', needsWork: 'factory:needs-work', environmentPr: 'factory:env', simplifyPr: 'factory:simplify' },
+    labels: { factoryPr: 'factory', issueInProgress: 'factory:wip', groomed: 'factory:groomed', needsWork: 'factory:needs-work', environmentPr: 'factory:env', simplifyPr: 'factory:simplify', epic: 'type:epic' },
     groom: { maxPerTick: 5, principlesFile: 'principles.example.md' },
     selector: { maxCandidates: 100 },
     environment: { enabled: true, maxPrsPerPass: 3 },
@@ -152,57 +152,82 @@ describe('run records', () => {
 
 describe('reconcileOutcomes', () => {
   beforeEach(() => {
-    viewPr.mockReset();
+    listPrsByLabel.mockReset();
+    listIssuesByLabel.mockReset();
+    listIssuesByLabel.mockResolvedValue([]);
     removeIssueLabels.mockClear();
   });
 
-  const closedPr = (url: string, state: 'MERGED' | 'CLOSED') => ({
-    url, state, body: '', reviews: [], comments: [], mergedAt: state === 'MERGED' ? 'then' : null, closedAt: 'then',
+  const pr = (n: number, state: 'OPEN' | 'MERGED' | 'CLOSED', body = '') => ({
+    url: `https://github.com/o/r/pull/${n}`, state, body, reviews: [], comments: [],
+    mergedAt: state === 'MERGED' ? 'then' : null, closedAt: state === 'OPEN' ? null : 'then',
   });
 
-  function runRecord(issueNumber: number, prUrl: string): RunRecord {
-    return {
-      type: 'run', taskId: `o/r#${issueNumber}`, issueNumber, issueTitle: '', worker: 'cursor', model: null,
-      agentId: 'a', startedAt: 'now', finishedAt: 'now', outcome: 'pr-opened', prUrl, usage: null, durationMs: 1,
-    };
-  }
-
-  function envRecord(prUrl: string): EnvRecord {
-    return {
-      type: 'env', prsExamined: ['https://github.com/o/r/pull/5'], outcome: 'pr-opened', prUrl,
-      worker: 'cursor', model: null, agentId: 'a', startedAt: 'now', finishedAt: 'now', usage: null, durationMs: 1,
-    };
+  /** GitHub answers per label: implementer PRs, environment PRs, simplify PRs. */
+  function github(byLabel: Record<string, unknown[]>) {
+    listPrsByLabel.mockImplementation(async (_repo: string, label: string) => byLabel[label] ?? []);
   }
 
   it('records an environment PR outcome and releases no issue label', async () => {
     const { state, dir } = stateFor(1);
-    const telemetry = new Telemetry(dir);
-    telemetry.append(envRecord('https://github.com/o/r/pull/7'));
-    viewPr.mockResolvedValue(closedPr('https://github.com/o/r/pull/7', 'MERGED'));
+    github({ 'factory:env': [pr(7, 'MERGED')] });
 
     expect(await state.reconcileOutcomes(() => {})).toBe(1);
-    const outcome = new Telemetry(dir).outcomes()[0]!;
-    expect(outcome).toMatchObject({ source: 'environment', merged: true, issueNumber: null });
-    // Environment PRs claim no issue, so nothing to unlabel.
+    expect(new Telemetry(dir).outcomes()[0]).toMatchObject({ source: 'environment', merged: true, issueNumber: null });
     expect(removeIssueLabels).not.toHaveBeenCalled();
   });
 
-  it('still releases the wip label for an implementer PR', async () => {
+  it('records an implementer PR with the issue it closed', async () => {
     const { state, dir } = stateFor(1);
-    new Telemetry(dir).append(runRecord(42, 'https://github.com/o/r/pull/8'));
-    viewPr.mockResolvedValue(closedPr('https://github.com/o/r/pull/8', 'CLOSED'));
+    github({ factory: [pr(8, 'CLOSED', 'Closes #42')] });
 
     expect(await state.reconcileOutcomes(() => {})).toBe(1);
     expect(new Telemetry(dir).outcomes()[0]).toMatchObject({ source: 'implementer', merged: false, issueNumber: 42 });
-    expect(removeIssueLabels).toHaveBeenCalledWith('o/r', 42, ['factory:wip']);
   });
 
   it('leaves an open PR alone so it is reconciled on a later tick', async () => {
     const { state, dir } = stateFor(1);
-    new Telemetry(dir).append(envRecord('https://github.com/o/r/pull/9'));
-    viewPr.mockResolvedValue({ ...closedPr('https://github.com/o/r/pull/9', 'MERGED'), state: 'OPEN' });
+    github({ 'factory:env': [pr(9, 'OPEN')] });
 
     expect(await state.reconcileOutcomes(() => {})).toBe(0);
     expect(new Telemetry(dir).outcomes()).toEqual([]);
+  });
+
+  it('does not record a PR twice, so the record survives a second look', async () => {
+    const { state, dir } = stateFor(1);
+    github({ factory: [pr(8, 'MERGED', 'Closes #42')] });
+
+    expect(await state.reconcileOutcomes(() => {})).toBe(1);
+    expect(await state.reconcileOutcomes(() => {})).toBe(0);
+    expect(new Telemetry(dir).outcomes()).toHaveLength(1);
+  });
+
+  it('releases the wip label on an issue whose PR has closed', async () => {
+    const { state } = stateFor(1);
+    github({ factory: [pr(8, 'MERGED', 'Closes #42')] });
+    listIssuesByLabel.mockResolvedValue([{ number: 42 }]);
+
+    await state.reconcileOutcomes(() => {});
+    expect(removeIssueLabels).toHaveBeenCalledWith('o/r', 42, ['factory:wip']);
+  });
+
+  it('keeps the label while an open factory PR or a running pipeline claims the issue', async () => {
+    const { state } = stateFor(2);
+    github({ factory: [pr(8, 'OPEN', 'Closes #42')] });
+    state.writeRun(run(43));
+    listIssuesByLabel.mockResolvedValue([{ number: 42 }, { number: 43 }]);
+
+    await state.reconcileOutcomes(() => {});
+    expect(removeIssueLabels).not.toHaveBeenCalled();
+  });
+
+  it('releases a label a crashed tick leaked, with no PR ever recorded', async () => {
+    // Nothing in telemetry knows about #44; GitHub says it is claimed and nothing is working on it.
+    const { state } = stateFor(1);
+    github({});
+    listIssuesByLabel.mockResolvedValue([{ number: 44 }]);
+
+    await state.reconcileOutcomes(() => {});
+    expect(removeIssueLabels).toHaveBeenCalledWith('o/r', 44, ['factory:wip']);
   });
 });

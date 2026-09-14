@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { filterAssigned, filterClaimed, parseSelection } from '../src/selector.ts';
+import { filterAssigned, filterClaimed, filterEpics, parseSelection } from '../src/selector.ts';
 import type { Task } from '../src/types.ts';
 
 function task(issueNumber: number, labels: string[] = [], assignees: string[] = []): Task {
@@ -59,6 +59,18 @@ describe('parseSelection', () => {
 
   it('is unparseable when nothing matches', () => {
     expect(parseSelection('I could not decide.', tasks)).toEqual({ kind: 'unparseable' });
+  });
+});
+
+describe('filterEpics', () => {
+  it('keeps a groomed epic away from the selector', () => {
+    const list = [task(1, ['type:epic', 'factory:groomed']), task(2, ['factory:groomed'])];
+    expect(filterEpics(list, 'type:epic').map((t) => t.issueNumber)).toEqual([2]);
+  });
+
+  it('filters nothing when no epic label is configured', () => {
+    const list = [task(1, ['type:epic'])];
+    expect(filterEpics(list, undefined)).toEqual(list);
   });
 });
 

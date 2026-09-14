@@ -1,125 +1,115 @@
 import { describe, expect, it } from 'vitest';
-import { environmentChangedAt, skipReason, unreadFactoryPrs, type UnreadPrs } from '../src/environment.ts';
-import type { EnvRecord, OutcomeRecord, RunRecord } from '../src/types.ts';
-
-function run(issueNumber: number, prUrl: string | null, startedAt = '2026-01-02T00:00:00Z', over: Partial<RunRecord> = {}): RunRecord {
-  return {
-    type: 'run',
-    taskId: `o/r#${issueNumber}`,
-    issueNumber,
-    issueTitle: `issue ${issueNumber}`,
-    worker: 'cursor',
-    model: null,
-    agentId: `agent-${issueNumber}`,
-    startedAt,
-    finishedAt: startedAt,
-    outcome: prUrl ? 'pr-opened' : 'no-pr',
-    prUrl,
-    usage: null,
-    durationMs: 1,
-    ...over,
-  };
-}
-
-function pass(prsExamined: string[], over: Partial<EnvRecord> = {}): EnvRecord {
-  return {
-    type: 'env',
-    prsExamined,
-    outcome: 'no-gap',
-    prUrl: null,
-    worker: 'cursor',
-    model: null,
-    agentId: 'agent-env',
-    startedAt: '2026-01-02T00:00:00Z',
-    finishedAt: '2026-01-02T00:00:00Z',
-    usage: null,
-    durationMs: 1,
-    ...over,
-  };
-}
-
-function outcome(prUrl: string, over: Partial<OutcomeRecord> = {}): OutcomeRecord {
-  return {
-    type: 'outcome',
-    prUrl,
-    source: 'environment',
-    issueNumber: null,
-    merged: true,
-    closedAt: '2026-01-02T00:00:00Z',
-    humanChangeRequests: 0,
-    humanCommentCount: 0,
-    recordedAt: '2026-01-02T00:00:00Z',
-    ...over,
-  };
-}
+import {
+  ENV_AGENT_MARK,
+  environmentChangedAt,
+  recentVerdicts,
+  skipReason,
+  unreadFactoryPrs,
+  type FactoryPr,
+  type UnreadPrs,
+} from '../src/environment.ts';
 
 const pr = (n: number) => `https://github.com/o/r/pull/${n}`;
 const unread = (fresh: string[] = [], stale: string[] = []): UnreadPrs => ({ fresh, stale });
 
+/** A factory PR as GitHub reports it: when it opened, and what has been said on it. */
+function factoryPr(n: number, createdAt = '2026-01-02T00:00:00Z', comments: string[] = []): FactoryPr {
+  return {
+    url: pr(n),
+    createdAt,
+    comments: comments.map((body, i) => ({ body, url: `${pr(n)}#issuecomment-${i + 1}` })),
+  };
+}
+
+const verdict = `🏭 ${ENV_AGENT_MARK} It read this PR and opened none.`;
+const humanComment = 'LGTM, one nit inline.';
+
 describe('environmentChangedAt', () => {
   it('is null before any environment PR has merged', () => {
     expect(environmentChangedAt([])).toBeNull();
-    expect(environmentChangedAt([outcome(pr(1), { merged: false })])).toBeNull();
+    expect(environmentChangedAt([{ mergedAt: null }])).toBeNull();
   });
 
-  it('ignores implementer PRs, however recent', () => {
-    const recent = outcome(pr(9), { source: 'implementer', closedAt: '2026-06-01T00:00:00Z' });
-    expect(environmentChangedAt([recent])).toBeNull();
-  });
-
-  it('takes the latest merge, not the last record written', () => {
-    const older = outcome(pr(1), { closedAt: '2026-03-01T00:00:00Z' });
-    const newer = outcome(pr(2), { closedAt: '2026-05-01T00:00:00Z' });
+  it('takes the latest merge, whatever order GitHub lists them in', () => {
+    const older = { mergedAt: '2026-03-01T00:00:00Z' };
+    const newer = { mergedAt: '2026-05-01T00:00:00Z' };
     expect(environmentChangedAt([newer, older])).toBe('2026-05-01T00:00:00Z');
+    expect(environmentChangedAt([older, newer])).toBe('2026-05-01T00:00:00Z');
   });
 
   it('ignores an environment PR that was closed unmerged', () => {
-    const merged = outcome(pr(1), { closedAt: '2026-03-01T00:00:00Z' });
-    const rejected = outcome(pr(2), { merged: false, closedAt: '2026-05-01T00:00:00Z' });
+    const merged = { mergedAt: '2026-03-01T00:00:00Z' };
+    const rejected = { mergedAt: null };
     expect(environmentChangedAt([merged, rejected])).toBe('2026-03-01T00:00:00Z');
   });
 });
 
 describe('unreadFactoryPrs', () => {
-  it('returns the PRs no pass has read, newest first', () => {
-    const got = unreadFactoryPrs([run(1, pr(11)), run(2, pr(12))], [], null);
-    expect(got).toEqual(unread([pr(12), pr(11)]));
+  it('returns the PRs the agent has not commented on, newest first', () => {
+    const prs = [factoryPr(11, '2026-01-01T00:00:00Z'), factoryPr(12, '2026-01-03T00:00:00Z')];
+    expect(unreadFactoryPrs(prs, null)).toEqual(unread([pr(12), pr(11)]));
   });
 
-  it('skips runs that opened no PR', () => {
-    expect(unreadFactoryPrs([run(1, null), run(2, pr(12))], [], null).fresh).toEqual([pr(12)]);
+  it('treats the environment agent\'s comment as the read mark', () => {
+    const prs = [factoryPr(11), factoryPr(12, '2026-01-03T00:00:00Z', [verdict]), factoryPr(13, '2026-01-04T00:00:00Z', [verdict])];
+    expect(unreadFactoryPrs(prs, null).fresh).toEqual([pr(11)]);
   });
 
-  it('drops PRs a previous pass already read', () => {
-    const runs = [run(1, pr(11)), run(2, pr(12)), run(3, pr(13))];
-    expect(unreadFactoryPrs(runs, [pass([pr(13)]), pass([pr(12)])], null).fresh).toEqual([pr(11)]);
+  it('does not mistake a human comment, or another factory comment, for the mark', () => {
+    const prs = [factoryPr(11, '2026-01-02T00:00:00Z', [humanComment, '🏭 **Factory attempt.** Closed unmerged.'])];
+    expect(unreadFactoryPrs(prs, null).fresh).toEqual([pr(11)]);
   });
 
-  it('names a PR once even when several run records point at it', () => {
-    // A pipeline that failed after opening its PR writes a second record.
-    const runs = [run(1, pr(11)), run(1, pr(11), '2026-01-02T00:00:00Z', { outcome: 'failed' })];
-    expect(unreadFactoryPrs(runs, [], null).fresh).toEqual([pr(11)]);
+  it('finds the mark among other comments', () => {
+    const prs = [factoryPr(11, '2026-01-02T00:00:00Z', [humanComment, verdict, humanComment])];
+    expect(unreadFactoryPrs(prs, null)).toEqual(unread());
   });
 
-  it('re-offers the PRs of a pass that failed before reaching a conclusion', () => {
-    const failed = pass([], { outcome: 'failed', failureReason: 'run ended with status ERROR' });
-    expect(unreadFactoryPrs([run(1, pr(11))], [failed], null).fresh).toEqual([pr(11)]);
+  it('re-offers a PR whose pass failed before commenting', () => {
+    // A failed pass posts nothing, so nothing marks the PR as read.
+    expect(unreadFactoryPrs([factoryPr(11)], null).fresh).toEqual([pr(11)]);
   });
 
-  it('calls a report stale when its run started before the environment changed', () => {
+  it('calls a report stale when its PR opened before the environment changed', () => {
     // PR 781's story: the reports were all written on the pre-Docker machine.
-    const runs = [run(1, pr(765), '2026-08-31T18:48:00Z'), run(2, pr(782), '2026-09-01T18:56:00Z')];
-    expect(unreadFactoryPrs(runs, [], '2026-09-01T19:35:51Z')).toEqual(unread([], [pr(782), pr(765)]));
+    const prs = [factoryPr(765, '2026-08-31T18:48:00Z'), factoryPr(782, '2026-09-01T18:56:00Z')];
+    expect(unreadFactoryPrs(prs, '2026-09-01T19:35:51Z')).toEqual(unread([], [pr(782), pr(765)]));
   });
 
-  it('keeps a report from a run that started after the change', () => {
-    const runs = [run(1, pr(782), '2026-09-01T18:56:00Z'), run(2, pr(790), '2026-09-01T20:00:00Z')];
-    expect(unreadFactoryPrs(runs, [], '2026-09-01T19:35:51Z')).toEqual(unread([pr(790)], [pr(782)]));
+  it('keeps a report from a PR opened after the change', () => {
+    const prs = [factoryPr(782, '2026-09-01T18:56:00Z'), factoryPr(790, '2026-09-01T20:00:00Z')];
+    expect(unreadFactoryPrs(prs, '2026-09-01T19:35:51Z')).toEqual(unread([pr(790)], [pr(782)]));
   });
 
   it('treats everything as fresh when no environment PR has ever merged', () => {
-    const runs = [run(1, pr(765), '2020-01-01T00:00:00Z')];
-    expect(unreadFactoryPrs(runs, [], null).fresh).toEqual([pr(765)]);
+    expect(unreadFactoryPrs([factoryPr(765, '2020-01-01T00:00:00Z')], null).fresh).toEqual([pr(765)]);
+  });
+
+  it('does not depend on the order GitHub returns PRs in', () => {
+    const prs = [factoryPr(12, '2026-01-03T00:00:00Z'), factoryPr(11, '2026-01-01T00:00:00Z'), factoryPr(13, '2026-01-05T00:00:00Z')];
+    expect(unreadFactoryPrs(prs, null).fresh).toEqual([pr(13), pr(12), pr(11)]);
+  });
+});
+
+describe('recentVerdicts', () => {
+  it('links the agent\'s comments, newest PR first, up to the limit', () => {
+    const prs = [
+      factoryPr(11, '2026-01-01T00:00:00Z', [verdict]),
+      factoryPr(12, '2026-01-02T00:00:00Z', [humanComment]),
+      factoryPr(13, '2026-01-03T00:00:00Z', [humanComment, verdict]),
+      factoryPr(14, '2026-01-04T00:00:00Z'),
+    ];
+    expect(recentVerdicts(prs, 5)).toEqual([`${pr(13)}#issuecomment-2`, `${pr(11)}#issuecomment-1`]);
+    expect(recentVerdicts(prs, 1)).toEqual([`${pr(13)}#issuecomment-2`]);
+  });
+
+  it('keeps one verdict per PR when a pass was repeated on it', () => {
+    const prs = [factoryPr(11, '2026-01-01T00:00:00Z', [verdict, humanComment, verdict])];
+    expect(recentVerdicts(prs, 5)).toEqual([`${pr(11)}#issuecomment-3`]);
+  });
+
+  it('is empty before the agent has ever spoken', () => {
+    expect(recentVerdicts([factoryPr(11), factoryPr(12, '2026-01-03T00:00:00Z', [humanComment])], 5)).toEqual([]);
   });
 });
 

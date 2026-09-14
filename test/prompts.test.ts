@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { groomPrompt, implementPrompt, selectPrompt, simplifyPrompt } from '../src/prompts.ts';
+import { environmentPrompt, groomEpicPrompt, groomPrompt, implementPrompt, selectPrompt, simplifyPrompt } from '../src/prompts.ts';
 import type { Task } from '../src/types.ts';
 
 const task: Task = {
@@ -50,7 +50,10 @@ describe('verification is required and reported', () => {
     const p = implementPrompt(task);
     expect(p).toContain('agent-browser');
     expect(p).toContain('**Verification** section');
-    expect(p).toMatch(/every check you did not run/);
+    expect(p).toContain('**Did not run**');
+    // Kept apart from "not applicable" so the environment agent gets a clean signal.
+    expect(p).toContain('**Blocked by the machine**');
+    expect(p).toMatch(/even if you then worked around it/);
   });
 
   it('implementer triages review findings: fix or dismiss with a reason, never a follow-up', () => {
@@ -64,6 +67,43 @@ describe('verification is required and reported', () => {
     const p = groomPrompt(task, 'principles', { maxRunMinutes: 90 });
     expect(p).toContain('live test');
     expect(p).toContain('never tell the implementer to skip one');
+  });
+});
+
+// An epic is groomed as direction: the agent settles the open decisions itself,
+// asks a human only for the irreversible ones, and writes the children.
+describe('epics', () => {
+  const epic = { ...task, labels: ['type:epic'] };
+  const p = groomEpicPrompt(epic, 'principles', { maxRunMinutes: 90 });
+
+  it('gets the link, never the body', () => {
+    expect(p).toContain(epic.url);
+    expect(p).not.toContain('A long description');
+  });
+
+  it('settles decisions with defaults and reversal costs, and reserves needs-work for human-only decisions', () => {
+    expect(p).toContain('reverse');
+    expect(p).toContain('irreversible');
+    expect(p).toMatch(/do not send back a list of questions/);
+  });
+
+  it('writes children in fenced child blocks, sized to the implementer budget', () => {
+    expect(p).toContain('```child');
+    expect(p).toContain('about 90 minutes');
+    expect(p).toContain('Write no children for a needs-work epic');
+  });
+
+  it('ratchets on a re-review: settled decisions stand unless the reply names them', () => {
+    expect(p).toContain('re-review');
+    expect(p).toContain('ratchets');
+    expect(p).toMatch(/which decisions changed and which stand/);
+  });
+
+  it('the ordinary groom prompt knows about epics and blockers', () => {
+    const g = groomPrompt(task, 'principles', { maxRunMinutes: 90 });
+    expect(g).toContain('part of an epic');
+    expect(g).toContain('BLOCKED: #<issue number>');
+    expect(g).toContain('the record this issue was judged against has changed');
   });
 });
 
@@ -91,5 +131,27 @@ describe('simplification', () => {
     expect(p).toContain(merged);
     expect(p).not.toContain('already declined');
     expect(simplifyPrompt({ recentPrs: [], declinedPrs: [declined], budget: { maxRunMinutes: 90 } })).toContain(declined);
+  });
+});
+
+// The environment agent once called "installed the deps myself" an inconvenience
+// and declined, PR after PR, to add the project's toolchain. CI is now its
+// reference, and it is shown its own past verdicts so the pattern is visible.
+describe('environment agent judges against CI and sees its own history', () => {
+  const prs = ['https://github.com/o/r/pull/850'];
+
+  it('names CI as the reference machine and counts self-setup as a gap', () => {
+    const p = environmentPrompt(prs);
+    expect(p).toContain('.github/workflows');
+    expect(p).toMatch(/ran only after setting the machine up themselves/);
+    expect(p).toMatch(/services:/);
+    expect(p).toContain(prs[0]);
+  });
+
+  it('links its recent verdicts when there are any, and says nothing about them otherwise', () => {
+    const verdicts = ['https://github.com/o/r/pull/840#issuecomment-1'];
+    expect(environmentPrompt(prs, verdicts)).toContain('## Your recent verdicts');
+    expect(environmentPrompt(prs, verdicts)).toContain(verdicts[0]);
+    expect(environmentPrompt(prs)).not.toContain('recent verdicts');
   });
 });

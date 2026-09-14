@@ -23,6 +23,16 @@ export function filterAssigned(tasks: Task[]): Task[] {
   return tasks.filter((t) => t.assignees.length === 0);
 }
 
+/**
+ * Issues that are not epics. A groomed epic carries the same label as a
+ * groomed issue, because grooming is the one verdict mechanism, but what it
+ * means is "this direction is settled", not "an agent can build this". Its
+ * children are what get built.
+ */
+export function filterEpics(tasks: Task[], epicLabel: string | undefined): Task[] {
+  return epicLabel ? tasks.filter((t) => !t.labels.includes(epicLabel)) : tasks;
+}
+
 export type Selection =
   | { kind: 'picked'; task: Task }
   | { kind: 'none' }
