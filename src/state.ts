@@ -1,14 +1,17 @@
-// FactoryState: the "how much work is already in flight?" question.
-// Source of truth is GitHub (open PRs carrying the factory label); a small
-// local current-runs file adds crash detection for pipelines mid-flight.
-// Both count against the one throttle, config.maxConcurrentJobs.
+// FactoryState: the "how much work is already in flight?" question, and its
+// mirror, "what has finished since we last looked?". Source of truth for both
+// is GitHub — PRs carrying the factory labels, issues carrying the in-progress
+// label; a small local current-runs file adds crash detection for pipelines
+// mid-flight. Open PRs and in-flight pipelines count against the one throttle,
+// config.maxConcurrentJobs.
 
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import type { CurrentRun, OutcomeRecord } from './types.ts';
+import type { CurrentRun } from './types.ts';
 import type { FactoryConfig } from './config.ts';
 import { repoSlug } from './config.ts';
-import { linkedIssueNumber, listPrsByLabel, removeIssueLabels, viewPr } from './github.ts';
+import { listIssuesByLabel, listPrsByLabel, removeIssueLabels } from './github.ts';
+import { leakedClaims, unrecordedOutcomes, withSource } from './outcomes.ts';
 import type { Telemetry } from './telemetry.ts';
 
 export interface Capacity {
@@ -75,40 +78,38 @@ export class FactoryState {
   }
 
   /**
-   * Record human outcomes for any factory PR that has been merged or closed
-   * since the last tick, and release the claimed issues. Returns the number
-   * of outcomes recorded.
+   * Reconcile with GitHub: record the verdict on every factory PR that has
+   * closed and is not yet in the record, and release the in-progress label on
+   * every issue nothing is working on any more. Returns the number of outcomes
+   * recorded. See outcomes.ts for why the decision and the record are separate.
    */
   async reconcileOutcomes(log: (msg: string) => void): Promise<number> {
-    const awaiting = this.telemetry.prsAwaitingOutcome();
-    let recorded = 0;
-    for (const job of awaiting) {
-      const pr = await viewPr(this.repo, job.prUrl).catch(() => null);
-      if (!pr || pr.state === 'OPEN') continue;
+    const { labels } = this.config;
+    const [implementer, environment, simplify, claimed] = await Promise.all([
+      listPrsByLabel(this.repo, labels.factoryPr, 'all'),
+      listPrsByLabel(this.repo, labels.environmentPr, 'all'),
+      listPrsByLabel(this.repo, labels.simplifyPr, 'all'),
+      listIssuesByLabel(this.repo, labels.issueInProgress),
+    ]);
+    const prs = [
+      ...withSource(implementer, 'implementer'),
+      ...withSource(environment, 'environment'),
+      ...withSource(simplify, 'simplify'),
+    ];
 
-      const changeRequests = pr.reviews.filter((r) => r.state === 'CHANGES_REQUESTED').length;
-      const issueNumber = job.issueNumber ?? ((job.source ?? 'implementer') === 'implementer' ? linkedIssueNumber(pr.body) : null);
-      const outcome: OutcomeRecord = {
-        type: 'outcome',
-        prUrl: job.prUrl,
-        ...(job.source ? { source: job.source } : {}),
-        issueNumber,
-        merged: pr.state === 'MERGED',
-        closedAt: pr.mergedAt ?? pr.closedAt ?? new Date().toISOString(),
-        humanChangeRequests: changeRequests,
-        humanCommentCount: pr.comments.length,
-        recordedAt: new Date().toISOString(),
-      };
-      this.telemetry.append(outcome);
-      recorded += 1;
-      log(`outcome recorded: ${job.prUrl} → ${pr.state}`);
-
-      // Environment and simplification PRs claim no issue, so there is no wip label to release.
-      if (issueNumber !== null) {
-        await removeIssueLabels(this.repo, issueNumber, [this.config.labels.issueInProgress]).catch(() => {});
-      }
+    const recorded = new Set(this.telemetry.outcomes().map((o) => o.prUrl));
+    const rows = unrecordedOutcomes(prs, recorded);
+    for (const row of rows) {
+      this.telemetry.append(row);
+      log(`outcome recorded: ${row.prUrl} → ${row.merged ? 'MERGED' : 'CLOSED'}`);
     }
-    return recorded;
+
+    const openPrs = implementer.filter((pr) => pr.state === 'OPEN');
+    for (const issue of leakedClaims(claimed, openPrs, this.readRuns())) {
+      log(`releasing #${issue}: no open factory PR or running pipeline claims it`);
+      await removeIssueLabels(this.repo, issue, [labels.issueInProgress]).catch(() => {});
+    }
+    return rows.length;
   }
 
   /**

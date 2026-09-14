@@ -15,7 +15,8 @@
     "groomed": "factory:groomed",
     "needsWork": "factory:needs-work",
     "environmentPr": "factory:env",
-    "simplifyPr": "factory:simplify"
+    "simplifyPr": "factory:simplify",
+    "epic": "type:epic"
   },
   "groom": {
     "maxPerTick": 5,

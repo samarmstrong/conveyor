@@ -57,23 +57,32 @@ export async function listOpenIssues(repo: string, limit: number): Promise<Issue
   ]);
 }
 
+/** Open issues carrying a label — the in-progress label, for reconciliation. */
+export async function listIssuesByLabel(repo: string, label: string, limit = 100): Promise<IssueData[]> {
+  return ghJson<IssueData[]>([
+    'issue', 'list', '-R', repo, '--state', 'open', '--label', label,
+    '--limit', String(limit), '--json', 'number,title,body,url,labels,comments,assignees',
+  ]);
+}
+
 export interface PrData {
   number: number;
   url: string;
   title: string;
   state: 'OPEN' | 'CLOSED' | 'MERGED';
   isDraft: boolean;
+  createdAt: string;
   mergedAt: string | null;
   closedAt: string | null;
   body: string;
   reviews: { state: string }[];
-  comments: { author: { login: string } }[];
+  comments: { author: { login: string }; body: string; url: string }[];
   headRefName: string;
   additions: number;
   deletions: number;
 }
 
-const PR_FIELDS = 'number,url,title,state,isDraft,mergedAt,closedAt,body,reviews,comments,headRefName,additions,deletions';
+const PR_FIELDS = 'number,url,title,state,isDraft,createdAt,mergedAt,closedAt,body,reviews,comments,headRefName,additions,deletions';
 
 export async function listPrsByLabel(repo: string, label: string, state: 'open' | 'closed' | 'merged' | 'all'): Promise<PrData[]> {
   return ghJson<PrData[]>([
@@ -131,6 +140,22 @@ export async function addPrLabels(repo: string, prUrl: string, labels: string[])
     'api', `repos/${repo}/issues/${prNumber}/labels`,
     ...labels.flatMap((l) => ['-f', `labels[]=${l}`]),
   ]);
+}
+
+export async function createIssue(
+  repo: string,
+  title: string,
+  body: string,
+  labels: string[],
+): Promise<{ number: number; url: string }> {
+  const out = await ghStdin(
+    ['issue', 'create', '-R', repo, '--title', title, '--body-file', '-', ...labels.flatMap((l) => ['--label', l])],
+    body,
+  );
+  const url = out.trim().split('\n').find((l) => /\/issues\/\d+$/.test(l));
+  const number = url?.match(/\/issues\/(\d+)$/)?.[1];
+  if (!url || !number) throw new Error(`gh issue create returned no issue URL: ${out.slice(0, 200)}`);
+  return { number: Number(number), url };
 }
 
 export async function commentOnIssue(repo: string, issue: number, body: string): Promise<void> {

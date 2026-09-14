@@ -1,21 +1,23 @@
 // The factory controller: one idempotent tick.
 //
-//   reconcile outcomes → groom ungroomed issues → fix the agents' environment →
+//   reconcile with GitHub → groom ungroomed issues → simplify, alongside:
 //   measure free capacity → for each free slot, a selector agent picks the
 //   best-defined GROOMED issue → hand each to a FRESH implementer agent → label
 //   the resulting PRs (or, if the attempt refuted the groom, retract the
-//   verdict) → record telemetry → yield to a human.
+//   verdict) → record telemetry → fix the agents' environment from what those
+//   PRs said about it → yield to a human.
 //
 // `maxConcurrentJobs` is the whole throttle: a job is an open factory PR
 // awaiting a human or a pipeline still running, at most that many exist at
 // once, and so one tick starts at most that many pipelines. Default 1 keeps the
 // strict one-at-a-time factory.
 //
-// Grooming, the environment phase, and the simplification phase all run before
-// the capacity gate on purpose: a PR sitting in review is no reason to stop
-// vetting the backlog, to leave the agents' machine broken, or to let the code
-// keep accreting. Environment and simplification PRs are each their own
-// one-deep queue and never spend an implementer's slot.
+// Grooming, the environment phase, and the simplification phase all run
+// outside the capacity gate on purpose: a PR sitting in review is no reason to
+// stop vetting the backlog, to leave the agents' machine broken, or to let the
+// code keep accreting. Environment and simplification PRs are each their own
+// one-deep queue and never spend an implementer's slot. The environment phase
+// runs last, after the implementers, so the PRs it reads include this tick's.
 //
 // Every judgment call (is this worth building, which issue, how to
 // implement/verify/review it) lives in an agent; the controller only sequences
@@ -28,11 +30,11 @@ import { CursorWorker, RunBudgetExceeded } from './worker.ts';
 import { GitHubIssueSource } from './workSource.ts';
 import { FactoryState } from './state.ts';
 import { Telemetry } from './telemetry.ts';
-import { filterAssigned, filterClaimed, parseSelection, type Selection } from './selector.ts';
-import { environmentPrompt, groomPrompt, implementPrompt, selectPrompt, simplifyPrompt } from './prompts.ts';
-import { factoryComment, groomState, isGroomed, needsGroom, parseGroomReply, verdict } from './groom.ts';
+import { filterAssigned, filterClaimed, filterEpics, parseSelection, type Selection } from './selector.ts';
+import { environmentPrompt, groomEpicPrompt, groomPrompt, implementPrompt, selectPrompt, simplifyPrompt } from './prompts.ts';
+import { factoryComment, groomState, isEpic, isGroomed, needsGroom, openIssues, parseGroomReply, stampExtrasFor, verdict, type OpenIssues } from './groom.ts';
 import { addPrLabels, closePr, commentOnIssue, commentOnPr, defaultBranchHead, ensureLabel, findPrByBranch, listPrsByLabel, viewPr } from './github.ts';
-import { environmentChangedAt, skipReason, unreadFactoryPrs } from './environment.ts';
+import { ENV_AGENT_MARK, environmentChangedAt, recentVerdicts, skipReason, unreadFactoryPrs, type UnreadPrs } from './environment.ts';
 import { declinedSimplifications, recentlyMergedFactoryPrs, shrinks, skipReason as simplifySkipReason } from './simplify.ts';
 
 export function log(msg: string): void {
@@ -73,19 +75,25 @@ export async function buildWorker(config: FactoryConfig): Promise<CursorWorker> 
   });
 }
 
-/** Open issues the factory has not already claimed. */
+/**
+ * Every open issue, claimed or not. Fetched once per tick: the phases filter
+ * this list rather than each asking GitHub again, and the full list is what a
+ * blocked verdict is checked against — an issue in progress is still open.
+ */
 export async function candidateTasks(ctx: FactoryContext): Promise<Task[]> {
-  const tasks = await ctx.source.eligibleTasks();
-  return filterClaimed(tasks, ctx.config.labels.issueInProgress);
+  return ctx.source.eligibleTasks();
 }
 
 /**
- * The candidates one phase may act on. Both phases start from the same list —
- * an extra issue-list call per phase would only widen the window in which the
- * two disagree — and differ only in whether a human's assignment excludes it.
+ * The candidates one phase may act on. Neither touches an issue the factory
+ * has claimed. They differ in whether a human's assignment excludes it, and in
+ * that epics are groomed — that is where their direction gets settled — but
+ * never implemented: their children are.
  */
 export function admissible(ctx: FactoryContext, tasks: Task[], phase: 'groom' | 'implement'): Task[] {
-  return ctx.config.assignedIssues[phase] ? tasks : filterAssigned(tasks);
+  const unclaimed = filterClaimed(tasks, ctx.config.labels.issueInProgress);
+  const admitted = ctx.config.assignedIssues[phase] ? unclaimed : filterAssigned(unclaimed);
+  return phase === 'implement' ? filterEpics(admitted, ctx.config.labels.epic) : admitted;
 }
 
 /**
@@ -97,17 +105,17 @@ export async function runGroomPhase(
   ctx: FactoryContext,
   worker: CodingWorker,
   candidates: Task[],
-  opts: { limit?: number; force?: boolean } = {},
+  opts: { limit?: number; force?: boolean; open?: OpenIssues } = {},
 ): Promise<GroomRecord[]> {
-  const pending = needsGroom(candidates, ctx.config.labels, opts.force).slice(0, opts.limit ?? ctx.config.groom.maxPerTick);
+  const pending = needsGroom(candidates, ctx.config.labels, opts.force, opts.open).slice(0, opts.limit ?? ctx.config.groom.maxPerTick);
   if (pending.length === 0) return [];
 
   const principles = loadPrinciples(ctx.config);
-  log(`grooming ${pending.length} issue(s): ${pending.map((t) => `#${t.issueNumber}`).join(' ')}`);
+  log(`grooming ${pending.length} issue(s): ${pending.map((t) => `#${t.issueNumber}${isEpic(t, ctx.config.labels) ? ' (epic)' : ''}`).join(' ')}`);
 
   const records = await Promise.all(
     pending.map((task) =>
-      groomOne(ctx, worker, task, principles).catch((err) => {
+      groomOne(ctx, worker, task, principles, opts.open).catch((err) => {
         log(`groom #${task.issueNumber} failed: ${(err as Error).message}`);
         return null;
       }),
@@ -116,14 +124,23 @@ export async function runGroomPhase(
   return records.filter((r): r is GroomRecord => r !== null);
 }
 
+/** The groom prompt for this issue: direction for an epic, one PR for anything else. */
+export function groomPromptFor(ctx: FactoryContext, task: Task, principles: string): string {
+  return isEpic(task, ctx.config.labels)
+    ? groomEpicPrompt(task, principles, ctx.config.worker)
+    : groomPrompt(task, principles, ctx.config.worker);
+}
+
 async function groomOne(
   ctx: FactoryContext,
   worker: CodingWorker,
   task: Task,
   principles: string,
+  open?: OpenIssues,
 ): Promise<GroomRecord> {
+  const epic = isEpic(task, ctx.config.labels);
   const startedAt = new Date().toISOString();
-  const handle = await worker.start(groomPrompt(task, principles, ctx.config.worker), {
+  const handle = await worker.start(groomPromptFor(ctx, task, principles), {
     autoCreatePR: false,
     name: `factory-groom: #${task.issueNumber}`.slice(0, 100),
   });
@@ -136,8 +153,24 @@ async function groomOne(
     throw new Error(`groom reply had no VERDICT line:\n${result.resultText.slice(0, 500)}`);
   }
 
-  await ctx.source.recordGroom(task, reply);
-  log(`groomed #${task.issueNumber} → ${reply.verdict}${reply.notes ? ' (+notes)' : ''}`);
+  // A child's verdict names the epic record it was judged against; an epic's
+  // names its children. Either way the verdict says what would make it stale.
+  await ctx.source.recordGroom(task, reply, stampExtrasFor(task, ctx.config.labels, open));
+  log(`groomed #${task.issueNumber}${epic ? ' (epic)' : ''} → ${reply.verdict}${reply.notes ? ' (+notes)' : ''}${reply.blocked !== undefined ? ` (blocked on #${reply.blocked})` : ''}`);
+
+  // A groomed epic's children are the work; the verdict alone builds nothing.
+  // Filed after the verdict is on record so a child always points at an epic
+  // that already carries its decisions.
+  let childrenFiled = 0;
+  if (epic && reply.verdict === 'groomed') {
+    if (reply.children.length === 0) {
+      log(`epic #${task.issueNumber} groomed but the groomer wrote no children; nothing to build toward it yet.`);
+    } else {
+      const filed = await ctx.source.fileChildren(task, reply.children);
+      childrenFiled = filed.length;
+      log(`epic #${task.issueNumber}: filed ${filed.length} child issue(s): ${filed.map((c) => `#${c.number}`).join(' ')}`);
+    }
+  }
 
   const record: GroomRecord = {
     type: 'groom',
@@ -149,6 +182,8 @@ async function groomOne(
     // revisited via --force. Keying on 'stale' alone under-counts re-grooms.
     regroom: groomState(task, ctx.config.labels) !== 'ungroomed',
     hadNotes: reply.notes !== undefined,
+    ...(epic ? { epic: true, childrenFiled } : {}),
+    ...(reply.blocked !== undefined ? { blockedOn: reply.blocked } : {}),
     worker: 'cursor',
     model: ctx.config.worker.model,
     agentId: handle.agentId,
@@ -190,6 +225,39 @@ export async function runSelector(
   };
 }
 
+/** How many of its own past verdicts the environment agent is shown. */
+const ENV_VERDICTS_SHOWN = 5;
+
+/**
+ * Everything the environment phase decides on, read from GitHub in one place so
+ * the tick, the dry run, and `factory status` cannot disagree. See the header
+ * of environment.ts for why none of it comes from telemetry.
+ */
+export async function environmentInputs(config: FactoryConfig): Promise<{
+  skip: string | null;
+  unread: UnreadPrs;
+  changedAt: string | null;
+  verdicts: string[];
+}> {
+  if (!config.environment.enabled) {
+    return { skip: skipReason(false, [], { fresh: [], stale: [] }), unread: { fresh: [], stale: [] }, changedAt: null, verdicts: [] };
+  }
+  const repo = repoSlug(config);
+  const [envPrs, factoryPrs] = await Promise.all([
+    listPrsByLabel(repo, config.labels.environmentPr, 'all'),
+    listPrsByLabel(repo, config.labels.factoryPr, 'all'),
+  ]);
+  const openEnvPrs = envPrs.filter((p) => p.state === 'OPEN');
+  const changedAt = environmentChangedAt(envPrs);
+  const unread = unreadFactoryPrs(factoryPrs, changedAt);
+  return {
+    skip: skipReason(true, openEnvPrs, unread, changedAt),
+    unread,
+    changedAt,
+    verdicts: recentVerdicts(factoryPrs, ENV_VERDICTS_SHOWN),
+  };
+}
+
 /**
  * The environment phase: hand an agent the factory's own recent PRs and let it
  * decide whether any of them reports a check that could not run, then fix the
@@ -206,12 +274,7 @@ export async function runEnvironmentPhase(
   worker: CodingWorker,
 ): Promise<EnvRecord | null> {
   const { config } = ctx;
-  const openEnvPrs = config.environment.enabled
-    ? await listPrsByLabel(repoSlug(config), config.labels.environmentPr, 'open')
-    : [];
-  const changedAt = environmentChangedAt(ctx.telemetry.outcomes());
-  const unread = unreadFactoryPrs(ctx.telemetry.runs(), ctx.telemetry.envPasses(), changedAt);
-  const skip = skipReason(config.environment.enabled, openEnvPrs, unread, changedAt);
+  const { skip, unread, verdicts } = await environmentInputs(config);
   if (skip) {
     log(`environment: skipped — ${skip}.`);
     return null;
@@ -221,7 +284,7 @@ export async function runEnvironmentPhase(
   log(`environment: reading ${prUrls.length} factory PR(s) for verification the agents could not run: ${prUrls.join(' ')}`);
 
   const startedAt = new Date().toISOString();
-  const handle = await worker.start(environmentPrompt(prUrls), {
+  const handle = await worker.start(environmentPrompt(prUrls, verdicts), {
     autoCreatePR: true,
     name: 'factory-env',
   });
@@ -264,9 +327,10 @@ export async function runEnvironmentPhase(
   // Either way the finding belongs on the PRs that produced it — that is where
   // the human who hit the blocked check is looking.
   const alongside = prUrls.length > 1 ? ` (alongside ${prUrls.length - 1} other recent factory PR${prUrls.length > 2 ? 's' : ''})` : '';
+  // The comment is also the "read" mark the next pass looks for.
   const note = envPrUrl
-    ? `🏭 **Factory environment agent.** Reading this PR${alongside} it found a gap in the cloud-agent environment and opened ${envPrUrl} to close it.`
-    : `🏭 **Factory environment agent.** It read this PR${alongside} looking for a check that could not run in the cloud-agent environment, and opened none. Its report:\n\n${result.resultText.trim() || '_(no report)_'}`;
+    ? `🏭 ${ENV_AGENT_MARK} Reading this PR${alongside} it found a gap in the cloud-agent environment and opened ${envPrUrl} to close it.`
+    : `🏭 ${ENV_AGENT_MARK} It read this PR${alongside} looking for a check that could not run in the cloud-agent environment, and opened none. Its report:\n\n${result.resultText.trim() || '_(no report)_'}`;
   for (const prUrl of prUrls) {
     await commentOnPr(repoSlug(config), prUrl, factoryComment(note)).catch((err: Error) => {
       log(`environment: could not comment on ${prUrl}: ${err.message}`);
@@ -286,11 +350,15 @@ export async function simplifySkip(ctx: FactoryContext, baseSha: string | null):
   return simplifySkipReason(config.simplify.enabled, openPrs, ctx.telemetry.simplifyPasses(), baseSha);
 }
 
-function simplifyPromptFor(ctx: FactoryContext): string {
-  const outcomes = ctx.telemetry.outcomes();
+async function simplifyPromptFor(ctx: FactoryContext): Promise<string> {
+  const repo = repoSlug(ctx.config);
+  const [merged, closed] = await Promise.all([
+    listPrsByLabel(repo, ctx.config.labels.factoryPr, 'merged'),
+    listPrsByLabel(repo, ctx.config.labels.simplifyPr, 'closed'),
+  ]);
   return simplifyPrompt({
-    recentPrs: recentlyMergedFactoryPrs(outcomes, 5),
-    declinedPrs: declinedSimplifications(outcomes),
+    recentPrs: recentlyMergedFactoryPrs(merged, 5),
+    declinedPrs: declinedSimplifications(closed),
     budget: ctx.config.worker,
   });
 }
@@ -317,7 +385,7 @@ export async function runSimplifyPhase(ctx: FactoryContext, worker: CursorWorker
 
   log(`simplify: looking for one simplification PR at ${baseSha?.slice(0, 8) ?? 'the default branch'}`);
   const startedAt = new Date().toISOString();
-  const handle = await worker.start(simplifyPromptFor(ctx), { autoCreatePR: true, name: 'factory-simplify' });
+  const handle = await worker.start(await simplifyPromptFor(ctx), { autoCreatePR: true, name: 'factory-simplify' });
 
   const record = async (over: Partial<SimplifyRecord>): Promise<SimplifyRecord> => {
     const full: SimplifyRecord = {
@@ -384,32 +452,50 @@ export async function tick(opts: { dryRun: boolean }): Promise<void> {
 
   // 2. Grooming: vet part of the backlog. Deliberately ahead of the
   //    capacity gate — it produces no code, so it cannot collide.
-  if (candidates.length > 0) await runGroomPhase(ctx, worker, admissible(ctx, candidates, 'groom'));
+  if (candidates.length > 0) {
+    await runGroomPhase(ctx, worker, admissible(ctx, candidates, 'groom'), { open: openIssues(candidates) });
+  }
 
-  // 3. Environment and simplification, together: fix the machine the
-  //    implementers run on from what they said about it, and take back some of
-  //    the complexity they added. Both ahead of the capacity gate, each its own
-  //    one-deep PR queue, and both deliberately independent of the backlog: a
-  //    broken machine or an accreting codebase is a problem whether or not
-  //    there is anything to build today, and the tick that notices is the idle
-  //    one. Concurrent because each may use the whole run budget.
+  // 3. Simplification alongside implementation: take back some of the
+  //    complexity the implementers added. Ahead of the capacity gate, its own
+  //    one-deep PR queue, and deliberately independent of the backlog: an
+  //    accreting codebase is a problem whether or not there is anything to
+  //    build today, and the tick that notices is the idle one. Concurrent with
+  //    the implementers because it touches no issue and takes no slot.
   await Promise.all([
-    runEnvironmentPhase(ctx, worker).catch((err: Error) => {
-      log(`environment phase error: ${err.message}`);
-      return null;
-    }),
     runSimplifyPhase(ctx, worker).catch((err: Error) => {
       log(`simplify phase error: ${err.message}`);
       return null;
     }),
+    runImplementation(ctx, worker, candidates),
   ]);
 
+  // 4. Environment, last: fix the machine the implementers run on from what
+  //    they said about it. It reads the factory's PRs, and the ones opened this
+  //    tick are the freshest evidence — a pass before the implementers would
+  //    read yesterday's and hand today's to tomorrow. Still independent of the
+  //    backlog: it runs on an idle tick too, on whatever it has not yet read.
+  await runEnvironmentPhase(ctx, worker).catch((err: Error) => {
+    log(`environment phase error: ${err.message}`);
+    return null;
+  });
+}
+
+interface Pick {
+  task: Task;
+  agentId: string;
+  usage: TokenUsage | null;
+}
+
+/** The implementation half of a tick: capacity gate, selectors, implementers. */
+async function runImplementation(ctx: FactoryContext, worker: CodingWorker, candidates: Task[]): Promise<void> {
+  const { config } = ctx;
   if (candidates.length === 0) {
-    log('no open unclaimed issues. Nothing to implement.');
+    log('no open issues. Nothing to implement.');
     return;
   }
 
-  // 4. Capacity gate, for the implementation half only.
+  // Capacity gate, for the implementation half only.
   const capacity = await ctx.state.capacity(log);
   log(`capacity: ${capacity.slots} of ${capacity.limit} slot(s) free (${capacity.openPrs.length} PR(s) awaiting a human, ${capacity.inFlight.length} pipeline(s) in flight)`);
   if (capacity.slots === 0) {
@@ -421,8 +507,8 @@ export async function tick(opts: { dryRun: boolean }): Promise<void> {
     return;
   }
 
-  // 5. Selector agents fill the free slots. Re-fetch, since the groom phase
-  //    just rewrote some of the bodies we hold.
+  // Selector agents fill the free slots. Re-fetch, since the groom phase just
+  // rewrote some of the bodies we hold.
   const tasks = admissible(ctx, await candidateTasks(ctx), 'implement').filter((t) => isGroomed(t, ctx.config.labels));
   if (tasks.length === 0) {
     log('no groomed issues available to implement. Nothing to do.');
@@ -433,9 +519,9 @@ export async function tick(opts: { dryRun: boolean }): Promise<void> {
   const picks = await pickTasks(ctx, worker, tasks, capacity.slots);
   if (picks.length === 0) return;
 
-  // 6. Handoff: one fresh implementer session per pick, run concurrently. They
-  //    work on separate branches, so the only collisions are ones a human
-  //    resolves at review time — the same as two people picking up two issues.
+  // Handoff: one fresh implementer session per pick, run concurrently. They
+  // work on separate branches, so the only collisions are ones a human
+  // resolves at review time — the same as two people picking up two issues.
   await Promise.all(
     picks.map((pick) =>
       runPipeline(ctx, worker, pick.task, pick.agentId, pick.usage).catch(async (err) => {
@@ -444,12 +530,6 @@ export async function tick(opts: { dryRun: boolean }): Promise<void> {
       }),
     ),
   );
-}
-
-interface Pick {
-  task: Task;
-  agentId: string;
-  usage: TokenUsage | null;
 }
 
 /**
@@ -498,24 +578,26 @@ async function pickTasks(
 
 /** What the tick would do, and the exact prompts it would send. Spends nothing. */
 async function dryRun(ctx: FactoryContext, allCandidates: Task[]): Promise<void> {
+  const { labels } = ctx.config;
   const candidates = admissible(ctx, allCandidates, 'groom');
-  const pending = needsGroom(candidates, ctx.config.labels);
-  const groomed = admissible(ctx, allCandidates, 'implement').filter((t) => isGroomed(t, ctx.config.labels));
-  const heldBack = allCandidates.length - candidates.length;
+  const pending = needsGroom(candidates, labels, false, openIssues(allCandidates));
+  const groomed = admissible(ctx, allCandidates, 'implement').filter((t) => isGroomed(t, labels));
+  const heldBack = filterClaimed(allCandidates, labels.issueInProgress).length - candidates.length;
   if (heldBack > 0) log(`${heldBack} assigned issue(s) held back from grooming.`);
-  const needsWork = candidates.filter((t) => verdict(t, ctx.config.labels) === 'needs-work').length;
-  const assignedGroomed = allCandidates.filter((t) => t.assignees.length > 0 && isGroomed(t, ctx.config.labels)).length;
+  const needsWork = candidates.filter((t) => verdict(t, labels) === 'needs-work').length;
+  const epics = candidates.filter((t) => isEpic(t, labels));
+  const assignedGroomed = allCandidates.filter((t) => t.assignees.length > 0 && isGroomed(t, labels)).length;
   if (!ctx.config.assignedIssues.implement && assignedGroomed > 0) {
     log(`${assignedGroomed} groomed issue(s) withheld from the selector: assigned to a human.`);
   }
   // The buckets overlap: a groomed issue someone has since replied to is both
   // implementable and queued for another look.
-  log(`dry run: ${candidates.length} unclaimed issue(s) — ${groomed.length} groomed, ${needsWork} needs-work, ${candidates.length - groomed.length - needsWork} never groomed (${pending.length} queued for a groom)`);
+  log(`dry run: ${candidates.length} unclaimed issue(s) — ${groomed.length} groomed and implementable, ${needsWork} needs-work, ${epics.length} epic(s) (${epics.filter((t) => isGroomed(t, labels)).length} groomed), ${pending.length} queued for a groom`);
 
   const next = pending.slice(0, ctx.config.groom.maxPerTick);
   if (next.length > 0) {
-    log(`would groom: ${next.map((t) => `#${t.issueNumber}`).join(' ')}. Groom prompt for #${next[0]!.issueNumber}:`);
-    console.log(`\n${groomPrompt(next[0]!, loadPrinciples(ctx.config), ctx.config.worker)}\n`);
+    log(`would groom: ${next.map((t) => `#${t.issueNumber}${isEpic(t, labels) ? ' (epic)' : ''}`).join(' ')}. Groom prompt for #${next[0]!.issueNumber}:`);
+    console.log(`\n${groomPromptFor(ctx, next[0]!, loadPrinciples(ctx.config))}\n`);
   }
   if (groomed.length > 0) {
     log('selector prompt would be:');
@@ -523,18 +605,13 @@ async function dryRun(ctx: FactoryContext, allCandidates: Task[]): Promise<void>
   }
 
   const { config } = ctx;
-  const openEnvPrs = config.environment.enabled
-    ? await listPrsByLabel(repoSlug(config), config.labels.environmentPr, 'open')
-    : [];
-  const changedAt = environmentChangedAt(ctx.telemetry.outcomes());
-  const unread = unreadFactoryPrs(ctx.telemetry.runs(), ctx.telemetry.envPasses(), changedAt);
-  const skip = skipReason(config.environment.enabled, openEnvPrs, unread, changedAt);
+  const { skip, unread, verdicts } = await environmentInputs(config);
   if (skip) {
     log(`environment: would skip — ${skip}.`);
   } else {
     const prUrls = unread.fresh.slice(0, config.environment.maxPrsPerPass);
     log(`environment: would read ${prUrls.length} of ${unread.fresh.length} unread factory PR(s)${unread.stale.length ? `, ignoring ${unread.stale.length} written before the environment changed` : ''}. Its prompt would be:`);
-    console.log(`\n${environmentPrompt(prUrls)}\n`);
+    console.log(`\n${environmentPrompt(prUrls, verdicts)}\n`);
   }
 
   const { sha } = await defaultBranchHead(repoSlug(config));
@@ -544,7 +621,7 @@ async function dryRun(ctx: FactoryContext, allCandidates: Task[]): Promise<void>
     return;
   }
   log(`simplify: would look for one simplification at ${sha.slice(0, 8)}. Its prompt would be:`);
-  console.log(`\n${simplifyPromptFor(ctx)}\n`);
+  console.log(`\n${await simplifyPromptFor(ctx)}\n`);
 }
 
 async function runPipeline(

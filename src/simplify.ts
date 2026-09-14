@@ -15,23 +15,34 @@
 // Like the environment phase it is handed no issue and parses no prose. The
 // input is the codebase plus links to the factory's own merged PRs, which is
 // where the newest complexity is; the output is whether a branch came back and
-// what its line count says. One simplification PR is open at a time, and a pass
-// that reached a conclusion is not repeated on the same commit.
+// what its line count says. One simplification PR is open at a time.
+//
+// Those inputs come from GitHub — merged PRs by label, declined ones by label
+// and state — not from telemetry, for the reason environment.ts gives. The one
+// thing read from telemetry is the commit the last pass judged, and that only
+// saves a redundant pass on an idle day: stale telemetry names an old commit,
+// the head has moved, the pass runs. It cannot make the factory skip work it
+// should do.
 
-import type { OutcomeRecord, SimplifyRecord } from './types.ts';
+import type { SimplifyRecord } from './types.ts';
 
 /** Merged implementer PRs, newest first: the first place to look for accretion. */
-export function recentlyMergedFactoryPrs(outcomes: OutcomeRecord[], limit: number): string[] {
-  return outcomes
-    .filter((o) => o.merged && (o.source ?? 'implementer') === 'implementer')
-    .sort((a, b) => b.closedAt.localeCompare(a.closedAt))
+export function recentlyMergedFactoryPrs(prs: { url: string; mergedAt: string | null }[], limit: number): string[] {
+  return prs
+    .filter((p): p is { url: string; mergedAt: string } => p.mergedAt !== null)
+    .sort((a, b) => b.mergedAt.localeCompare(a.mergedAt))
     .slice(0, limit)
-    .map((o) => o.prUrl);
+    .map((p) => p.url);
 }
 
-/** Simplifications a human closed unmerged. The agent is told not to propose them again. */
-export function declinedSimplifications(outcomes: OutcomeRecord[]): string[] {
-  return outcomes.filter((o) => o.source === 'simplify' && !o.merged).map((o) => o.prUrl);
+/**
+ * Simplifications a human closed unmerged. The agent is told not to propose
+ * them again. A closed simplification that grew the code was closed by the
+ * factory, not a human, and is not held against the idea — that one may come
+ * back done right.
+ */
+export function declinedSimplifications(prs: { url: string; state: string; additions: number; deletions: number }[]): string[] {
+  return prs.filter((p) => p.state === 'CLOSED' && shrinks(p)).map((p) => p.url);
 }
 
 /** The rule the factory enforces: a simplification removes more than it adds. */

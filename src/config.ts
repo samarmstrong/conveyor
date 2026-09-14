@@ -21,6 +21,11 @@ export interface FactoryConfig {
     environmentPr: string;
     /** Likewise for the simplification agent's PRs. */
     simplifyPr: string;
+    /** The repo's own epic label. An issue carrying it is groomed as a
+     *  direction — the groomer settles its open decisions and writes its
+     *  children — and is never handed to the selector. Not a factory label:
+     *  the repo already has one, and a human applies it. */
+    epic: string;
   };
   groom: { maxPerTick: number; principlesFile: string };
   selector: { maxCandidates: number };
@@ -70,9 +75,9 @@ export function loadConfig(root: string = projectRoot): FactoryConfig {
     );
   }
   const config = JSON.parse(readFileSync(path, 'utf8')) as FactoryConfig;
-  // Deployments commit their own factory.config.json and pull engine updates on
-  // top, so a field added upstream is simply absent in older ones. Default to
-  // the original one-job-at-a-time throttle rather than failing their next tick.
+  // A committed factory.config.json can predate a field the engine has since
+  // grown, so a missing one is simply absent. Default to the original
+  // one-job-at-a-time throttle rather than failing the next tick.
   config.maxConcurrentJobs ??= 1;
   if (!Number.isInteger(config.maxConcurrentJobs) || config.maxConcurrentJobs < 1) {
     throw new Error(
@@ -81,6 +86,7 @@ export function loadConfig(root: string = projectRoot): FactoryConfig {
   }
   config.labels.environmentPr ??= 'factory:env';
   config.labels.simplifyPr ??= 'factory:simplify';
+  config.labels.epic ??= 'type:epic';
   config.simplify ??= { enabled: true };
   // Narrowing what the factory touches is the safe direction for a deployment
   // that pulls this in without asking for it, so this defaults on rather than

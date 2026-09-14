@@ -2,9 +2,12 @@ import type { Task, WorkSource } from './types.ts';
 import type { FactoryConfig } from './config.ts';
 import { repoSlug } from './config.ts';
 import {
-  addIssueLabels, commentOnIssue, editIssueBody, ensureLabel, listOpenIssues, removeIssueLabels,
+  addIssueLabels, commentOnIssue, createIssue, editIssueBody, ensureLabel, listOpenIssues, removeIssueLabels,
 } from './github.ts';
-import { failedAttemptComment, groomComment, hasLegacyBlock, stripLegacyBlock, type GroomReply } from './groom.ts';
+import {
+  childrenFiledComment, failedAttemptComment, groomComment, hasLegacyBlock, isEpic, stripLegacyBlock,
+  type ChildDraft, type GroomReply, type StampExtras,
+} from './groom.ts';
 
 export class GitHubIssueSource implements WorkSource {
   constructor(private readonly config: FactoryConfig) {}
@@ -69,8 +72,8 @@ export class GitHubIssueSource implements WorkSource {
    * against. Either half failing therefore leaves the issue looking ungroomed or
    * stale — it gets groomed again next tick, which is the safe way to fail.
    */
-  async recordGroom(task: Task, reply: GroomReply): Promise<void> {
-    await commentOnIssue(this.repo, task.issueNumber, groomComment(task, reply));
+  async recordGroom(task: Task, reply: GroomReply, extras: StampExtras = {}): Promise<void> {
+    await commentOnIssue(this.repo, task.issueNumber, groomComment(task, reply, isEpic(task, this.config.labels), extras));
 
     const { groomed, needsWork } = this.config.labels;
     const [add, remove] = reply.verdict === 'groomed' ? [groomed, needsWork] : [needsWork, groomed];
@@ -85,5 +88,30 @@ export class GitHubIssueSource implements WorkSource {
     if (hasLegacyBlock(task.body)) {
       await editIssueBody(this.repo, task.issueNumber, `${stripLegacyBlock(task.body).trimEnd()}\n`).catch(() => {});
     }
+  }
+
+  /**
+   * The children a groomed epic's groomer wrote. Each opens with a line naming
+   * the epic — that is the only structure the factory adds, and it is what a
+   * later groom follows to find the premise. They inherit the epic's labels,
+   * minus the epic label itself and anything the factory owns, so an epic
+   * filed under `area:agents` yields children filed under `area:agents`.
+   * Filed one at a time so a failure leaves a legible partial list, which is
+   * then noted on the epic.
+   */
+  async fileChildren(epic: Task, children: ChildDraft[]): Promise<{ number: number; url: string }[]> {
+    const factoryOwned = new Set(Object.values(this.config.labels));
+    const labels = epic.labels.filter((l) => !factoryOwned.has(l));
+    const filed: { number: number; url: string }[] = [];
+    try {
+      for (const child of children) {
+        filed.push(await createIssue(this.repo, child.title, `Part of #${epic.issueNumber}\n\n${child.body}`, labels));
+      }
+    } finally {
+      if (filed.length > 0) {
+        await commentOnIssue(this.repo, epic.issueNumber, childrenFiledComment(filed)).catch(() => {});
+      }
+    }
+    return filed;
   }
 }

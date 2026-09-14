@@ -51,18 +51,20 @@ Plenty of tools point an agent at a backlog. This one takes positions:
 ## What one tick does
 
 ```
-reconcile outcomes of previously opened PRs (merged/rejected → telemetry, release issue)
+reconcile with GitHub: record the verdict on every factory PR that has closed, release the
+   in-progress label on every issue nothing is working on any more
 → GROOM agents (up to groom.maxPerTick, in parallel, newest first): vet issues against
    principles.md — "groomed" or "needs-work", recorded as a label, alongside a comment
-   giving the conclusion, why, and any coding-level notes (the issue is never closed)
-→ ENVIRONMENT agent: reads the factory PRs it has not read yet, looking for a check the
-   implementer could not run, and fixes .cursor/environment.json in the target repo so the
-   next one can. Opens a PR only when it finds a gap it can close; one open at a time
-→ SIMPLIFY agent, alongside it: reads the codebase, starting from the factory's own merged
-   PRs, and opens one PR that removes more code than it adds — abstractions with one
-   caller, fallback paths nothing reaches, hand-rolled copies of what the SDK ships. A PR
-   that grows the code is closed by the factory, unseen. One open at a time; a commit the
-   last pass already judged is not looked at again
+   giving the conclusion, why, and any coding-level notes (the issue is never closed).
+   An issue carrying the repo's epic label is groomed as a DIRECTION instead: the agent
+   settles its open decisions in the comment and writes its first children, which the
+   factory files under it. A verdict blocked on another issue names it, and is revisited
+   the tick after that issue closes
+→ SIMPLIFY agent, alongside the implementation below: reads the codebase, starting from
+   the factory's own merged PRs, and opens one PR that removes more code than it adds —
+   abstractions with one caller, fallback paths nothing reaches, hand-rolled copies of
+   what the SDK ships. A PR that grows the code is closed by the factory, unseen. One
+   open at a time; a commit the last pass already judged is not looked at again
 count the jobs already in flight (open factory PRs + running pipelines)
    → no free slot under maxConcurrentJobs? stop here
 for each free slot:
@@ -76,6 +78,10 @@ for each free slot:
 label the resulting PRs `factory`, comment on the issues, record telemetry
    → a run that ends with NO PR, or runs out of worker.maxRunMinutes, retracts the
       groom verdict: the issue is relabelled needs-work with the agent's report
+→ ENVIRONMENT agent, last, so the PRs just opened are in front of it: reads the factory
+   PRs it has not read yet, looking for a check the implementer could not run, and fixes
+   .cursor/environment.json in the target repo so the next one can. Opens a PR only when
+   it finds a gap it can close; one open at a time
 stop — a human merging or closing a PR is what frees the next slot
 ```
 
@@ -181,6 +187,91 @@ branches, so the only collisions are ones a human resolves at review time. Crash
 pipelines are detected via stale records in the local `telemetry/current-runs.json`
 (> `staleRunHours`), recorded as aborted, and cleaned up, so a crash cannot leak a slot.
 
+## Epics: where direction comes from
+
+Grooming one issue at a time has a blind spot. Every capability that needs more than one
+PR before it delivers anything has a first PR that is, on its own, dead code — a planner
+whose plan nothing executes, a contract with one implementation. Judged alone, that issue
+fails, and so the capability never starts. A factory with only that filter drifts toward
+maintenance: fixes, deletions, small hardening, and nothing anyone would call a direction.
+
+An **epic** is how direction gets in. It is an ordinary issue carrying the repo's own epic
+label (`labels.epic`, default `type:epic`), usually linking a design document. The factory
+grooms it with the same agent and the same principles, but the question changes: not
+"can one PR land this" but "is this worth building toward, and can its shape-changing
+decisions be settled here". The groomer settles them — which engine first, a plain string
+or a modelled entity, the existing mechanism or a new one — and records each default, why,
+and what reversing it would cost, in the groom comment. That comment is the record the
+children are built against.
+
+**The groomer asks a human only for the decisions that need one:** irreversible ones, legal
+or licensing exposure, or anything that widens what the system may do on its own. Those are
+`needs-work` with the one decision named. Everything else is a default a human can veto
+the way every verdict here is vetoed: reply on the epic, and it is groomed again with the
+reply in view. Nothing waits for an approval nobody asked for.
+
+**A groomed epic's children are the work.** The groomer writes the first slice — the issues
+that can start against the code as it stands or against a sibling in the same slice — each
+one PR by the usual standard, in fenced ```` ```child ```` blocks. The factory files them
+under the epic, each opening with a `Part of #N` line, inheriting the epic's labels minus
+the factory's own. Each child is then groomed on a later tick like any issue, with one
+difference the groom prompt spells out: the epic's decisions are its premise, so the
+groomer judges shape and size and does not re-argue whether the capability should exist.
+Later slices are written when the epic is groomed again after the first has landed.
+
+**A groomed epic is never handed to the selector.** It carries the same `factory:groomed`
+label as an implementable issue, because grooming is the one verdict mechanism here, but
+`admissible(..., 'implement')` drops anything with the epic label. What gets built is the
+children.
+
+**Blocked verdicts revisit themselves.** A child that cannot start until its epic is groomed,
+or until a sibling lands, is `needs-work` with a `BLOCKED: #N` line in the groomer's reply.
+The factory carries that into the stamp — `<!-- factory-groom sha=… blocked=#N -->` — and
+treats the verdict as stale the tick after the blocker clears, exactly as if a human had
+replied: a sibling clears when it is no longer open, an epic clears when it is groomed,
+since an epic never closes while its children are being built. So a first-slice child
+blocked on its sibling is groomed again, unprompted, once the sibling merges. The only
+state is in the issue, as always. Epics are groomed ahead of everything else in a tick,
+because their children are newer than they are by construction and grooming a child
+before its epic only produces a verdict blocked on it — and since a tick's grooms run in
+parallel, a child whose epic is itself waiting for a groom is left out of that tick
+entirely rather than groomed beside it.
+
+**Children follow the epic's record.** A child's verdict is judged against the decisions in
+its epic's groom comment, so the stamp names that record — `<!-- factory-groom sha=…
+premise=#N@<hash of the epic's groom comment> -->`. When the epic is groomed again, the
+hash no longer matches and every child judged against the old record is stale: each is
+re-groomed against the record as it stands, told that the epic is what brought it back, and
+asked what changed for it, which may be nothing. A child already claimed by an implementer
+is not interrupted; its PR is reviewed like any other.
+
+**An epic reviews itself when its slice lands.** The epic's stamp names the children its
+verdict knew about — `children=#a,#b`, plus the ones the factory filed for it — and the
+verdict goes stale once none of them is open. That re-groom is where the next slice of
+children gets written, so a capability keeps moving without anyone remembering to ask. A
+child a human closes as rejected counts as landed for this purpose, which is what you want:
+the groomer sees the closure and writes around it.
+
+**Direction changes in one place, and it ratchets.** A revised design document is not a
+change of direction. A reply on the epic is — one that links the revision and names the
+decisions it disagrees with. The epic is then groomed again with that reply in view, and the
+groomer is told the record ratchets: a settled decision stands unless the reply names it,
+the code has moved from under it, or it now pulls against the principles, and a decision a
+merged or in-flight child relies on is reversed only when the reply asks for that in so many
+words, with the cost in existing code stated. The children then follow, as above. This is
+what keeps a document that is rewritten weekly from becoming weekly whiplash for the work:
+every reversal is a deliberate, attributed act on the issue the work hangs from, and its cost
+is written down where the person making it can see it.
+
+The whole flow, for the next design document (`.claude/skills/doc-to-epics` walks it): file
+one issue per direction it proposes with the epic label, written so the issue is the record —
+what should become true, how the author means it to work, the decisions and their proposed
+defaults, all in the issue's own words, since the document is usually internal and the
+agents never see it. A document that is a plan, a schedule, an org chart and a product
+proposal at once yields several epics, and the plan and the schedule are not among them.
+Run the tick; the design review is the groom. When the document is revised, reply on the
+epics it changes with the change stated in full; do not file a new one.
+
 ## The environment
 
 An implementer that cannot verify its own change says so, plainly, in the PR it opens:
@@ -203,6 +294,25 @@ an issue link. And the pass's own verdict is the branch it pushed: a PR means it
 fixable gap, no PR means it did not. That is the same handoff the controller already reads
 from an implementer, so the phase adds no new grammar to the factory.
 
+The implementer's Verification section does keep **Blocked by the machine** as its own
+heading, apart from checks that were not applicable or ran out of time. That is not a
+format the factory parses; it is so the reviewer and the environment agent both find the
+one line that matters without sorting it out of the others.
+
+**The reference machine is the repo's own CI.** The workflows under `.github/workflows`
+already say what has to be installed and running before the repo's checks can pass, so the
+agent is told to hold the environment to that: a suite an implementer skipped because its
+runner was not installed, or a database that was not up, is a gap, and so is a
+`pip install` every implementer has to run before anything works. Our first version asked
+only for *blocked* checks and warned against a general-purpose image, and the agent applied
+that faithfully — it called "installed the deps myself" an inconvenience, PR after PR, while
+an implementer down the line skipped the Python integration suite over exactly that. Beyond
+what CI needs the warning still holds: a tool no workflow installs is not the agent's to add.
+
+The agent is also shown its own recent verdicts, one per PR it has read. A gap that shows
+up as a shrug in every PR is invisible to a reader handed one PR at a time; this is where
+it is seen whole.
+
 **Not every gap is the environment's to close**, and the prompt is specific about it. A
 check that needs an artifact which does not exist yet at review time, or a credential the
 factory does not hold, is not an environment problem — the implementer verified the wrong
@@ -219,13 +329,23 @@ the other only product code — so a full review queue never leaves the agents' 
 broken. The cost is honest: it is a second thing that can be awaiting your review. Set
 `environment.enabled` to `false` to turn the phase off entirely.
 
+**Every input comes from GitHub, none from telemetry.** The factory PRs are the ones
+carrying the factory label; a PR has been read when the environment agent's comment is on
+it, which the pass posts on every PR it reads anyway; and the environment last changed when
+the newest environment-labelled PR merged. Telemetry records each pass and decides nothing.
+The first version read run records instead, and a tick whose telemetry failed to persist —
+the GitHub Actions runner, for a week — re-read the same two PRs every day while never
+learning the newer ones existed. GitHub is where the PRs are; asking it is correct from any
+machine, and a pass that fails before commenting leaves its PRs unread, so they come back
+around without any bookkeeping.
+
 **A merged environment PR voids every report written before it.** A report is a claim
 about the machine the agent ran on, so once that machine changes the claim is about
 something that no longer exists — the same move the groom fingerprint makes when a human
 replies to an issue. Without this the phase re-fixes what it just fixed: our first
 environment PR merged, and the next pass was handed seven reports of "no Docker" all
-written on the pre-Docker machine, and dutifully added Docker again. A run that *started*
-before the change necessarily ran on the old machine, so `startedAt` is the cutoff.
+written on the pre-Docker machine, and dutifully added Docker again. A PR *opened* before
+the change was written on the old machine, so its creation time is the cutoff.
 
 Voided reports are dropped, not deferred. If the gap one describes still exists, the next
 implementer hits it and says so in a PR opened after the change, and that one is read.
@@ -337,6 +457,8 @@ so the workflow is inert in the upstream repo.
   `groom.maxPerTick` (how much backlog to vet per tick), `maxConcurrentJobs` (how many
   jobs may be in flight at once — the whole implementation throttle), stale-run cutoff,
   labels.
+- `factory.config.json` → `labels.epic` — the repo's own epic label (default `type:epic`).
+  Issues carrying it are groomed as direction and never implemented; see "Epics" above.
 - `factory.config.json` → `assignedIssues` — whether each phase may act on an issue a
   human has assigned to themselves. Defaults to `{ "groom": true, "implement": false }`:
   vetting an assigned issue costs its assignee nothing, implementing one collides with
@@ -366,10 +488,34 @@ so the workflow is inert in the upstream repo.
 
 ## Telemetry
 
-Append-only JSONL at `telemetry/runs.jsonl`:
+**GitHub is the source of record; telemetry is the record of what the factory spent.**
+Nothing the tick decides is read from telemetry. Which issues are claimed, which PRs
+closed, what the environment agent has read, what the simplifier was declined — all of it
+is on GitHub, as labels, PR state, and the factory's own comments, and every phase asks
+GitHub. The first version decided from telemetry, and a runner whose telemetry did not
+persist — the Actions runner, for a week — re-read the same PRs every day and never
+learned the new ones existed. A record can be lost without the factory doing anything
+wrong; a decision cannot.
+
+The one exception is deliberate: the simplification pass skips a commit the last pass
+already judged, read from telemetry. Stale telemetry names an old commit and the pass
+runs, so the worst a lost record can do there is cost one redundant pass.
+
+The record itself is append-only JSONL at `telemetry/runs.jsonl`, kept on the `telemetry`
+branch: only the tick writes it, nothing reviews it, and the org ruleset that requires a
+PR for `main` has no business with it. The Actions tick fetches the branch before it
+starts and appends its rows after. To read it locally:
+
+```bash
+git fetch origin telemetry && git show origin/telemetry:telemetry/runs.jsonl > telemetry/runs.jsonl
+npm run factory -- status
+```
+
+Its rows:
 
 - `groom` records: issue, verdict, whether notes were written, whether it was a
-  re-groom after the issue changed, agent id, token usage, duration.
+  re-groom after the issue changed, agent id, token usage, duration. For an epic, that
+  it was one and how many children were filed; for a blocked verdict, the blocker.
 - `run` records: issue, worker/model, selector + implementer agent ids, start/end,
   outcome (`pr-opened`/`no-pr`/`failed`/`aborted`), token usage for both agents, duration.
 - `env` records: which factory PRs the pass read, whether it opened a PR and which,

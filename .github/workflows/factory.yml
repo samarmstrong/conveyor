@@ -9,8 +9,10 @@ concurrency:
   group: factory
   cancel-in-progress: false
 
-# The tick commits telemetry back to this repo; without this the default
-# GITHUB_TOKEN is read-only and the persist step fails after the work is done.
+# The tick appends to the record on the `telemetry` branch; without this the
+# default GITHUB_TOKEN is read-only and the persist step fails after the work
+# is done. Main is never pushed to: the org ruleset requires a PR there, and
+# nothing the tick decides depends on the record anyway (see outcomes.ts).
 permissions:
   contents: write
 
@@ -25,8 +27,21 @@ jobs:
           node-version: 24
       - run: npm ci
       - run: npm run check
-      # A deployment commits its factory.config.json; the upstream repo has
-      # none, so the tick is skipped there and the schedule is a no-op.
+      # The tick needs a committed factory.config.json; without one the
+      # schedule is a no-op.
+      # The record lives on the `telemetry` branch, one append-only file. Fetch
+      # what is there so this tick's rows land after it; a missing branch means
+      # the record starts here.
+      - name: Fetch telemetry
+        if: hashFiles('factory.config.json') != ''
+        run: |
+          mkdir -p telemetry
+          if git fetch -q origin telemetry 2>/dev/null; then
+            git show origin/telemetry:telemetry/runs.jsonl > telemetry/runs.jsonl
+            echo "record has $(wc -l < telemetry/runs.jsonl) row(s)"
+          else
+            echo "no telemetry branch yet; starting the record"
+          fi
       - if: hashFiles('factory.config.json') != ''
         run: npm run factory -- run
         env:
@@ -34,15 +49,44 @@ jobs:
           # PAT with repo scope on the target repo; the default GITHUB_TOKEN
           # is scoped to this repo and cannot label/PR the target repo.
           GH_TOKEN: ${{ secrets.FACTORY_GH_TOKEN }}
-      # Telemetry lives in the runner unless persisted; commit it back so
-      # outcome reconciliation works across ticks.
+      # Append this tick's rows to the record. Only the tick writes to this
+      # branch, so a rejected push means another tick beat us to it: refetch
+      # and replay the new rows onto whatever is there now. The branch is
+      # handled in a worktree so the main checkout, and the credentials
+      # actions/checkout put in its config, are left alone.
       - name: Persist telemetry
         if: hashFiles('factory.config.json') != ''
         run: |
-          if [[ -n "$(git status --porcelain telemetry/ 2>/dev/null)" ]]; then
-            git config user.name "conveyor"
-            git config user.email "conveyor@users.noreply.github.com"
-            git add -f telemetry/runs.jsonl
-            git commit -m "telemetry: factory tick $(date -u +%Y-%m-%dT%H:%M)"
-            git push
+          [[ -f telemetry/runs.jsonl ]] || exit 0
+          base_rows=$(git show origin/telemetry:telemetry/runs.jsonl 2>/dev/null | wc -l)
+          tail -n +"$((base_rows + 1))" telemetry/runs.jsonl > "$RUNNER_TEMP/new-rows.jsonl"
+          if [[ ! -s "$RUNNER_TEMP/new-rows.jsonl" ]]; then
+            echo "no new telemetry rows"; exit 0
           fi
+          echo "persisting $(wc -l < "$RUNNER_TEMP/new-rows.jsonl") telemetry row(s)"
+          git config user.name "conveyor"
+          git config user.email "conveyor@users.noreply.github.com"
+
+          record="$RUNNER_TEMP/record"
+          for attempt in 1 2 3 4 5; do
+            rm -rf "$record"; git worktree prune
+            if git fetch -q origin telemetry 2>/dev/null; then
+              git worktree add -q --detach "$record" origin/telemetry
+            else
+              # No record yet: start the branch with this tick's rows.
+              git worktree add -q --detach "$record" HEAD
+              git -C "$record" checkout -q --orphan telemetry
+              git -C "$record" rm -rfq --cached . && git -C "$record" clean -fdq
+            fi
+            mkdir -p "$record/telemetry"
+            cat "$RUNNER_TEMP/new-rows.jsonl" >> "$record/telemetry/runs.jsonl"
+            git -C "$record" add -f telemetry/runs.jsonl
+            git -C "$record" commit -q -m "telemetry: factory tick $(date -u +%Y-%m-%dT%H:%M)"
+            if git -C "$record" push -q origin HEAD:refs/heads/telemetry; then
+              exit 0
+            fi
+            echo "push rejected (attempt $attempt); the record moved, retrying"
+            sleep $((attempt * 5))
+          done
+          echo "::error::could not persist telemetry after 5 attempts"
+          exit 1
