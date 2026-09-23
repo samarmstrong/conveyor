@@ -1,10 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import {
   ENV_AGENT_MARK,
+  workerSkipReason,
   environmentChangedAt,
+  filedIssueBody,
+  parseEnvReport,
   recentVerdicts,
   skipReason,
   unreadFactoryPrs,
+  withOpenedThisTick,
   type FactoryPr,
   type UnreadPrs,
 } from '../src/environment.ts';
@@ -144,5 +148,85 @@ describe('skipReason', () => {
 
   it('reports the open PR before anything else when both apply', () => {
     expect(skipReason(true, [{ url: pr(20) }], unread())).toMatch(/already awaiting a human/);
+  });
+});
+
+describe('workerSkipReason', () => {
+  it('lets the cursor worker run the phase', () => {
+    expect(workerSkipReason('cursor')).toBeNull();
+  });
+
+  it('skips it for the claude-code worker, saying why', () => {
+    expect(workerSkipReason('claude-code')).toMatch(/only applies to the cursor worker/);
+  });
+});
+
+// A "Blocked by the machine" item that is really the repo's defect is the one
+// thing the environment agent cannot close itself. It writes it as a fenced
+// issue block; the factory files it and posts the rest of the report.
+describe('parseEnvReport', () => {
+  const reply = `No environment gap; the image is fine.
+
+\`\`\`issue
+CSRF middleware rejects the agent layer's /internal calls with env.example's settings
+With \`APP_CSRF_REPORT_ONLY="false"\` every POST /internal/tools/invoke answers 403.
+\`\`\`
+
+The database start is the same as on #56.`;
+
+  it('lifts each issue block out, title first line and body the rest', () => {
+    const { report, issues } = parseEnvReport(reply);
+    expect(issues).toEqual([{
+      title: "CSRF middleware rejects the agent layer's /internal calls with env.example's settings",
+      body: 'With `APP_CSRF_REPORT_ONLY="false"` every POST /internal/tools/invoke answers 403.',
+    }]);
+    expect(report).toContain('No environment gap');
+    expect(report).toContain('same as on #56');
+    expect(report).not.toContain('```issue');
+    expect(report).not.toContain('answers 403');
+  });
+
+  it('a report with no block files nothing and is posted whole', () => {
+    expect(parseEnvReport('Nothing to add this week.')).toEqual({ report: 'Nothing to add this week.', issues: [] });
+  });
+
+  it('a block with no title is not an issue', () => {
+    expect(parseEnvReport('```issue\n\n```').issues).toEqual([]);
+  });
+});
+
+describe('filedIssueBody', () => {
+  const draft = { title: 't', body: 'The body.' };
+
+  it('opens with where the report came from, then the write-up', () => {
+    const body = filedIssueBody(draft, [pr(1067)]);
+    expect(body.startsWith(`Reported by the implementer of ${pr(1067)} under **Blocked by the machine**`)).toBe(true);
+    expect(body).toContain('a defect in the repo, not the machine');
+    expect(body.trimEnd().endsWith('The body.')).toBe(true);
+  });
+
+  it('names every PR the pass read', () => {
+    const body = filedIssueBody(draft, [pr(1067), pr(1066)]);
+    expect(body).toContain(`implementers of ${pr(1067)}, ${pr(1066)}`);
+  });
+});
+
+// GitHub's label index lags a label write by seconds, and the pass lists by
+// label seconds after the implementers labelled their PRs. The tick vouches
+// for what it opened.
+describe('withOpenedThisTick', () => {
+  it('puts a PR GitHub has not listed yet in front of the fresh ones', () => {
+    expect(withOpenedThisTick(unread([pr(1070), pr(1067)]), [pr(1071)])).toEqual(unread([pr(1071), pr(1070), pr(1067)]));
+  });
+
+  it('does not repeat a PR GitHub already listed, fresh or stale', () => {
+    const u = unread([pr(1070)], [pr(900)]);
+    expect(withOpenedThisTick(u, [pr(1070), pr(900)])).toBe(u);
+    expect(withOpenedThisTick(u, [pr(1071), pr(1071)])).toEqual(unread([pr(1071), pr(1070)], [pr(900)]));
+  });
+
+  it('is a no-op when nothing was opened', () => {
+    const u = unread([pr(1070)]);
+    expect(withOpenedThisTick(u, [])).toBe(u);
   });
 });

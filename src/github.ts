@@ -57,6 +57,21 @@ export async function listOpenIssues(repo: string, limit: number): Promise<Issue
   ]);
 }
 
+/**
+ * Whether an issue or pull request is still open. `repos/…/issues/N` answers
+ * for both, which is the point: a groom verdict may be blocked on a PR, and the
+ * issue list never sees one. `unknown` when GitHub could not say — deleted,
+ * transferred, or the call failed.
+ */
+export async function referenceState(repo: string, number: number): Promise<'open' | 'closed' | 'unknown'> {
+  try {
+    const { state } = await ghJson<{ state: string }>(['api', `repos/${repo}/issues/${number}`]);
+    return state === 'open' ? 'open' : state === 'closed' ? 'closed' : 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
 /** Open issues carrying a label — the in-progress label, for reconciliation. */
 export async function listIssuesByLabel(repo: string, label: string, limit = 100): Promise<IssueData[]> {
   return ghJson<IssueData[]>([
@@ -165,6 +180,55 @@ export async function commentOnIssue(repo: string, issue: number, body: string):
 
 export async function commentOnPr(repo: string, prUrl: string, body: string): Promise<void> {
   await ghStdin(['pr', 'comment', prUrl, '-R', repo, '--body-file', '-'], body);
+}
+
+/**
+ * Take a PR out of draft. Cursor opens the implementer's PR itself, and whether
+ * it comes out as a draft varies run to run with nothing in the factory's
+ * control (four runs in a row stayed drafts; the runs before them did not).
+ * A draft waits on nobody, so the factory clears it the moment it labels the PR.
+ */
+export async function markPrReady(repo: string, prUrl: string): Promise<void> {
+  const { isDraft } = await viewPr(repo, prUrl);
+  if (isDraft) await gh(['pr', 'ready', prUrl, '-R', repo]);
+}
+
+export interface PrCheck {
+  name: string;
+  /** gh's rollup of a check's state; `cancel` is what gh calls a cancelled run. */
+  bucket: 'pass' | 'fail' | 'pending' | 'skipping' | 'cancel';
+  link: string;
+}
+
+/**
+ * The PR's checks as they stand right now. Exit code is 0 even when checks
+ * are red because of `--json`; without it gh signals red with a nonzero exit
+ * and the wrapper would throw.
+ */
+export async function prChecks(repo: string, prUrl: string): Promise<PrCheck[]> {
+  return ghJson<PrCheck[]>(['pr', 'checks', prUrl, '-R', repo, '--json', 'name,bucket,link']);
+}
+
+/**
+ * Wait for a PR's checks to settle, and return the failing ones. A repo with no
+ * checks settles at once. Gives up after `maxWaitMs` and treats whatever is
+ * still pending as not failing: a slow CI is not the implementer's fault, and
+ * the human sees the real state on the PR either way.
+ */
+export async function awaitPrChecks(
+  repo: string,
+  prUrl: string,
+  opts: { maxWaitMs: number; pollMs: number; log?: (msg: string) => void },
+): Promise<{ failed: PrCheck[]; settled: boolean }> {
+  const deadline = Date.now() + opts.maxWaitMs;
+  for (;;) {
+    const checks = await prChecks(repo, prUrl);
+    const pending = checks.filter((c) => c.bucket === 'pending');
+    if (pending.length === 0) return { failed: checks.filter((c) => c.bucket === 'fail'), settled: true };
+    if (Date.now() > deadline) return { failed: checks.filter((c) => c.bucket === 'fail'), settled: false };
+    opts.log?.(`${prUrl}: ${pending.length} check(s) still running`);
+    await new Promise((r) => setTimeout(r, opts.pollMs));
+  }
 }
 
 export async function closePr(repo: string, prUrl: string, comment: string): Promise<void> {

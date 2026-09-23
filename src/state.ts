@@ -141,7 +141,7 @@ export class FactoryState {
         taskId: run.taskId,
         issueNumber: run.issueNumber,
         issueTitle: '',
-        worker: 'cursor',
+        worker: this.config.worker.kind,
         model: this.config.worker.model,
         agentId: run.agentId,
         startedAt: run.startedAt,

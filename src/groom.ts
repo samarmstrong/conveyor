@@ -34,7 +34,12 @@
 // only because another issue has to land first is about that other issue as
 // much as this one, so the stamp names it, and the verdict goes stale the tick
 // after #N is no longer open — the same move a human reply makes, without a
-// human having to make it.
+// human having to make it. "No longer open" is checked against every open
+// issue in the repo, and #N is not always one of those: the groomer may name a
+// pull request, or an issue past the fetch cap. A number the open issues do
+// not account for is looked up on its own and held open until GitHub says it
+// is closed, so a verdict blocked on an open PR stays current instead of
+// going stale every tick and being groomed again to the same conclusion.
 //
 // Epics are groomed by the same machinery with one difference in what
 // "groomed" means: not "one PR can land this" but "this direction is settled,
@@ -118,11 +123,35 @@ export interface GroomLabels {
   /** The repo's own epic label. An issue carrying it is groomed as direction
    *  and never implemented. Optional so older tests and configs still read. */
   epic?: string;
+  /** Blocks the agents' own verification; goes ahead of the ordinary backlog. */
+  blocker?: string;
 }
 
 /** An epic: a direction the groomer settles and decomposes, never a PR. */
 export function isEpic(task: Task, labels: GroomLabels): boolean {
   return labels.epic !== undefined && task.labels.includes(labels.epic);
+}
+
+/**
+ * A blocker: an issue whose defect stops implementers verifying their own
+ * changes — a test script that leaves the database empty, a shipped config
+ * that rejects the app's own calls. The environment pass files these from the
+ * factory's PRs and labels them; a human can label one too. It is a premise
+ * for every PR opened while it stands, so it goes ahead of the queue.
+ */
+export function isBlocker(task: Task, labels: GroomLabels): boolean {
+  return labels.blocker !== undefined && task.labels.includes(labels.blocker);
+}
+
+/**
+ * The one order both queues use: epics, then blockers, then oldest first.
+ * Each tier is a premise for the tier below — an epic's verdict for its
+ * children, a blocker's fix for every implementer's verification — and issue
+ * numbers are the order issues were filed.
+ */
+export function queueOrder(labels: GroomLabels): (a: Task, b: Task) => number {
+  const tier = (t: Task) => (isEpic(t, labels) ? 0 : isBlocker(t, labels) ? 1 : 2);
+  return (a, b) => tier(a) - tier(b) || a.issueNumber - b.issueNumber;
 }
 
 export type GroomState =
@@ -232,20 +261,38 @@ export function verdict(task: Task, labels: GroomLabels): GroomVerdict | null {
   return null;
 }
 
-/** Every open issue in the repo, claimed or not, by number. */
-export type OpenIssues = Map<number, Task>;
+/**
+ * Every open issue in the repo, claimed or not, by number — plus `heldOpen`:
+ * numbers a verdict is blocked on that are not among those issues but are not
+ * known to be closed either. A pull request, an issue past the fetch cap, or a
+ * reference the lookup could not settle. Absence from the map is only evidence
+ * of closure for the numbers this set does not hold.
+ */
+export type OpenIssues = Map<number, Task> & { readonly heldOpen: ReadonlySet<number> };
 
-export function openIssues(tasks: Task[]): OpenIssues {
-  return new Map(tasks.map((t) => [t.issueNumber, t]));
+export function openIssues(tasks: Task[], heldOpen: Iterable<number> = []): OpenIssues {
+  return Object.assign(new Map(tasks.map((t) => [t.issueNumber, t])), { heldOpen: new Set(heldOpen) });
+}
+
+/**
+ * The blockers current verdicts name that the open issues do not account for.
+ * Each is either closed — and the verdict waiting on it is stale — or open
+ * somewhere the issue list does not reach; only a lookup can tell which.
+ */
+export function unaccountedBlockers(tasks: Task[], open: OpenIssues): number[] {
+  const named = tasks.map((t) => readBlocker(t)).filter((n): n is number => n !== null && !open.has(n));
+  return [...new Set(named)].sort((a, b) => a - b);
 }
 
 /**
  * Whether what a blocked verdict waited for has happened. A sibling has to
  * land, so it clears when it is no longer open. An epic never closes while its
  * children are being built; it clears when it is groomed, because that is the
- * moment its children have a premise.
+ * moment its children have a premise. A blocker that is not an open issue but
+ * is held open — a pull request still in flight — has not cleared.
  */
 function blockerCleared(blocker: number, open: OpenIssues, labels: GroomLabels): boolean {
+  if (open.heldOpen.has(blocker)) return false;
   const target = open.get(blocker);
   if (!target) return true;
   return isEpic(target, labels) && verdict(target, labels) === 'groomed';
@@ -354,6 +401,18 @@ export function childrenFiledComment(children: { number: number; url: string }[]
 }
 
 /**
+ * The groomer, asked whether an unlabelled issue is one PR, answered that it is a
+ * direction instead. A plain factory comment, not a groom stamp: the issue has no
+ * verdict yet, so once it carries the epic label the next groom reads it as an
+ * ungroomed epic and settles it.
+ */
+export function epicRecognizedComment(reasoning: string, epicLabel: string): string {
+  return factoryComment(
+    `🏭 **Factory groom — this is an epic.** Read as one PR it is not one: it sets a direction that several PRs build toward. The factory has labelled it \`${epicLabel}\` and grooms it as a direction — whether it is worth building toward, with its open decisions settled and its first children written.\n\n${reasoning.trim()}`,
+  );
+}
+
+/**
  * The factory retracting its own groomed verdict after an implementation attempt
  * refuted it. A factory comment, not a groom stamp: the fingerprint keeps
  * pointing at what the groom read, so only a human reply or edit queues a
@@ -368,14 +427,17 @@ export function failedAttemptComment(report: string): string {
 /**
  * Never groomed, or groomed against an issue that has since changed.
  *
- * Newest first. A stale issue's premises are false by construction — the code
- * moved underneath it — so oldest-first spends the grooming budget on the part
- * of the backlog least likely to yield anything buildable, and the factory
- * opens no PRs meanwhile because selection only draws from groomed issues.
+ * Oldest first. Issues are filed in roughly dependency order — the thing an
+ * issue builds on was usually filed before it — so grooming the oldest pending
+ * issue first settles the premises the newer ones rest on. A stale old issue
+ * still costs a groom, but its `needs-work` verdict is a real answer about the
+ * backlog, and the newer issues that assumed it get judged against that answer.
  *
  * Epics go ahead of everything, because an epic's verdict is the premise for the
  * issues around it: its children are newer than it by construction, and grooming
- * them first only produces verdicts blocked on it. Going first is not enough
+ * them first only produces verdicts blocked on it. Blockers go next: every
+ * implementer that runs before one is fixed hits it, so its verdict is wanted
+ * before the backlog's. Going first is not enough
  * when the batch runs in parallel, so a child whose epic is itself waiting for a
  * groom is left out altogether until the epic has one: its verdict would be
  * about a record that is about to change.
@@ -387,7 +449,7 @@ export function failedAttemptComment(report: string): string {
 export function needsGroom(tasks: Task[], labels: GroomLabels, force = false, open?: OpenIssues): Task[] {
   const pending = tasks
     .filter((t) => force || groomState(t, labels, open) !== 'current')
-    .sort((a, b) => Number(isEpic(b, labels)) - Number(isEpic(a, labels)) || b.issueNumber - a.issueNumber);
+    .sort(queueOrder(labels));
   const pendingEpics = new Set(pending.filter((t) => isEpic(t, labels)).map((t) => t.issueNumber));
   return pending.filter((t) => {
     const parent = parentEpic(t);
@@ -424,19 +486,31 @@ export interface GroomReply {
   children: ChildDraft[];
 }
 
-const VERDICT_RE = /^\s*VERDICT:\s*(groomed|needs[-_ ]?work)\s*$/gim;
+const VERDICT_RE = /^\s*VERDICT:\s*(groomed|needs[-_ ]?work|epic)\s*$/gim;
 const BLOCKED_RE = /^\s*BLOCKED:\s*#?(\d+)\s*$/gim;
 const NOTES_RE = /```notes[ \t]*\n([\s\S]*?)```/g;
 const CHILD_RE = /```child[ \t]*\n([\s\S]*?)```/g;
 
 /** First non-empty line is the title, shorn of markdown; the rest is the body. */
-function parseChild(block: string): ChildDraft | null {
+function parseDraft(block: string): ChildDraft | null {
   const lines = block.split('\n');
   const i = lines.findIndex((l) => l.trim().length > 0);
   if (i === -1) return null;
   const title = lines[i]!.trim().replace(/^(#+\s*|title:\s*)/i, '').replace(/^\*\*(.*)\*\*$/, '$1').trim();
   const body = lines.slice(i + 1).join('\n').trim();
   return title ? { title, body } : null;
+}
+
+/**
+ * Every fenced ```<tag> block in an agent's reply, read as an issue draft, and
+ * the reply with those blocks removed. This is the one shape in which an agent
+ * hands the factory an issue to file: the groomer's children under an epic,
+ * and the environment agent's repo defects. Blocks with no title are dropped.
+ */
+export function parseDraftBlocks(text: string, tag: string): { drafts: ChildDraft[]; rest: string } {
+  const re = new RegExp('```' + tag + '[ \\t]*\\n([\\s\\S]*?)```', 'g');
+  const drafts = [...text.matchAll(re)].map((m) => parseDraft(m[1]!)).filter((c): c is ChildDraft => c !== null);
+  return { drafts, rest: text.replace(re, '').trim() };
 }
 
 /**
@@ -449,14 +523,12 @@ export function parseGroomReply(text: string): GroomReply | null {
   const verdicts = [...text.matchAll(VERDICT_RE)];
   const last = verdicts.at(-1);
   if (!last) return null;
-  const verdict: GroomVerdict = /^groomed$/i.test(last[1]!) ? 'groomed' : 'needs-work';
+  const verdict: GroomVerdict = /^groomed$/i.test(last[1]!) ? 'groomed' : /^epic$/i.test(last[1]!) ? 'epic' : 'needs-work';
 
   const notes = [...text.matchAll(NOTES_RE)].at(-1)?.[1]?.trim() || undefined;
   const blockedLine = [...text.matchAll(BLOCKED_RE)].at(-1)?.[1];
   const blocked = blockedLine && verdict === 'needs-work' ? Number(blockedLine) : undefined;
-  const children = [...text.matchAll(CHILD_RE)]
-    .map((m) => parseChild(m[1]!))
-    .filter((c): c is ChildDraft => c !== null);
+  const children = parseDraftBlocks(text, 'child').drafts;
 
   // The reasoning is everything except the machinery, for the issue comment.
   const reasoning = text

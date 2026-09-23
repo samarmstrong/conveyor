@@ -1,24 +1,13 @@
 // CursorWorker: CodingWorker implemented on the Cursor Cloud Agents v1 API.
 // Docs: https://cursor.com/docs/cloud-agent/api/endpoints
 
-import type {
-  CodingWorker, ModelSpec, RunHandle, RunResult, RunStatus, StartOptions, TokenUsage,
+import {
+  RunBudgetExceeded,
+  type CodingWorker, type ModelSpec, type RunHandle, type RunResult, type RunStatus, type StartOptions, type TokenUsage,
 } from './types.ts';
 
 const BASE_URL = 'https://api.cursor.com';
 const TERMINAL: RunStatus[] = ['FINISHED', 'ERROR', 'CANCELLED', 'EXPIRED'];
-
-/**
- * The factory's own `maxRunMinutes` ran out. Distinct from Cursor's terminal
- * statuses because it means something different: an ERROR is the machinery, a
- * blown budget is evidence about the size of the work.
- */
-export class RunBudgetExceeded extends Error {
-  constructor(readonly runId: string, readonly maxRunMinutes: number) {
-    super(`Run ${runId} exceeded ${maxRunMinutes} minutes; cancelled.`);
-    this.name = 'RunBudgetExceeded';
-  }
-}
 
 export interface CursorWorkerOptions {
   apiKey: string;
@@ -32,6 +21,13 @@ export interface CursorWorkerOptions {
    */
   startingRef: string | null;
   model: ModelSpec | null;
+  /**
+   * Credentials injected into every agent's shell, by variable name. Cursor
+   * scopes them to the agent and deletes them with it. The field is in beta on
+   * Cursor's side and silently dropped for accounts without it, so an agent
+   * reporting the variable missing is a Cursor account question first.
+   */
+  envVars?: Record<string, string>;
   pollIntervalSeconds: number;
   maxRunMinutes: number;
   log?: (msg: string) => void;
@@ -84,6 +80,8 @@ export class CursorWorker implements CodingWorker {
       autoCreatePR: opts.autoCreatePR ?? false,
     };
     if (opts.name) body['name'] = opts.name;
+    const envNames = Object.keys(this.opts.envVars ?? {});
+    if (envNames.length > 0) body['envVars'] = this.opts.envVars;
     if (this.opts.model) {
       const { id, params } = this.opts.model;
       body['model'] = {
@@ -95,7 +93,7 @@ export class CursorWorker implements CodingWorker {
     const json = await this.api<{ agent: { id: string }; run: { id: string } }>(
       'POST', '/v1/agents', body,
     );
-    this.log(`launched agent ${json.agent.id} run ${json.run.id}`);
+    this.log(`launched agent ${json.agent.id} run ${json.run.id}${envNames.length ? ` (env: ${envNames.join(', ')})` : ''}`);
     return { agentId: json.agent.id, runId: json.run.id };
   }
 
@@ -128,12 +126,28 @@ export class CursorWorker implements CodingWorker {
         };
       }
       if (Date.now() > deadline) {
-        await this.api('POST', `/v1/agents/${handle.agentId}/runs/${handle.runId}/cancel`).catch(() => {});
+        await this.cancel(handle);
         throw new RunBudgetExceeded(handle.runId, this.opts.maxRunMinutes);
       }
       this.log(`agent ${handle.agentId} run ${handle.runId}: ${run.status}`);
       await new Promise((r) => setTimeout(r, intervalMs));
     }
+  }
+
+  async cancel(handle: RunHandle): Promise<void> {
+    await this.api('POST', `/v1/agents/${handle.agentId}/runs/${handle.runId}/cancel`).catch((err: Error) => {
+      this.log(`could not cancel agent ${handle.agentId} run ${handle.runId}: ${err.message}`);
+    });
+  }
+
+  /**
+   * The API carries no reason for an ERROR, and the cause is usually outside
+   * the run: on 2026-09-16 three implementers died in the same minute because
+   * the team's included usage hit 100% with on-demand spend off. The agent
+   * page is where that shows, so the log points there.
+   */
+  opaqueRunNote(handle: RunHandle): string {
+    return `Cursor gave no reason; see https://cursor.com/agents/${handle.agentId} (an account-wide cause, such as the usage limit, shows there and hits every run at once)`;
   }
 
   async usage(agentId: string): Promise<TokenUsage | undefined> {

@@ -89,3 +89,38 @@ describe('filterAssigned', () => {
     expect(filterAssigned(tasks)).toEqual(tasks);
   });
 });
+
+describe('oldestFirst', () => {
+  const LABELS = { groomed: 'factory:groomed', needsWork: 'factory:needs-work', epic: 'type:epic', blocker: 'factory:blocker' };
+  const t = (n: number, labels: string[] = []) => ({ id: `o/r#${n}`, issueNumber: n, title: '', body: '', comments: [], labels, assignees: [], url: '' });
+
+  it('orders groomed issues by number ascending, lowest number first', async () => {
+    const { oldestFirst } = await import('../src/controller.ts');
+    const input = [t(40), t(7), t(19)];
+    expect(oldestFirst(input, LABELS).map((x) => x.issueNumber)).toEqual([7, 19, 40]);
+    // Non-mutating: the fetch order is left as GitHub gave it.
+    expect(input.map((x) => x.issueNumber)).toEqual([40, 7, 19]);
+  });
+
+  it('puts a blocker ahead of everything, however new it is', async () => {
+    const { oldestFirst } = await import('../src/controller.ts');
+    // The environment pass filed #1080 last night; eighteen groomed issues are older.
+    const input = [t(40), t(1080, ['factory:blocker']), t(7), t(900, ['factory:blocker'])];
+    expect(oldestFirst(input, LABELS).map((x) => x.issueNumber)).toEqual([900, 1080, 7, 40]);
+  });
+});
+
+describe('selectorCandidates', () => {
+  const LABELS = { groomed: 'factory:groomed', needsWork: 'factory:needs-work', blocker: 'factory:blocker' };
+  const t = (n: number, labels: string[] = []) => ({ id: `o/r#${n}`, issueNumber: n, title: '', body: '', comments: [], labels, assignees: [], url: '' });
+
+  it('offers only the blockers while any stand', async () => {
+    const { selectorCandidates } = await import('../src/controller.ts');
+    expect(selectorCandidates([t(7), t(1080, ['factory:blocker']), t(40)], LABELS).map((x) => x.issueNumber)).toEqual([1080]);
+  });
+
+  it('offers the whole groomed set when none does', async () => {
+    const { selectorCandidates } = await import('../src/controller.ts');
+    expect(selectorCandidates([t(7), t(40)], LABELS).map((x) => x.issueNumber)).toEqual([7, 40]);
+  });
+});

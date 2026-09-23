@@ -5,9 +5,11 @@
     "url": "https://github.com/acme/widgets"
   },
   "worker": {
+    "kind": "cursor",
     "model": null,
     "pollIntervalSeconds": 30,
-    "maxRunMinutes": 90
+    "maxRunMinutes": 90,
+    "agentEnv": []
   },
   "labels": {
     "factoryPr": "factory",
@@ -16,13 +18,15 @@
     "needsWork": "factory:needs-work",
     "environmentPr": "factory:env",
     "simplifyPr": "factory:simplify",
-    "epic": "type:epic"
+    "epic": "type:epic",
+    "blocker": "factory:blocker"
   },
   "groom": {
     "maxPerTick": 5,
     "principlesFile": "principles.example.md"
   },
   "selector": {
+    "enabled": false,
     "maxCandidates": 100
   },
   "environment": {

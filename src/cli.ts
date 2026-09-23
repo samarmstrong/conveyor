@@ -2,21 +2,21 @@
 // factory CLI — the daily trigger runs `factory run`; everything else is
 // for humans operating the factory.
 
-import { admissible, buildContext, buildWorker, candidateTasks, environmentInputs, log, runEnvironmentPhase, runGroomPhase, runSelector, runSimplifyPhase, simplifySkip, tick } from './controller.ts';
-import { repoSlug, requireCursorApiKey } from './config.ts';
-import { isEpic, isGroomed, needsGroom, openIssues, verdict } from './groom.ts';
+import { admissible, buildContext, buildWorker, candidateTasks, environmentInputs, log, openSet, runEnvironmentPhase, runGroomPhase, runSelector, runSimplifyPhase, simplifySkip, tick } from './controller.ts';
+import { repoSlug } from './config.ts';
+import { isEpic, isGroomed, needsGroom, verdict } from './groom.ts';
 import { defaultBranchHead } from './github.ts';
-import type { CurrentRun } from './types.ts';
+import type { CodingWorker, CurrentRun } from './types.ts';
 
-const USAGE = `conveyor — thin software-factory control plane around Cursor
+const USAGE = `conveyor — thin software-factory control plane around Cursor cloud agents or local Claude Code
 
 Usage:
-  npm run factory -- run [--dry-run]   One idempotent tick: groom part of the backlog, then a selector agent picks a groomed issue and a fresh agent implements it.
+  npm run factory -- run [--dry-run]   One idempotent tick: groom part of the backlog, then hand the oldest groomed issue to a fresh implementer agent (a selector agent picks instead if selector.enabled).
   npm run factory -- groom [--limit N] [--force]
                                        Run just the grooming phase (vets issues against principles.md; no implementation).
                                        --force re-grooms issues that already have a current verdict — use after editing
                                        principles.md or the groom prompt, which do not invalidate verdicts on their own.
-  npm run factory -- select            Run just the selector agent over the groomed issues and show its pick (no implementation, no labels).
+  npm run factory -- select            Run just the selector agent over the groomed issues and show its pick (no implementation, no labels). Works even with selector.enabled off.
   npm run factory -- env               Run just the environment phase: an agent reads the factory PRs it has not read yet,
                                        looking for checks the implementer could not run, and fixes .cursor/environment.json
                                        in the target repo so the next one can. Opens a PR only if it finds a gap it can close.
@@ -25,13 +25,15 @@ Usage:
                                        A PR that grows the code is closed by the factory before a human sees it.
   npm run factory -- status            Show grooming progress, capacity, in-flight jobs, pending PRs, and recent telemetry.
   npm run factory -- abort [--issue N] Abandon stuck local pipelines — all of them, or just issue N's
-                                       (cancels the Cursor runs if possible).
+                                       (cancels the runs if the worker still can).
+
+Environment: FACTORY_WORKER=cursor|claude-code overrides worker.kind for one invocation.
 `;
 
 async function groom(opts: { limit?: number; force?: boolean }): Promise<void> {
   const ctx = buildContext();
   const all = await candidateTasks(ctx);
-  const open = openIssues(all);
+  const open = await openSet(ctx, all);
   const candidates = admissible(ctx, all, 'groom');
   const records = await runGroomPhase(ctx, await buildWorker(ctx.config), candidates, { ...opts, open });
   if (records.length === 0) {
@@ -62,7 +64,7 @@ async function status(): Promise<void> {
   const epics = candidates.filter((t) => isEpic(t, labels)).length;
   // The buckets overlap: a groomed issue someone has since replied to is both
   // implementable and queued for another look.
-  const pending = needsGroom(candidates, labels, false, openIssues(allCandidates)).length;
+  const pending = needsGroom(candidates, labels, false, await openSet(ctx, allCandidates)).length;
   log(`backlog: ${candidates.length} unclaimed — ${groomed} groomed, ${needsWork} needs-work, ${candidates.length - groomed - needsWork} never groomed, ${epics} epic(s) among them (${pending} queued for a groom)`);
 
   const implementable = admissible(ctx, allCandidates, 'implement').filter((t) => isGroomed(t, labels)).length;
@@ -74,7 +76,7 @@ async function status(): Promise<void> {
     ];
     log(`assigned to a human: ${assigned.length} issue(s)${held.length ? ` — withheld from ${held.join(' and ')}` : ' — not withheld from anything'}`);
   }
-  log(`implementable now: ${implementable} groomed issue(s) the selector may draw from`);
+  log(`implementable now: ${implementable} groomed issue(s) ready for an implementer`);
 
   const capacity = await ctx.state.capacity(log);
   log(`capacity: ${capacity.slots} of ${capacity.limit} slot(s) free`);
@@ -158,26 +160,24 @@ async function abort(opts: { issueNumber?: number }): Promise<void> {
     );
     return;
   }
-  for (const current of runs) await abortRun(ctx, current);
+  const worker = await buildWorker(ctx.config).catch((err: Error) => {
+    log(`could not build the worker to cancel runs (${err.message}); clearing local state only.`);
+    return null;
+  });
+  for (const current of runs) await abortRun(ctx, worker, current);
 }
 
-async function abortRun(ctx: ReturnType<typeof buildContext>, current: CurrentRun): Promise<void> {
-  try {
-    const apiKey = requireCursorApiKey();
-    const res = await fetch(
-      `https://api.cursor.com/v1/agents/${current.agentId}/runs/${current.runId}/cancel`,
-      { method: 'POST', headers: { Authorization: `Bearer ${apiKey}` } },
-    );
-    log(`cancel request for agent ${current.agentId} run ${current.runId}: HTTP ${res.status}`);
-  } catch (err) {
-    log(`could not cancel the Cursor run (${(err as Error).message}); stop it from the Cursor dashboard if needed.`);
+async function abortRun(ctx: ReturnType<typeof buildContext>, worker: CodingWorker | null, current: CurrentRun): Promise<void> {
+  if (worker) {
+    await worker.cancel({ agentId: current.agentId, runId: current.runId });
+    log(`cancel requested for agent ${current.agentId} run ${current.runId}`);
   }
   ctx.telemetry.append({
     type: 'run',
     taskId: current.taskId,
     issueNumber: current.issueNumber,
     issueTitle: '',
-    worker: 'cursor',
+    worker: ctx.config.worker.kind,
     model: ctx.config.worker.model,
     agentId: current.agentId,
     startedAt: current.startedAt,
