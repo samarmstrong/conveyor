@@ -2,10 +2,10 @@ import type { Task, WorkSource } from './types.ts';
 import type { FactoryConfig } from './config.ts';
 import { repoSlug } from './config.ts';
 import {
-  addIssueLabels, commentOnIssue, createIssue, editIssueBody, ensureLabel, listOpenIssues, removeIssueLabels,
+  addIssueLabels, commentOnIssue, createIssue, editIssueBody, ensureLabel, listOpenIssues, referenceState, removeIssueLabels,
 } from './github.ts';
 import {
-  childrenFiledComment, failedAttemptComment, groomComment, hasLegacyBlock, isEpic, stripLegacyBlock,
+  childrenFiledComment, epicRecognizedComment, failedAttemptComment, groomComment, hasLegacyBlock, isEpic, stripLegacyBlock,
   type ChildDraft, type GroomReply, type StampExtras,
 } from './groom.ts';
 
@@ -28,6 +28,17 @@ export class GitHubIssueSource implements WorkSource {
       assignees: (i.assignees ?? []).map((a) => a.login),
       url: i.url,
     }));
+  }
+
+  /**
+   * Of the numbers given, those not confirmed closed. One call each, for the
+   * few blockers the open-issue list does not account for. A reference GitHub
+   * cannot settle is held open too: a verdict should not go stale, and cost a
+   * groom every tick, on a lookup that failed.
+   */
+  async stillOpen(numbers: number[]): Promise<Set<number>> {
+    const states = await Promise.all(numbers.map(async (n) => [n, await referenceState(this.repo, n)] as const));
+    return new Set(states.filter(([, s]) => s !== 'closed').map(([n]) => n));
   }
 
   async markStarted(task: Task): Promise<void> {
@@ -99,6 +110,13 @@ export class GitHubIssueSource implements WorkSource {
    * Filed one at a time so a failure leaves a legible partial list, which is
    * then noted on the epic.
    */
+  async markEpic(task: Task, reasoning: string): Promise<void> {
+    const epicLabel = this.config.labels.epic;
+    if (epicLabel === undefined) throw new Error('no epic label configured');
+    await commentOnIssue(this.repo, task.issueNumber, epicRecognizedComment(reasoning, epicLabel));
+    await addIssueLabels(this.repo, task.issueNumber, [epicLabel]);
+  }
+
   async fileChildren(epic: Task, children: ChildDraft[]): Promise<{ number: number; url: string }[]> {
     const factoryOwned = new Set(Object.values(this.config.labels));
     const labels = epic.labels.filter((l) => !factoryOwned.has(l));

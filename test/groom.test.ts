@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
-  fingerprint, groomComment, groomNotes, groomState, hasLegacyBlock, isEpic, isGroomed, needsGroom, openIssues,
-  childrenFiledComment, openChildren, parentEpic, parseGroomReply, premiseOf, readBlocker, readChildren,
-  readFingerprint, readPremise, recordFingerprint, stampExtrasFor, stripLegacyBlock, verdict,
+  fingerprint, groomComment, groomNotes, groomState, hasLegacyBlock, isEpic, isFactoryComment, isGroomed, needsGroom, openIssues,
+  childrenFiledComment, epicRecognizedComment, openChildren, parentEpic, parseGroomReply, premiseOf, readBlocker, readChildren,
+  readFingerprint, readPremise, recordFingerprint, stampExtrasFor, stripLegacyBlock, unaccountedBlockers, verdict,
 } from '../src/groom.ts';
 import type { GroomVerdict, IssueComment, Task } from '../src/types.ts';
 
@@ -144,8 +144,15 @@ describe('backlog filters', () => {
   const fresh = task(12, 'c');
   const stale = { ...verdictOn(task(9, 'd'), 'groomed'), body: 'd rewritten' };
 
-  it('grooms the ungroomed and the stale, newest first', () => {
-    expect(needsGroom([groomed, rejected, fresh, stale], LABELS).map((t) => t.issueNumber)).toEqual([12, 9]);
+  it('grooms the ungroomed and the stale, oldest first', () => {
+    expect(needsGroom([groomed, rejected, fresh, stale], LABELS).map((t) => t.issueNumber)).toEqual([9, 12]);
+  });
+
+  it('grooms a blocker ahead of the backlog, and an epic ahead of that', () => {
+    const blocker = task(1080, 'test db empty', [], ['factory:blocker']);
+    const epic = task(2000, 'a direction', [], ['type:epic']);
+    const labels = { ...LABELS, epic: 'type:epic', blocker: 'factory:blocker' };
+    expect(needsGroom([fresh, blocker, stale, epic], labels).map((t) => t.issueNumber)).toEqual([2000, 1080, 9, 12]);
   });
 
   it('offers every issue carrying the groomed label for implementation', () => {
@@ -195,6 +202,22 @@ describe('parseGroomReply', () => {
   it('does not mistake prose about a verdict for the verdict line', () => {
     expect(parseGroomReply('I would say VERDICT: groomed is arguable here, but see below.')).toBeNull();
   });
+
+  it('parses the epic verdict: a direction, not a PR', () => {
+    const parsed = parseGroomReply('Three phases, each several PRs, with decisions that bind them.\n\nVERDICT: epic');
+    expect(parsed).toMatchObject({ verdict: 'epic' });
+    expect(parsed!.reasoning).not.toContain('VERDICT');
+  });
+});
+
+describe('recognising an epic', () => {
+  it('the comment is a factory comment, not a groom stamp, and names the label', () => {
+    const c = epicRecognizedComment('Several PRs, one direction.', 'type:epic');
+    expect(isFactoryComment(c)).toBe(true);
+    expect(c).not.toMatch(/factory-groom sha=/);
+    expect(c).toContain('`type:epic`');
+    expect(c).toContain('Several PRs, one direction.');
+  });
 });
 
 describe('blocked verdicts', () => {
@@ -232,6 +255,22 @@ describe('blocked verdicts', () => {
     expect(groomState(blocked, LABELS)).toBe('current');
   });
 
+  it('a blocker that is not an open issue but is held open — a PR in flight — has not cleared', () => {
+    // #15 is a pull request: never in the issue list, so absent from the map.
+    expect(groomState(blocked, LABELS, openIssues([blocked], [15]))).toBe('current');
+    expect(groomState(blocked, LABELS, openIssues([blocked], []))).toBe('stale');
+    expect(needsGroom([blocked], LABELS, false, openIssues([blocked], [15]))).toEqual([]);
+  });
+
+  it('names the blockers the open issues do not account for, once each', () => {
+    const sibling = task(15, 'the sibling');
+    const alsoBlocked = verdictOn(task(21, 'another child'), 'needs-work', undefined, 15);
+    const onPr = verdictOn(task(22, 'waits on a PR'), 'needs-work', undefined, 913);
+    const unblocked = verdictOn(task(23, 'fine'), 'groomed');
+    expect(unaccountedBlockers([blocked, alsoBlocked, onPr, unblocked, sibling], openIssues([blocked, alsoBlocked, onPr, unblocked, sibling]))).toEqual([913]);
+    expect(unaccountedBlockers([blocked, alsoBlocked, onPr], openIssues([blocked, alsoBlocked, onPr]))).toEqual([15, 913]);
+  });
+
   it('never stamps a blocker on a groomed verdict', () => {
     const groomed = verdictOn(task(21, 'x'), 'groomed', undefined, 15);
     expect(readBlocker(groomed)).toBeNull();
@@ -247,11 +286,11 @@ describe('epics', () => {
   const EPIC_LABELS = { ...LABELS, epic: 'type:epic' };
   const epic = task(30, 'Direction: a closed loop', [], ['type:epic']);
 
-  it('grooms ahead of everything else, then newest first', () => {
+  it('grooms ahead of everything else, then oldest first', () => {
     const older = task(28, 'a'), newer = task(29, 'b');
-    expect(needsGroom([older, newer, epic], EPIC_LABELS).map((t) => t.issueNumber)).toEqual([30, 29, 28]);
+    expect(needsGroom([older, newer, epic], EPIC_LABELS).map((t) => t.issueNumber)).toEqual([30, 28, 29]);
     const olderEpic = task(5, 'e', [], ['type:epic']);
-    expect(needsGroom([older, newer, olderEpic], EPIC_LABELS).map((t) => t.issueNumber)).toEqual([5, 29, 28]);
+    expect(needsGroom([older, newer, olderEpic], EPIC_LABELS).map((t) => t.issueNumber)).toEqual([5, 28, 29]);
   });
 
   it('is an epic only by the configured label', () => {
@@ -409,7 +448,7 @@ describe('children of an epic', () => {
   it('waits for the epic: a child is not groomed in a tick where its epic still needs one', () => {
     const sibling = task(44, 'Part of #40\n\nfeat: reconstruction');
     expect(needsGroom([ungroomedEpic, child, sibling, orphan], EPIC_LABELS).map((t) => t.issueNumber)).toEqual([40, 42]);
-    expect(needsGroom([epic, child, sibling, orphan], EPIC_LABELS).map((t) => t.issueNumber)).toEqual([44, 42, 41]);
+    expect(needsGroom([epic, child, sibling, orphan], EPIC_LABELS).map((t) => t.issueNumber)).toEqual([41, 42, 44]);
     // Under force the epic is pending again, so its children wait for the next tick.
     expect(needsGroom([epic, child, orphan], EPIC_LABELS, true).map((t) => t.issueNumber)).toEqual([40, 42]);
   });
@@ -425,6 +464,6 @@ describe('force re-grooming', () => {
   });
 
   it('revisits current verdicts under force — the fingerprint does not track the principles', () => {
-    expect(needsGroom([groomed, rejected, fresh], LABELS, true).map((t) => t.issueNumber)).toEqual([12, 11, 10]);
+    expect(needsGroom([groomed, rejected, fresh], LABELS, true).map((t) => t.issueNumber)).toEqual([10, 11, 12]);
   });
 });

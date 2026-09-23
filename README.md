@@ -1,7 +1,8 @@
 # conveyor
 
 An opinionated software factory: agents groom your backlog, one PR is in flight
-at a time, and humans merge. Cursor cloud agents do the coding; this repo owns
+at a time, and humans merge. Cursor cloud agents do the coding — or Claude Code
+sessions on the machine running the tick, see [Workers](#workers) — and this repo owns
 only the **factory policy** — what is worth building, when work happens, which
 issue is admissible, verification requirements, review policy, the
 human-approval boundary, and run/outcome telemetry.
@@ -36,6 +37,13 @@ Plenty of tools point an agent at a backlog. This one takes positions:
   entry point, with `agent-browser` for anything that has a UI, and ends its PR with a
   Verification section listing each check it ran and each it did not, with the reason.
   The groomer budgets for that and may not scope it away to make an issue fit.
+- **CI's verdict goes back to the agent, not to the reviewer.** A PR with a failing check
+  is not finished work. The factory waits for the checks and, if one is red, hands the
+  failing jobs back to the implementer that wrote the code — same agent, same branch —
+  for one fix round. It judges whether the failure is its own; one that is red on main
+  too is reported on the PR and left. Only then does a human see the PR, and the issue
+  comment says if it is still red. This is not a review gate: the check is the repo's
+  own, and the factory only relays it.
 - **The factory owns the machine it builds on.** When an agent cannot verify its own
   change because the sandbox lacks something, that is the factory's bug, not the
   reviewer's problem. An agent reads the factory's own PRs and fixes the environment.
@@ -53,12 +61,14 @@ Plenty of tools point an agent at a backlog. This one takes positions:
 ```
 reconcile with GitHub: record the verdict on every factory PR that has closed, release the
    in-progress label on every issue nothing is working on any more
-→ GROOM agents (up to groom.maxPerTick, in parallel, newest first): vet issues against
+→ GROOM agents (up to groom.maxPerTick, in parallel; epics, then blockers, then oldest
+   first): vet issues against
    principles.md — "groomed" or "needs-work", recorded as a label, alongside a comment
    giving the conclusion, why, and any coding-level notes (the issue is never closed).
    An issue carrying the repo's epic label is groomed as a DIRECTION instead: the agent
    settles its open decisions in the comment and writes its first children, which the
-   factory files under it. A verdict blocked on another issue names it, and is revisited
+   factory files under it. An unlabelled issue the groomer finds to be a direction rather
+   than a PR is given that label and groomed as an epic in the same tick. A verdict blocked on another issue names it, and is revisited
    the tick after that issue closes
 → SIMPLIFY agent, alongside the implementation below: reads the codebase, starting from
    the factory's own merged PRs, and opens one PR that removes more code than it adds —
@@ -68,20 +78,28 @@ reconcile with GitHub: record the verdict on every factory PR that has closed, r
 count the jobs already in flight (open factory PRs + running pipelines)
    → no free slot under maxConcurrentJobs? stop here
 for each free slot:
-   → SELECTOR agent: gets LINKS to the GROOMED issues (minus factory:wip claims,
-      issues assigned to a human, and the picks made earlier this tick), reads them,
-      and picks the best-defined one by judgment — no scores, no weights, no veto
+   → take the OLDEST groomed issue by number (minus factory:wip claims, issues assigned
+      to a human, and the picks made earlier this tick), except that a groomed issue
+      labelled factory:blocker comes first however new it is. With selector.enabled, a
+      SELECTOR agent instead gets LINKS to those issues — only the blockers, while any
+      stand — reads them, and picks the best-defined one by judgment — no scores, no
+      weights, no veto
    label the pick factory:wip
 → handoff to a FRESH implementer agent per pick, running concurrently, each with a
    short workflow prompt and the issue LINK (not its text — the agent reads the
    issue itself, notes and all)
+wait for each PR's checks. A red check goes back to the SAME implementer, once, with
+   the failing jobs' links: fix it if it is yours, say so on the PR if it is not
 label the resulting PRs `factory`, comment on the issues, record telemetry
    → a run that ends with NO PR, or runs out of worker.maxRunMinutes, retracts the
       groom verdict: the issue is relabelled needs-work with the agent's report
 → ENVIRONMENT agent, last, so the PRs just opened are in front of it: reads the factory
    PRs it has not read yet, looking for a check the implementer could not run, and fixes
    .cursor/environment.json in the target repo so the next one can. Opens a PR only when
-   it finds a gap it can close; one open at a time
+   it finds a gap it can close; one open at a time. A gap that is the repo's, not the
+   machine's, is filed as an issue labelled factory:blocker, which puts it at the front
+   of both queues above. Cursor worker only: local agents fix
+   their own machine as they go
 stop — a human merging or closing a PR is what frees the next slot
 ```
 
@@ -100,11 +118,18 @@ the issue that the prompt author had to decide how to cut.
 "Is this one PR?" is asked exactly once, by grooming, and it is asked with the real
 constraint in hand: the groom prompt states the implementer's run budget
 (`worker.maxRunMinutes`), that it is a single fresh agent, and that it can use
-subagents. The selector does not ask again. It is told grooming already settled size,
-that it is ranking rather than re-vetting, and that it must always pick one — a
-selector that could decline would be a second gate with no record of its verdict,
-and a factory whose two gates disagree stalls forever on the same issue with the
-same log line.
+subagents. Nothing downstream asks again. By default there is nothing downstream to
+ask: a free slot takes the oldest groomed issue, and the only thing between grooming
+and the implementer is a label. The optional selector agent (`selector.enabled`) ranks
+rather than re-vets, and must always pick one — a selector that could decline would be
+a second gate with no record of its verdict, and a factory whose two gates disagree
+stalls forever on the same issue with the same log line.
+
+The selector is off by default because it costs more as the groomed backlog grows —
+one read of every groomed issue per free slot — without changing what lands. Grooming
+decided each issue is buildable; the order they are tried in is not what the attempt
+tests. Oldest first also means a stale groomed verdict is the next one tested rather
+than the one skipped forever.
 
 What tests the groom's judgment is the attempt. An implementer that finishes without a
 PR, or runs out of its budget, has produced the one piece of evidence that matters, so
@@ -112,7 +137,7 @@ the factory retracts the verdict: `factory:groomed` comes off, `factory:needs-wo
 goes on, and a comment carries the agent's report. That comment is not a new groom
 stamp, so the fingerprint still points at what the groom read — the issue is groomed
 again when a human replies or edits, and that groom is told to weigh the failed
-attempt. Failures that say nothing about the issue (a Cursor error, a cancelled run, a
+attempt. Failures that say nothing about the issue (a worker error, a cancelled run, a
 GitHub hiccup) only release it for a later tick.
 
 ## Grooming
@@ -123,17 +148,30 @@ bad issue produces a confident bad PR, and no amount of agent autonomy fixes an 
 that should not be built. A groomed issue's implementer is in fact *less* boxed in,
 because the scoping argument already happened upstream.
 
-Grooming works **newest issue first**. A stale issue's premises are false by
-construction — the code moved underneath it — so oldest-first spends the grooming
-budget on the part of the backlog least likely to yield anything buildable, while the
-factory opens no PRs meanwhile (selection draws only from groomed issues). The first
-seven grooms in our first deployment, run against a months-old backlog, were 7/7
-`needs-work` — none a false rejection — which is what motivated this ordering.
+Grooming works **oldest issue first**, with epics ahead of everything. Issues are filed
+in roughly dependency order — what an issue builds on was usually filed before it — so
+the oldest pending issue is the one whose verdict the most other issues rest on. A stale
+old issue still costs a groom, but its `needs-work` is a real answer about the backlog,
+and the newer issues that assumed it are then judged against that answer rather than
+ahead of it.
 
-`principles.md` holds the product-direction principles grooming judges against. They
-are deliberately factory-local: they never reach the implementer, which sees only
-coding-level direction. That separation is the point — product direction is decided at
-grooming time, not at coding time.
+One more tier sits between the epics and the rest: **blockers**. An issue labelled
+`factory:blocker` is a defect that stops the factory's own implementers verifying their
+changes — a test script that leaves the database empty, a shipped config that rejects the
+app's own calls. The environment pass files these from the factory's PRs (see
+[The environment](#the-environment)); a human can label
+one too, or remove the label to demote it. Every PR opened while a blocker stands hits it,
+so it is groomed ahead of the backlog and, once groomed, implemented ahead of it, however
+new its number. The label is an ordering claim and nothing more: the groomer still judges
+the issue, can still say `needs-work`, and the implementer's attempt still tests the
+verdict. It does not skip the gate; it goes to the front of the line for it.
+
+`principles.md` holds the product-direction principles grooming judges against. Its
+first section, *What the product is*, is the short list of settled commitments an epic's
+direction is checked against before anything else; the rest is about the shape of a
+change. They are deliberately factory-local: they never reach the implementer, which sees
+only coding-level direction. That separation is the point — product direction is decided
+at grooming time, not at coding time.
 
 **State lives in the issue, not in a local file.** The verdict is the
 `factory:groomed` / `factory:needs-work` label — the thing you already read when
@@ -168,8 +206,8 @@ would otherwise offer.
 The two records answer different questions, so they cannot contradict each other:
 the label says whether an issue passed, the fingerprint says whether that answer is
 still about the issue as it stands. **The label alone decides what may be
-implemented; the fingerprint only decides what gets looked at again.** So the
-selector sees every `factory:groomed` issue, and one that has drifted is both
+implemented; the fingerprint only decides what gets looked at again.** So every
+`factory:groomed` issue is implementable, and one that has drifted is both
 implementable now and queued for a re-review — a verdict stands until something
 replaces it.
 
@@ -182,7 +220,7 @@ the record, so it is also the override.
 The tick is idempotent: run it as often as you like; it starts work only in the slots
 `maxConcurrentJobs` leaves free, counting open factory PRs and running pipelines alike.
 `maxConcurrentJobs: 1` is the strict one-at-a-time factory. At 2, a tick with both slots
-free runs two selector picks and two implementers concurrently — they work on separate
+free takes two groomed issues and runs two implementers concurrently — they work on separate
 branches, so the only collisions are ones a human resolves at review time. Crashed
 pipelines are detected via stale records in the local `telemetry/current-runs.json`
 (> `staleRunHours`), recorded as aborted, and cleaned up, so a crash cannot leak a slot.
@@ -196,10 +234,14 @@ fails, and so the capability never starts. A factory with only that filter drift
 maintenance: fixes, deletions, small hardening, and nothing anyone would call a direction.
 
 An **epic** is how direction gets in. It is an ordinary issue carrying the repo's own epic
-label (`labels.epic`, default `type:epic`), usually linking a design document. The factory
-grooms it with the same agent and the same principles, but the question changes: not
-"can one PR land this" but "is this worth building toward, and can its shape-changing
-decisions be settled here". The groomer settles them — which engine first, a plain string
+label (`labels.epic`, default `type:epic`). Nobody has to apply the label: the ordinary
+groom has a third verdict, `epic`, for an issue that turns out to be a direction rather
+than a PR — several PRs before anything is delivered, with decisions that bind them all.
+The factory labels it, says why in a comment, and grooms it again as an epic in the same
+tick. Size alone is not an epic; an issue that is merely too large is `needs-work`. The
+factory grooms an epic with the same agent and the same principles, but the question
+changes: not "can one PR land this" but "is this worth building toward, and can its
+shape-changing decisions be settled here". The groomer settles them — which engine first, a plain string
 or a modelled entity, the existing mechanism or a new one — and records each default, why,
 and what reversing it would cost, in the groom comment. That comment is the record the
 children are built against.
@@ -219,7 +261,7 @@ difference the groom prompt spells out: the epic's decisions are its premise, so
 groomer judges shape and size and does not re-argue whether the capability should exist.
 Later slices are written when the epic is groomed again after the first has landed.
 
-**A groomed epic is never handed to the selector.** It carries the same `factory:groomed`
+**A groomed epic is never implemented.** It carries the same `factory:groomed`
 label as an implementable issue, because grooming is the one verdict mechanism here, but
 `admissible(..., 'implement')` drops anything with the epic label. What gets built is the
 children.
@@ -229,7 +271,10 @@ or until a sibling lands, is `needs-work` with a `BLOCKED: #N` line in the groom
 The factory carries that into the stamp — `<!-- factory-groom sha=… blocked=#N -->` — and
 treats the verdict as stale the tick after the blocker clears, exactly as if a human had
 replied: a sibling clears when it is no longer open, an epic clears when it is groomed,
-since an epic never closes while its children are being built. So a first-slice child
+since an epic never closes while its children are being built. A blocker that is not an
+open issue — a pull request, usually — is looked up on its own and held open until GitHub
+says it is closed, so the verdict does not read as cleared, and get groomed again to the
+same conclusion, every tick. So a first-slice child
 blocked on its sibling is groomed again, unprompted, once the sibling merges. The only
 state is in the issue, as always. Epics are groomed ahead of everything else in a tick,
 because their children are newer than they are by construction and grooming a child
@@ -292,7 +337,30 @@ report and its reply is not scanned for one — deciding whether a PR describes 
 check is a judgment call, so it lives in an agent, handed links the way grooming is handed
 an issue link. And the pass's own verdict is the branch it pushed: a PR means it found a
 fixable gap, no PR means it did not. That is the same handoff the controller already reads
-from an implementer, so the phase adds no new grammar to the factory.
+from an implementer, so the phase adds no new grammar to the factory. The one exception is
+below, and it borrows the groomer's grammar rather than adding its own.
+
+**Some gaps are the repo's, and those get filed.** An implementer sometimes reports, under
+the same heading, that the repo as shipped did not work — the example config rejects the
+agent layer's own service-to-service calls, say. The image cannot fix that and neither can
+a different check; it is a defect, and the fix is a change to the repo. The agent used to be
+able to say only that: it called one CSRF bug "worth its own issue" on two PRs in a row,
+and nobody filed it. Now it writes the defect as a fenced ```` ```issue ```` block — the
+shape the groomer already uses for an epic's children — and the factory files it, labelled
+`factory:blocker`, with the PRs it came from named at the top. The groomer judges it like
+an issue a human wrote; the environment agent's job ends at naming it. It is told to check
+open issues and its own recent verdicts first, so one defect reported by several
+implementers is filed once.
+
+The label is what keeps the finding from sinking. An oldest-first queue puts a defect filed
+last night behind everything filed before it, and the first such issue the factory filed
+sat unlabelled behind twenty ungroomed and eighteen groomed issues while every new PR
+hit the same broken test database. An implementer already hit it, so every implementer
+after it will too: it is a premise for their verification the way an epic's verdict is a
+premise for its children, and both queues put it ahead of the backlog for the same reason.
+Filing an issue rather than a PR is still right — the environment agent read a report, it
+did not hit the bug, and a PR from it would be a second implementer routed around the
+groom — so what changed is where the issue lands, not who builds it.
 
 The implementer's Verification section does keep **Blocked by the machine** as its own
 heading, apart from checks that were not applicable or ran out of time. That is not a
@@ -320,6 +388,17 @@ thing, and the honest answer is a different check. The agent says so and opens n
 out, this is the phase's obvious failure mode: an agent that installs its way around
 problems that were never about the environment.
 
+**Credentials are the one gap closed from the factory's side, not the environment's.**
+`worker.agentEnv` in `factory.config.json` names environment variables the tick machine
+holds — an LLM provider key, say — each with a description of what it is for. Every
+implementer gets the set ones in its shell (Cursor: session-scoped `envVars` on the VM,
+deleted with the agent; `claude-code`: inherited) and a **Credentials in your environment**
+section in its prompt naming them, so the live test that needs the real model gets run
+rather than filed under blocked. The environment agent is told the same list, so "no API
+key here" reads as the implementer's skip, not the machine's. The values live in `.env`
+locally and as Actions secrets in CI; one that is unset where the tick runs is logged and
+left out, never an error. Prompts carry names and descriptions only.
+
 Either way the finding is posted back onto the PRs that produced it, which is where the
 human who hit the blocked check is looking.
 
@@ -328,6 +407,11 @@ human who hit the blocked check is looking.
 the other only product code — so a full review queue never leaves the agents' machine
 broken. The cost is honest: it is a second thing that can be awaiting your review. Set
 `environment.enabled` to `false` to turn the phase off entirely.
+
+**The phase belongs to the Cursor worker.** `.cursor/environment.json` describes the
+machine Cursor's cloud agents get. With `worker.kind` set to `claude-code` the agents run
+on the machine running the tick, with permission to install whatever they lack, so there
+is no environment file to write and the phase reports itself skipped.
 
 **Every input comes from GitHub, none from telemetry.** The factory PRs are the ones
 carrying the factory label; a PR has been read when the environment agent's comment is on
@@ -353,9 +437,8 @@ Only evidence about the current machine counts.
 
 The phase runs at most once per tick, only when there are unread factory PRs with reports
 about the current machine and no environment PR already open, and reads at most
-`environment.maxPrsPerPass` of them — newest first, the same ordering grooming uses and
-for the same reason. The old tail is starved on a busy factory, deliberately: an unread
-old PR costs nothing, a stale environment costs every run.
+`environment.maxPrsPerPass` of them, newest first. The old tail is starved on a busy
+factory, deliberately: an unread old PR costs nothing, a stale environment costs every run.
 
 ## Simplification
 
@@ -405,7 +488,7 @@ npm install
 cp factory.config.example.json factory.config.json   # point it at your target repo
 cp principles.example.md principles.md               # then rewrite it — highest-leverage file here
 $EDITOR factory.config.json                          # set groom.principlesFile to principles.md
-cp .env.example .env       # put your Cursor API key in it (cursor.com/dashboard → API Keys)
+cp .env.example .env       # Cursor API key (cursor.com/dashboard → API Keys), or nothing for claude-code
 gh auth status             # gh must be authenticated with repo scope on the target repo
 ```
 
@@ -418,17 +501,47 @@ git remote add upstream https://github.com/samarmstrong/conveyor.git
 git pull upstream main     # engine updates; your policy files are untouched
 ```
 
+
+### Workers
+
+`worker.kind` in `factory.config.json` names the runtime the factory hands its prompts
+to. Everything else — prompts, phases, labels, telemetry — is the same either way.
+
+- **`cursor`** (default): Cursor Cloud Agents. Each agent gets a fresh VM, clones the
+  repo itself, and opens the PR itself. Needs `CURSOR_API_KEY`. The
+  [environment phase](#the-environment) maintains its machine.
+- **`claude-code`**: Claude Code sessions on the machine running the tick. The worker
+  clones the target repo at the tick's pinned commit into `telemetry/workspaces/<session>`,
+  puts the agent on a `factory/…` branch, and runs `claude -p` there with
+  `--dangerously-skip-permissions` — the same latitude a Cursor agent has in its VM, but
+  on this machine, so run it somewhere you would let an agent run. The agent pushes and
+  opens the PR with `gh`; a CI fix round is `claude --resume` in the same clone. Auth is
+  the machine's claude.ai login, so runs draw on the subscription rather than API
+  keys; where there is no browser, `claude setup-token` prints a one-year token for
+  `CLAUDE_CODE_OAUTH_TOKEN`. The agents see only the MCP servers the target repo's
+  `.mcp.json` declares, never this machine's. `FACTORY_CLAUDE_BIN` points at the
+  executable when `claude` is not on PATH.
+
+`worker.model` is written once, in Cursor's shape, and translated for Claude Code:
+`params.context: "1m"` becomes the `[1m]` suffix and `params.effort` becomes `--effort`;
+`thinking` is dropped (Claude Code has no flag for it). Cost in the telemetry for `claude-code` runs
+is Claude Code's estimate of what the run would have cost on the API, not a bill.
+
+**Falling back.** `FACTORY_WORKER=claude-code npm run factory -- run` overrides
+`worker.kind` for one tick; in Actions, the manual dispatch has a `worker` input that does
+the same. That is the move when the Cursor account is out of usage: nothing else changes.
+
 ## Commands
 
 ```bash
 npm run factory -- run             # one tick (the daily entry point)
 npm run factory -- run --dry-run   # grooming/backlog state + the exact prompts, launch nothing
 npm run factory -- groom           # run just the grooming phase
-npm run factory -- select          # run just the selector agent over the groomed issues
+npm run factory -- select          # run just the selector agent over the groomed issues (even with selector.enabled off)
 npm run factory -- env             # run just the environment phase over the unread factory PRs
 npm run factory -- simplify        # run just the simplification phase: one PR that removes more than it adds
 npm run factory -- status          # grooming progress, capacity, in-flight jobs, recent telemetry
-npm run factory -- abort           # abandon every stuck pipeline (cancels the Cursor runs)
+npm run factory -- abort           # abandon every stuck pipeline (cancels the runs where the worker can)
 npm run factory -- abort --issue 42  # ...or just the one working issue #42
 npm run check                      # typecheck + unit tests
 ```
@@ -441,24 +554,35 @@ Two options; both just invoke the idempotent tick.
 `~/Library/LaunchAgents/`, adjust paths, then `launchctl load` it.
 
 **GitHub Actions:** enable `.github/workflows/factory.yml` in your fork (daily
-cron + manual dispatch). Requires two repo secrets: `CURSOR_API_KEY`, and
-`FACTORY_GH_TOKEN` (a PAT with `repo` scope on the target repo — the default
-`GITHUB_TOKEN` is scoped to the fork and cannot touch the target repo). The
-tick step is skipped automatically when no `factory.config.json` is committed,
-so the workflow is inert in the upstream repo.
+cron + manual dispatch). Requires `FACTORY_GH_TOKEN` (a PAT with `repo` scope on
+the target repo — the default `GITHUB_TOKEN` is scoped to the fork and cannot
+touch the target repo; the `claude-code` worker's agents push with it too) plus
+the worker's own secret: `CURSOR_API_KEY` for `cursor`, `CLAUDE_CODE_OAUTH_TOKEN`
+for `claude-code`. Each credential named in `worker.agentEnv` is a secret of the
+same name, added to the tick step's `env`. The dispatch form's `worker` input
+overrides `worker.kind` for that run. The tick step is skipped automatically
+when no `factory.config.json` is committed, so the workflow is inert in the
+upstream repo.
 
 ## Policy knobs
 
 - `principles.md` — **what is worth building.** The product-direction standard
   grooming enforces. This is the highest-leverage file in the repo; editing it changes
   what the factory will and will not build.
-- `factory.config.json` — target repo, model (`null` = Cursor default; list with
-  `GET https://api.cursor.com/v1/models`), poll interval, max run minutes,
+- `factory.config.json` — target repo, `worker.kind` (`cursor` or `claude-code`, see
+  [Workers](#workers)), model (`null` = the worker's default; Cursor's list is
+  `GET https://api.cursor.com/v1/models`, Claude Code takes any alias or id it accepts),
+  poll interval, max run minutes, `worker.agentEnv` (credentials handed to every agent,
+  see [The environment](#the-environment)),
   `groom.maxPerTick` (how much backlog to vet per tick), `maxConcurrentJobs` (how many
   jobs may be in flight at once — the whole implementation throttle), stale-run cutoff,
   labels.
 - `factory.config.json` → `labels.epic` — the repo's own epic label (default `type:epic`).
   Issues carrying it are groomed as direction and never implemented; see "Epics" above.
+- `factory.config.json` → `labels.blocker` — (default `factory:blocker`) an issue that
+  blocks the agents' own verification. Groomed and implemented ahead of the rest of the
+  backlog; the environment pass applies it to the repo defects it files, and a human may
+  apply or remove it. Ordering only: the groomer still judges the issue.
 - `factory.config.json` → `assignedIssues` — whether each phase may act on an issue a
   human has assigned to themselves. Defaults to `{ "groom": true, "implement": false }`:
   vetting an assigned issue costs its assignee nothing, implementing one collides with
@@ -469,6 +593,10 @@ so the workflow is inert in the upstream repo.
   keeps opening PRs whose verification was blocked and never fixes the cause.
 - `factory.config.json` → `simplify` — `enabled` (default true): the phase that removes
   code. Off means the factory only ever adds.
+- `factory.config.json` → `selector` — `enabled` (default false): whether an agent ranks
+  the groomed issues before each implementer run. Off, the oldest groomed issue is
+  implemented next; see [One judge of size](#one-judge-of-size) for why that is the
+  default. `maxCandidates` (default 100) bounds the open-issue fetch either way.
 - `src/prompts.ts` — all five prompts (groom / selector / implementer / environment /
   simplify), each a few lines. The implementer and simplifier share one block of working
   rules so a simplification is held to exactly the standard the code it removes was built to. Add lines only for specific opinions where the model's default behavior isn't
@@ -516,8 +644,8 @@ Its rows:
 - `groom` records: issue, verdict, whether notes were written, whether it was a
   re-groom after the issue changed, agent id, token usage, duration. For an epic, that
   it was one and how many children were filed; for a blocked verdict, the blocker.
-- `run` records: issue, worker/model, selector + implementer agent ids, start/end,
-  outcome (`pr-opened`/`no-pr`/`failed`/`aborted`), token usage for both agents, duration.
+- `run` records: issue, worker/model, implementer agent id (and the selector's, when one
+  ran), start/end, outcome (`pr-opened`/`no-pr`/`failed`/`aborted`), token usage, duration.
 - `env` records: which factory PRs the pass read, whether it opened a PR and which,
   agent id, token usage, duration. A failed pass records no PRs as read, so they are
   offered to the next one.
@@ -544,6 +672,7 @@ tasks whose historical human-rejection rate is ~zero).
 principles.md      what is worth building  ← factory policy (ships as principles.example.md)
 src/types.ts       CodingWorker / WorkSource boundaries + telemetry records
 src/worker.ts      CursorWorker (Cursor Cloud Agents v1 API) — the only Cursor-aware file
+src/claudeCodeWorker.ts  ClaudeCodeWorker: a clone per session, `claude -p` in it
                    Every agent is pinned to one `startingRef`, resolved per tick
 src/workSource.ts  GitHubIssueSource (incl. writing groom verdicts back to issues)
 src/groom.ts       verdict labels + fingerprint, backlog filters, VERDICT parsing
@@ -560,8 +689,9 @@ src/cli.ts         run / groom / select / env / simplify / status / abort
 
 Non-goals (V1, on purpose): custom agent runtime, custom sandboxes, multi-agent
 framework, workflow engines, autonomous merging, persistent state machines. Parallelism
-is one integer (`maxConcurrentJobs`), not a scheduler. Swapping the worker later = reimplementing `CodingWorker` (three methods
-plus usage) — nothing else knows Cursor exists.
+is one integer (`maxConcurrentJobs`), not a scheduler. A worker is one class implementing
+`CodingWorker` (start, continue, await, usage, cancel) chosen by `worker.kind`; there are
+two, and nothing outside them knows which runtime is coding.
 
 ## License
 

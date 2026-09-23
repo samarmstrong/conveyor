@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { environmentPrompt, groomEpicPrompt, groomPrompt, implementPrompt, selectPrompt, simplifyPrompt } from '../src/prompts.ts';
+import { environmentPrompt, fixChecksPrompt, groomEpicPrompt, groomPrompt, implementPrompt, selectPrompt, simplifyPrompt } from '../src/prompts.ts';
 import type { Task } from '../src/types.ts';
 
 const task: Task = {
@@ -105,6 +105,17 @@ describe('epics', () => {
     expect(g).toContain('BLOCKED: #<issue number>');
     expect(g).toContain('the record this issue was judged against has changed');
   });
+
+  it('the ordinary groom may answer "epic" only when the repo has an epic label', () => {
+    const with_ = groomPrompt(task, 'principles', { maxRunMinutes: 90 }, 'type:epic');
+    expect(with_).toContain('Three verdicts');
+    expect(with_).toContain('VERDICT: epic');
+    expect(with_).toContain('`type:epic`');
+    expect(with_).toContain('Size alone does not make an epic');
+    const without = groomPrompt(task, 'principles', { maxRunMinutes: 90 });
+    expect(without).toContain('Two verdicts');
+    expect(without).not.toContain('VERDICT: epic');
+  });
 });
 
 // The simplifier is held to the implementer's standard, and told the one rule
@@ -153,5 +164,60 @@ describe('environment agent judges against CI and sees its own history', () => {
     expect(environmentPrompt(prs, verdicts)).toContain('## Your recent verdicts');
     expect(environmentPrompt(prs, verdicts)).toContain(verdicts[0]);
     expect(environmentPrompt(prs)).not.toContain('recent verdicts');
+  });
+
+  it('a defect in the repo is filed as an issue block, not fixed in the image or left as prose', () => {
+    const p = environmentPrompt(prs);
+    expect(p).toContain('Some gaps are the repo\'s, and those you file.');
+    expect(p).toContain('```issue');
+    expect(p).toMatch(/check the repo's open issues for the same defect/);
+    expect(p).toMatch(/do not put it in the environment file/);
+  });
+
+  it('the implementer files a shipped config that would not start under the same heading', () => {
+    expect(implementPrompt(task)).toMatch(/a shipped config or script of this repo that would not start until you changed it/);
+  });
+});
+
+// CI is the repo's own verdict. The factory relays a red check to the agent
+// that wrote the code rather than to a human, and the agent judges whose it is.
+describe('red checks go back to the implementer', () => {
+  it('working rules ask for the suites CI runs, not the ones near the change', () => {
+    expect(implementPrompt(task)).toContain('the full suites CI runs');
+  });
+
+  it('fix prompt hands links to the failing jobs and forbids a new PR or a skipped check', () => {
+    const p = fixChecksPrompt('https://github.com/o/r/pull/959', [
+      { name: 'Unit Tests - Backend', link: 'https://github.com/o/r/actions/runs/1/job/2' },
+    ]);
+    expect(p).toContain('https://github.com/o/r/pull/959');
+    expect(p).toContain('- Unit Tests - Backend: https://github.com/o/r/actions/runs/1/job/2');
+    expect(p).toContain('fails the same way on the default branch');
+    expect(p).toContain('Do not open a new PR');
+  });
+});
+
+// A credential is handed over by name and purpose only. The value is in the
+// agent's shell; the prompt says what it is for, so the live test that needs
+// the real service gets run instead of reported as blocked.
+describe('credentials reach agents as names, never values', () => {
+  const creds = [{ name: 'MODEL_API_KEY', description: 'API key for the model provider the app calls.' }];
+
+  it('implementer is told what is in its environment and what it is for', () => {
+    const p = implementPrompt(task, creds);
+    expect(p).toContain('## Credentials in your environment');
+    expect(p).toContain('`MODEL_API_KEY`: API key for the model provider the app calls.');
+    expect(p).toContain('Never print, commit, or paste a value');
+  });
+
+  it('no section when the factory holds nothing', () => {
+    expect(implementPrompt(task)).not.toContain('Credentials in your environment');
+  });
+
+  it('environment agent knows which credentials the factory holds', () => {
+    const prs = ['https://github.com/o/r/pull/1'];
+    expect(environmentPrompt(prs, [], creds)).toContain('`MODEL_API_KEY`');
+    expect(environmentPrompt(prs, [], creds)).toContain('skipped by the implementer, not the machine');
+    expect(environmentPrompt(prs)).not.toContain('The factory does hold');
   });
 });

@@ -6,6 +6,7 @@
 // an issue better than a prompt can excerpt it — it sees comments, edits, and
 // whatever else has accumulated, and nothing is cut off at a character limit.
 
+import type { AgentCredential } from './config.ts';
 import type { Task } from './types.ts';
 
 /** What the implementer actually is, so grooming's "one PR" means something. */
@@ -36,15 +37,18 @@ ${list}`;
  * reach only this agent — what the implementer needs is whatever this agent
  * writes into the notes.
  */
-export function groomPrompt(task: Task, principles: string, budget: RunBudget): string {
+export function groomPrompt(task: Task, principles: string, budget: RunBudget, epicLabel?: string): string {
+  const epicVerdict = epicLabel === undefined ? '' : `
+- epic — this is not a PR and should not be judged as one. It sets a direction: a capability that takes several PRs to deliver anything, with decisions that bind all of them, or a change to what the product is. The factory labels it \`${epicLabel}\` and grooms it again as a direction, settling its decisions and writing its first children, so do not settle them here — say in a few sentences why it is a direction rather than one change. Size alone does not make an epic: an issue that is merely too large, or a list of unrelated tasks, is needs-work.`;
+  const verdictLines = epicLabel === undefined ? 'VERDICT: groomed\nor\nVERDICT: needs-work' : 'VERDICT: groomed\nor\nVERDICT: needs-work\nor\nVERDICT: epic';
   return `Groom GitHub issue #${task.issueNumber} for an autonomous coding agent.
 ${task.url}
 
 Read the issue there, comments included, then look at the code it concerns — you are reviewing, not implementing, so change nothing. Judge it against the product-direction principles below: they are the standard this codebase is held to, and they outrank how the issue's author framed it.
 
-Two verdicts:
+${epicLabel === undefined ? 'Two' : 'Three'} verdicts:
 - groomed — there is a correct change here that one PR can land. It may be narrower than what the issue asks for; if it is, your notes say what to leave out. The implementer decides how to build it — an issue that leaves implementation open is not thereby unready.
-- needs-work — there is not. Say why, concretely, pointing at files.
+- needs-work — there is not. Say why, concretely, pointing at files.${epicVerdict}
 
 "One PR" has a concrete meaning here. The implementer is a single fresh cloud agent with a budget of about ${budget.maxRunMinutes} minutes to read the issue, build the change, verify it — the project's own checks, then a live test of the changed behavior; the machine has a browser for that — and open the PR. It can spawn subagents and it is capable, so do not scope for a timid agent — but a change that cannot plausibly be built and verified in that one run is not one PR, whatever the issue calls it. If you narrow the issue to a slice, the slice is what has to fit.
 
@@ -65,9 +69,7 @@ If there is something the implementer must know, put it in a fenced \`\`\`notes 
 Everything else you write becomes that comment's rationale, so say what you concluded and why in the open, addressed to the issue's author.
 
 End your reply with exactly one line:
-VERDICT: groomed
-or
-VERDICT: needs-work
+${verdictLines}
 
 ## Principles
 
@@ -116,20 +118,54 @@ ${principles}`;
  * was built to.
  */
 const WORKING_RULES = `- Keep code concise, with brief inline comments only where useful.
-- Verify with the project's own checks (tests, typecheck, lint), then live: start the app and exercise the changed behavior through its real entry point. \`agent-browser\` is on this machine for anything with a UI (\`agent-browser skills get core\` explains it; take a screenshot); an API or CLI change gets a real request or invocation. Skip the live test only when there is nothing to exercise — docs, a pure refactor — and say so. Add tests only for critical behavior; skip low-value assertions.
+- Verify with the project's own checks — the full suites CI runs, not only the modules near your change; "CI runs the rest" is not a check you ran. Then live: start the app and exercise the changed behavior through its real entry point. \`agent-browser\` is on this machine for anything with a UI (\`agent-browser skills get core\` explains it; take a screenshot); an API or CLI change gets a real request or invocation. Skip the live test only when there is nothing to exercise — docs, a pure refactor — and say so. Add tests only for critical behavior; skip low-value assertions.
 - Before opening the PR, have an independent subagent review your full diff with fresh eyes. Reviewers are often nitpicky and sometimes wrong, so you decide each finding, one of two ways. A real defect in what you changed — wrong behavior, a case the code mishandles, a test that does not test what it claims — gets fixed now; writing it down as a follow-up ships a bug you know about. Anything else — style, a preference, a suggestion outside the issue's scope, a change not worth its risk — gets dismissed with a sentence saying why. Do not restyle working code to satisfy a reviewer's taste. The PR lists each finding and its disposition in a line apiece.
-- End the PR description with a **Verification** section in three parts. **Ran**: every check you ran and what it showed. **Did not run**: every check you skipped as not applicable or out of time, with the reason. **Blocked by the machine**: every check you could not run because this environment lacked something — a tool not installed, a service not up, a dependency you had to install by hand before anything worked — even if you then worked around it. Keep that last part separate and write "none" when it is empty: the factory reads it to fix its own environment, and a gap you leave unmentioned or file under the wrong heading stays.`;
+- End the PR description with a **Verification** section in three parts. **Ran**: every check you ran and what it showed. **Did not run**: every check you skipped as not applicable or out of time, with the reason. **Blocked by the machine**: every check you could not run because this environment lacked something — a tool not installed, a service not up, a dependency you had to install by hand before anything worked, a shipped config or script of this repo that would not start until you changed it — even if you then worked around it. Keep that last part separate and write "none" when it is empty: the factory reads it to fix its own environment, and a gap you leave unmentioned or file under the wrong heading stays.`;
 
-export function implementPrompt(task: Task): string {
+/**
+ * What an agent is told about the credentials in its environment: names and
+ * purpose, never values. Without this an implementer whose live test needs a
+ * real model writes "no API key on this machine" and stops, when the key was
+ * in its shell the whole time.
+ */
+export function credentialsSection(credentials: AgentCredential[]): string {
+  if (credentials.length === 0) return '';
+  const list = credentials.map((c) => `- \`${c.name}\`: ${c.description}`).join('\n');
+  return `
+
+## Credentials in your environment
+
+These environment variables are set on this machine. When the live test needs the real service, use them — a check one of these would have let you run is not blocked by the machine, and a PR that skips it says so honestly under **Did not run**. Never print, commit, or paste a value.
+
+${list}`;
+}
+
+export function implementPrompt(task: Task, credentials: AgentCredential[] = []): string {
   return `Implement the GitHub issue below and open a PR that resolves it (reference "Closes #${task.issueNumber}").
 
 How we like to work in this repo:
-${WORKING_RULES}
+${WORKING_RULES}${credentialsSection(credentials)}
 
 ## Issue #${task.issueNumber}: ${task.title}
 ${task.url}
 
 Read the issue at that URL, comments included — do not work from the title alone. The factory's most recent groom comment there (🏭 Factory groom) may end with a "Factory grooming notes" section: that is scoping direction, not a suggestion. Build what it scopes and leave out what it leaves out.`;
+}
+
+/**
+ * The follow-up an implementer gets when CI went red on the PR it just opened.
+ * Same agent, same branch: it has the context a fresh one would spend its
+ * budget rebuilding. The checks are the repo's own, so the factory is relaying
+ * a verdict rather than making one, and the agent judges whether the failure is
+ * its — a check that is red on the default branch too is not.
+ */
+export function fixChecksPrompt(prUrl: string, failed: { name: string; link: string }[]): string {
+  const list = failed.map((c) => `- ${c.name}: ${c.link}`).join('\n');
+  return `CI failed on the PR you opened, ${prUrl}. The failing checks:
+
+${list}
+
+Read each failing job's log at its link. If your change caused the failure, fix it, run the check the way CI runs it before pushing, push to the same branch, and update the PR's Verification section to say what you ran. If a failure is not yours — it fails the same way on the default branch — say so in a comment on the PR, with what you checked, and leave it. Do not open a new PR and do not disable or skip the check.`;
 }
 
 /**
@@ -179,7 +215,10 @@ ${opts.recentPrs.join('\n') || '(none yet)'}${declined}`;
  * gets wrong — cloud agents can run Docker, but not on the default image and
  * not without the overlay/iptables workarounds.
  */
-export function environmentPrompt(prUrls: string[], verdicts: string[] = []): string {
+export function environmentPrompt(prUrls: string[], verdicts: string[] = [], credentials: AgentCredential[] = []): string {
+  const held = credentials.length > 0
+    ? ` The factory does hold these, and every implementer below had them in its environment: ${credentials.map((c) => `\`${c.name}\``).join(', ')}. A check skipped for want of one of those was skipped by the implementer, not the machine.`
+    : '';
   const priors = verdicts.length > 0
     ? `
 
@@ -202,7 +241,16 @@ If you find a gap the environment can close, close it. Commit \`.cursor/environm
 - Services CI declares — Postgres, Redis, whatever the workflow's \`services:\` block names — belong in the environment's \`start\` command, brought up the way the repo's own compose file or test scripts bring them up, so they are ready when the agent's first command runs.
 - Build to what CI needs, not beyond it. Every layer costs every future agent its startup time, so a tool no workflow installs is not yours to add; but anything a workflow installs before running tests is already paid for in CI and cheap here by comparison. You can add to this file again next week.
 
-**Not every gap is yours to close.** A check that needs an artifact which does not exist yet at review time, a credential the factory does not hold, or a display or cluster no CI job has either, is not an environment problem — the implementer verified the wrong thing, and the honest fix is a different check. When that is what you find, say what should have been verified instead and open no PR. Do not install your way around it.
+**Not every gap is yours to close.** A check that needs an artifact which does not exist yet at review time, a credential the factory does not hold, or a display or cluster no CI job has either, is not an environment problem — the implementer verified the wrong thing, and the honest fix is a different check. When that is what you find, say what should have been verified instead and open no PR. Do not install your way around it.${held}
+
+**Some gaps are the repo's, and those you file.** An implementer sometimes reports, under the same heading, that the repo as shipped did not work: its example config refuses its own service-to-service calls, its start script exits on a default, a documented setup path 404s. The image cannot fix that and neither can a different check — it is a defect in the repo, and the fix is a change to it. Do not work around it, do not put it in the environment file, and do not leave it as a sentence in your report: write it up as an issue and the factory will file it. Use one fenced block per defect, exactly this shape:
+
+\`\`\`issue
+A title that names the defect as a user would hit it
+The body: what the implementer did, what happened, the file and setting or code that causes it, and what a fix would leave true. Written for someone who will read nothing else — no reference to this report or these PRs.
+\`\`\`
+
+Before writing one, check the repo's open issues for the same defect, and what you concluded on the PRs before these for one already filed; when it exists, link it in your report instead. File only what an implementer actually hit; a defect you merely suspect is not yours to file.
 
 Open no PR when nothing was blocked and nothing had to be set up; a needless PR costs a human review. Whatever you write is posted back onto the PRs you read, so write it to the humans reviewing them.${priors}
 

@@ -3,7 +3,13 @@ name: factory-tick
 on:
   schedule:
     - cron: '0 14 * * 1-5' # 14:00 UTC weekdays; the tick is idempotent, so cadence is a policy knob
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      worker:
+        description: 'Override worker.kind for this run (blank = as configured)'
+        type: choice
+        options: ['', 'cursor', 'claude-code']
+        default: ''
 
 concurrency:
   group: factory
@@ -29,6 +35,10 @@ jobs:
       - run: npm run check
       # The tick needs a committed factory.config.json; without one the
       # schedule is a no-op.
+      - name: Read worker kind
+        id: kind
+        if: hashFiles('factory.config.json') != ''
+        run: echo "claude=$([[ "$(jq -r '.worker.kind // "cursor"' factory.config.json)" == claude-code ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
       # The record lives on the `telemetry` branch, one append-only file. Fetch
       # what is there so this tick's rows land after it; a missing branch means
       # the record starts here.
@@ -42,13 +52,28 @@ jobs:
           else
             echo "no telemetry branch yet; starting the record"
           fi
+      # The claude-code worker runs its agents on this runner, so it needs the
+      # CLI here. Installed only when this run will use it.
+      - name: Install Claude Code
+        if: hashFiles('factory.config.json') != '' && (inputs.worker == 'claude-code' || (inputs.worker == '' && fromJSON(steps.kind.outputs.claude)))
+        run: npm install -g @anthropic-ai/claude-code
       - if: hashFiles('factory.config.json') != ''
         run: npm run factory -- run
         env:
+          FACTORY_WORKER: ${{ inputs.worker }}
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          # Subscription token from `claude setup-token`, for the claude-code
+          # worker. Tied to the seat of whoever generated it.
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           # PAT with repo scope on the target repo; the default GITHUB_TOKEN
-          # is scoped to this repo and cannot label/PR the target repo.
+          # is scoped to this repo and cannot label/PR the target repo. The
+          # claude-code worker's agents push and open PRs with it too.
           GH_TOKEN: ${{ secrets.FACTORY_GH_TOKEN }}
+          # Credentials handed to the coding agents (worker.agentEnv in
+          # factory.config.json). Cursor agents get them as session env vars;
+          # claude-code agents inherit them from this step. One unset here is
+          # logged and left out, never an error. Add one line per name, e.g.
+          # MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
       # Append this tick's rows to the record. Only the tick writes to this
       # branch, so a rejected push means another tick beat us to it: refetch
       # and replay the new rows onto whatever is there now. The branch is

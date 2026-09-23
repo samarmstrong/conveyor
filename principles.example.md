@@ -8,6 +8,22 @@ write the code, and not what the implementer needs to know. Coding-level
 direction reaches the implementer through the grooming notes on the issue; these
 principles do not.
 
+## What the product is
+
+Replace this section with the handful of commitments that are actually settled
+for the target product. Direction is judged against it before anything else in
+this file: an epic that breaks one of these is needs-work however well it
+argues. Five to eight bullets; a product document does not belong here, and
+neither does anything the repository already records. The kind of thing that
+does:
+
+- **What it is, and what it is not.** One sentence on the job the product does,
+  and the adjacent things it must not turn into on the way.
+- **What it may never depend on.** A vendor, a hosted service, a single model
+  provider — whatever the product has promised its users it will not require.
+- **Where the humans stay.** The one kind of decision the factory may never
+  settle on its own, so the groomer knows what to hand back.
+
 ## Bloat is the default failure mode
 
 The most likely thing to go wrong is not a bug. It is another feature nobody

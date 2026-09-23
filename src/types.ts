@@ -29,6 +29,21 @@ export interface RunHandle {
   runId: string;
 }
 
+/** Which coding runtime the factory hands its prompts to. */
+export type WorkerKind = 'cursor' | 'claude-code';
+
+/**
+ * The factory's own `maxRunMinutes` ran out. Distinct from a worker's terminal
+ * statuses because it means something different: an ERROR is the machinery, a
+ * blown budget is evidence about the size of the work.
+ */
+export class RunBudgetExceeded extends Error {
+  constructor(readonly runId: string, readonly maxRunMinutes: number) {
+    super(`Run ${runId} exceeded ${maxRunMinutes} minutes; cancelled.`);
+    this.name = 'RunBudgetExceeded';
+  }
+}
+
 export type RunStatus =
   | 'CREATING'
   | 'RUNNING'
@@ -54,16 +69,28 @@ export interface TokenUsage {
   costCents?: number;
 }
 
-/** The coding worker boundary. V1 implementation: Cursor cloud agents. */
+/**
+ * The coding worker boundary. Two implementations: Cursor cloud agents
+ * (worker.ts) and local Claude Code sessions (claudeCodeWorker.ts). The
+ * controller sees only this.
+ */
 export interface CodingWorker {
+  /** The commit every agent this worker launches starts from; null = whatever
+   *  the runtime resolves as the default branch. */
+  readonly startingRef: string | null;
   /** Launch a fresh agent on the target repo. */
   start(prompt: string, opts?: StartOptions): Promise<RunHandle>;
   /** Send a follow-up instruction to an existing agent (same workspace/branch). */
   continueRun(handle: RunHandle, instruction: string): Promise<RunHandle>;
-  /** Poll a run until it reaches a terminal state. */
+  /** Wait for a run to reach a terminal state. Throws RunBudgetExceeded when
+   *  the factory's own `maxRunMinutes` ran out first. */
   awaitResult(handle: RunHandle): Promise<RunResult>;
   /** Token usage across all runs of an agent. */
   usage(agentId: string): Promise<TokenUsage | undefined>;
+  /** Best-effort: stop a run that is still going. */
+  cancel(handle: RunHandle): Promise<void>;
+  /** What the log says when a run ends with no text: where a human looks next. */
+  opaqueRunNote(handle: RunHandle): string;
 }
 
 export interface StartOptions {
@@ -76,11 +103,14 @@ export interface StartOptions {
  * building (with notes appended when there is something the implementer needs
  * to know) or it is not ready as written.
  */
-export type GroomVerdict = 'groomed' | 'needs-work';
+export type GroomVerdict = 'groomed' | 'needs-work' | 'epic';
 
 /** The work source boundary. V1 implementation: GitHub issues. */
 export interface WorkSource {
   eligibleTasks(): Promise<Task[]>;
+  /** Of these issue or PR numbers, the ones not known to be closed. Asked about
+   *  blockers that `eligibleTasks` does not return — pull requests, mostly. */
+  stillOpen(numbers: number[]): Promise<Set<number>>;
   markStarted(task: Task): Promise<void>;
   markFinished(task: Task): Promise<void>;
   /** Publish a groom verdict on the issue: a stamped comment saying what the
@@ -96,6 +126,9 @@ export interface WorkSource {
   /** File the children a groomed epic's groomer wrote, each linked back to the
    *  epic, and note them on the epic. Returns what was filed. */
   fileChildren(epic: Task, children: { title: string; body: string }[]): Promise<{ number: number; url: string }[]>;
+  /** The groomer read an unlabelled issue and found a direction, not a PR: give
+   *  it the repo's epic label and say why, so it is groomed as an epic. */
+  markEpic(task: Task, reasoning: string): Promise<void>;
   /** An implementation attempt refuted the groomed verdict: flip the label to
    *  needs-work and say why, so the issue is not picked again as scoped. */
   recordFailedAttempt(task: Task, report: string): Promise<void>;
@@ -119,11 +152,18 @@ export interface RunRecord extends AgentPass {
   taskId: string;
   issueNumber: number;
   issueTitle: string;
+  /** Absent when the selector is off and the issue was taken oldest-first. */
   selectorAgentId?: string;
   outcome: 'pr-opened' | 'no-pr' | 'failed' | 'aborted';
   failureReason?: string;
   prUrl: string | null;
   selectorUsage?: TokenUsage | null;
+  /** Follow-up runs spent turning red CI green on the PR; absent before the
+   *  factory watched checks. */
+  fixRounds?: number;
+  /** How the PR's checks stood when the pipeline let go of it. `unsettled`:
+   *  CI had not finished inside the wait. */
+  checks?: 'green' | 'red' | 'unsettled' | 'none';
 }
 
 export interface GroomRecord extends AgentPass {
@@ -168,6 +208,8 @@ export interface EnvRecord extends AgentPass {
   prsExamined: string[];
   outcome: 'pr-opened' | 'no-gap' | 'failed';
   prUrl: string | null;
+  /** Repo defects the pass filed as issues: gaps that were the repo's, not the machine's. */
+  issuesFiled?: string[];
   failureReason?: string;
 }
 
