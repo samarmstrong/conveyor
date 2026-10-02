@@ -3,6 +3,9 @@
 
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
+import type { ReviewPr } from './review.ts';
+import type { DepsPr } from './deps.ts';
+import type { CodeScanningAlert, DependabotAlert } from './security.ts';
 
 const execFileAsync = promisify(execFile);
 
@@ -99,11 +102,16 @@ export interface PrData {
 
 const PR_FIELDS = 'number,url,title,state,isDraft,createdAt,mergedAt,closedAt,body,reviews,comments,headRefName,additions,deletions';
 
-export async function listPrsByLabel(repo: string, label: string, state: 'open' | 'closed' | 'merged' | 'all'): Promise<PrData[]> {
+export async function listPrsByLabel(repo: string, label: string, state: 'open' | 'closed' | 'merged' | 'all', limit = 50): Promise<PrData[]> {
   return ghJson<PrData[]>([
     'pr', 'list', '-R', repo, '--label', label, '--state', state,
-    '--limit', '50', '--json', PR_FIELDS,
+    '--limit', String(limit), '--json', PR_FIELDS,
   ]);
+}
+
+/** Every open PR, whoever opened it, with its labels. */
+export async function listOpenPrs(repo: string): Promise<(PrData & { labels: { name: string }[] })[]> {
+  return ghJson(['pr', 'list', '-R', repo, '--state', 'open', '--limit', '100', '--json', `${PR_FIELDS},labels`]);
 }
 
 export async function findPrByBranch(repo: string, branch: string): Promise<PrData | null> {
@@ -112,6 +120,12 @@ export async function findPrByBranch(repo: string, branch: string): Promise<PrDa
     '--limit', '1', '--json', PR_FIELDS,
   ]);
   return prs[0] ?? null;
+}
+
+/** Open a PR from `branch` onto the default branch; returns its URL. */
+export async function createPr(repo: string, branch: string, title: string, body: string): Promise<string> {
+  const out = await ghStdin(['pr', 'create', '-R', repo, '--head', branch, '--title', title, '--body-file', '-'], body);
+  return out.trim().split('\n').pop()!;
 }
 
 export async function viewPr(repo: string, prUrl: string): Promise<PrData> {
@@ -173,6 +187,10 @@ export async function createIssue(
   return { number: Number(number), url };
 }
 
+export async function closeIssue(repo: string, issue: number, reason: 'completed' | 'not planned'): Promise<void> {
+  await gh(['issue', 'close', String(issue), '-R', repo, '--reason', reason]);
+}
+
 export async function commentOnIssue(repo: string, issue: number, body: string): Promise<void> {
   // Via stdin: groom rationales are longer than argv is worth trusting.
   await ghStdin(['issue', 'comment', String(issue), '-R', repo, '--body-file', '-'], body);
@@ -203,36 +221,168 @@ export interface PrCheck {
 /**
  * The PR's checks as they stand right now. Exit code is 0 even when checks
  * are red because of `--json`; without it gh signals red with a nonzero exit
- * and the wrapper would throw.
+ * and the wrapper would throw. A PR with no checks at all — a repo without CI,
+ * or a fork's first run waiting on a maintainer's approval — makes gh exit
+ * nonzero even with `--json`; that is an empty list, not an error.
  */
 export async function prChecks(repo: string, prUrl: string): Promise<PrCheck[]> {
-  return ghJson<PrCheck[]>(['pr', 'checks', prUrl, '-R', repo, '--json', 'name,bucket,link']);
+  try {
+    return await ghJson<PrCheck[]>(['pr', 'checks', prUrl, '-R', repo, '--json', 'name,bucket,link']);
+  } catch (err) {
+    if (/no checks reported/i.test((err as Error).message)) return [];
+    throw err;
+  }
+}
+
+/**
+ * Approve the workflow runs a commit is held on. GitHub holds a fork PR's runs
+ * (`action_required`) until a maintainer approves them — a first-time
+ * contributor's, by default — and until then the PR has no checks at all.
+ * Returns how many runs were approved.
+ */
+export async function approveHeldRuns(repo: string, sha: string): Promise<number> {
+  const ids = await ghJson<number[]>(['api', `repos/${repo}/actions/runs?head_sha=${sha}&status=action_required&per_page=100`, '--jq', '[.workflow_runs[].id]']);
+  for (const id of ids) await gh(['api', '-X', 'POST', `repos/${repo}/actions/runs/${id}/approve`]);
+  return ids.length;
 }
 
 /**
  * Wait for a PR's checks to settle, and return the failing ones. A repo with no
- * checks settles at once. Gives up after `maxWaitMs` and treats whatever is
- * still pending as not failing: a slow CI is not the implementer's fault, and
- * the human sees the real state on the PR either way.
+ * checks settles at once — unless `expectChecks`, when runs were just approved
+ * and their checks have yet to appear. Gives up after `maxWaitMs` and treats
+ * whatever is still pending as not failing: a slow CI is not the implementer's
+ * fault, and the human sees the real state on the PR either way.
  */
 export async function awaitPrChecks(
   repo: string,
   prUrl: string,
-  opts: { maxWaitMs: number; pollMs: number; log?: (msg: string) => void },
+  opts: { maxWaitMs: number; pollMs: number; expectChecks?: boolean; log?: (msg: string) => void },
 ): Promise<{ failed: PrCheck[]; settled: boolean }> {
   const deadline = Date.now() + opts.maxWaitMs;
   for (;;) {
     const checks = await prChecks(repo, prUrl);
     const pending = checks.filter((c) => c.bucket === 'pending');
-    if (pending.length === 0) return { failed: checks.filter((c) => c.bucket === 'fail'), settled: true };
+    const waiting = pending.length > 0 || (opts.expectChecks === true && checks.length === 0);
+    if (!waiting) return { failed: checks.filter((c) => c.bucket === 'fail'), settled: true };
     if (Date.now() > deadline) return { failed: checks.filter((c) => c.bucket === 'fail'), settled: false };
-    opts.log?.(`${prUrl}: ${pending.length} check(s) still running`);
+    opts.log?.(`${prUrl}: ${pending.length > 0 ? `${pending.length} check(s) still running` : 'waiting for the approved runs\' checks'}`);
     await new Promise((r) => setTimeout(r, opts.pollMs));
   }
 }
 
 export async function closePr(repo: string, prUrl: string, comment: string): Promise<void> {
   await gh(['pr', 'close', prUrl, '-R', repo, '--comment', comment]);
+}
+
+const REVIEW_PR_FIELDS = 'number,url,title,state,isDraft,body,author,headRefOid,isCrossRepository,labels,comments';
+
+/** PRs in one state, whoever opened them: the review phase's candidates. */
+export async function listPrsForReview(repo: string, state: 'open' | 'closed', limit: number): Promise<ReviewPr[]> {
+  return ghJson<ReviewPr[]>(['pr', 'list', '-R', repo, '--state', state, '--limit', String(limit), '--json', REVIEW_PR_FIELDS]);
+}
+
+export async function viewPrForReview(repo: string, prUrl: string): Promise<ReviewPr & { files: { path: string }[] }> {
+  return ghJson(['pr', 'view', prUrl, '-R', repo, '--json', `${REVIEW_PR_FIELDS},files`]);
+}
+
+/** Dependabot's open PRs: the dependency phase's candidates. */
+export async function listDependabotPrs(repo: string): Promise<DepsPr[]> {
+  return ghJson<DepsPr[]>(['pr', 'list', '-R', repo, '--author', 'app/dependabot', '--state', 'open', '--limit', '50',
+    '--json', 'number,url,title,isDraft,headRefName,headRefOid,files,comments']);
+}
+
+/** Every page of a list endpoint, one `jq`-shaped object per item. */
+async function ghApiList<T>(path: string, jq: string): Promise<T[]> {
+  const out = await gh(['api', '--paginate', path, '--jq', jq]);
+  return out.split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l) as T);
+}
+
+/** The repo's open Dependabot alerts. Throws when the token cannot read them or they are off. */
+export async function listDependabotAlerts(repo: string): Promise<DependabotAlert[]> {
+  return ghApiList(`repos/${repo}/dependabot/alerts?state=open&per_page=100`, `.[] | {
+    kind: "dependabot", number, severity: .security_advisory.severity, url: .html_url,
+    ecosystem: .dependency.package.ecosystem, package: .dependency.package.name,
+    manifest: .dependency.manifest_path, scope: .dependency.scope,
+    ghsa: .security_advisory.ghsa_id, advisory: .security_advisory.summary,
+    vulnerableRange: .security_vulnerability.vulnerable_version_range,
+    patched: .security_vulnerability.first_patched_version.identifier }`);
+}
+
+/**
+ * The repo's open code scanning alerts that carry a security severity — a
+ * quality finding has none. Throws when the token cannot read them or code
+ * scanning has never run.
+ */
+export async function listCodeScanningAlerts(repo: string): Promise<CodeScanningAlert[]> {
+  return ghApiList(`repos/${repo}/code-scanning/alerts?state=open&per_page=100`, `.[] | select(.rule.security_severity_level != null) | {
+    kind: "code-scanning", number, severity: .rule.security_severity_level, url: .html_url,
+    tool: .tool.name, rule: .rule.id, ruleDescription: .rule.description,
+    path: .most_recent_instance.location.path, line: .most_recent_instance.location.start_line,
+    message: .most_recent_instance.message.text }`);
+}
+
+/**
+ * Dismiss a code scanning alert as a false positive, with the reason on the
+ * alert. Reversible: reopening it in the security tab undoes this.
+ */
+export async function dismissCodeScanningAlert(repo: string, number: number, comment: string): Promise<void> {
+  await gh(['api', '-X', 'PATCH', `repos/${repo}/code-scanning/alerts/${number}`,
+    '-f', 'state=dismissed', '-f', 'dismissed_reason=false positive', '-f', `dismissed_comment=${comment.slice(0, 280)}`]);
+}
+
+/**
+ * Whether a PR merges cleanly into its base. GitHub works this out lazily: after
+ * a merge to the base it answers `UNKNOWN` until asked, then computes it in a
+ * few seconds. That is exactly when a conflict appears — the babysitter merges
+ * and then starts the tick — so ask again for up to ~30s before settling for it.
+ */
+export async function prMergeable(
+  repo: string,
+  prUrl: string,
+  opts: { attempts?: number; delayMs?: number } = {},
+): Promise<{ mergeable: 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN'; baseRefName: string }> {
+  const { attempts = 10, delayMs = 3_000 } = opts;
+  for (let i = 1; ; i++) {
+    const pr = await ghJson<{ mergeable: 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN'; baseRefName: string }>(
+      ['pr', 'view', prUrl, '-R', repo, '--json', 'mergeable,baseRefName']);
+    if (pr.mergeable !== 'UNKNOWN' || i >= attempts) return pr;
+    await new Promise((r) => setTimeout(r, delayMs));
+  }
+}
+
+/**
+ * How far a PR is from its base: GitHub's mergeability and how many base
+ * commits its head lacks. The compare API resolves a fork's head by sha,
+ * since the base repo holds every PR's commits under its pull refs.
+ */
+export async function prDrift(repo: string, prUrl: string): Promise<{ mergeable: string; behindBy: number }> {
+  const pr = await ghJson<{ mergeable: string; baseRefName: string; headRefOid: string }>(
+    ['pr', 'view', prUrl, '-R', repo, '--json', 'mergeable,baseRefName,headRefOid']);
+  const behind = await gh(['api', `repos/${repo}/compare/${pr.baseRefName}...${pr.headRefOid}`, '--jq', '.behind_by']);
+  return { mergeable: pr.mergeable, behindBy: Number(behind.trim()) };
+}
+
+/** Close without a comment of gh's own: the factory's stamped comment is posted first. */
+export async function closePrQuietly(repo: string, prUrl: string): Promise<void> {
+  await gh(['pr', 'close', prUrl, '-R', repo]);
+}
+
+export async function reopenPr(repo: string, prUrl: string): Promise<void> {
+  await gh(['pr', 'reopen', prUrl, '-R', repo]);
+}
+
+/**
+ * Squash-merge exactly `sha`: GitHub refuses if the head has moved since. Never
+ * `--admin` — the factory's token can bypass the repo's rules, and a merge that
+ * needed to is one the repo's rules said no to.
+ */
+export async function mergePr(repo: string, prUrl: string, sha: string, body?: string): Promise<void> {
+  await gh(['pr', 'merge', prUrl, '-R', repo, '--squash', '--match-head-commit', sha, ...(body !== undefined ? ['--body', body] : [])]);
+}
+
+/** A GitHub user's numeric id: what a noreply co-author address is built on. */
+export async function userId(login: string): Promise<number> {
+  return (await ghJson<{ id: number }>(['api', `users/${login}`])).id;
 }
 
 /** Extract "Closes #N" / "#N" issue references from a PR body. */

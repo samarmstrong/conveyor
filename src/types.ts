@@ -67,6 +67,9 @@ export interface TokenUsage {
   cacheReadTokens: number;
   totalTokens: number;
   costCents?: number;
+  /** Estimated peak context of the agent's first run; above the model's
+   *  window means it compacted. See `peakContextEstimate`. */
+  peakContextTokens?: number;
 }
 
 /**
@@ -91,19 +94,32 @@ export interface CodingWorker {
   cancel(handle: RunHandle): Promise<void>;
   /** What the log says when a run ends with no text: where a human looks next. */
   opaqueRunNote(handle: RunHandle): string;
+  /** The agent that opened a PR, found again in a later tick; absent where an
+   *  agent does not outlive the process that ran it. */
+  agentForPr?(prUrl: string): Promise<RunHandle | null>;
 }
 
 export interface StartOptions {
   autoCreatePR?: boolean;
   name?: string;
+  /** Work on this existing pull request: its branch is checked out, and what
+   *  the agent pushes goes to it. For reviewing a PR the factory did not open. */
+  prUrl?: string;
+  /** Hand the agent none of `worker.agentEnv`: it will run code nobody here wrote. */
+  withholdCredentials?: boolean;
+  /** Start from this branch instead of the tick's pinned commit: the environment
+   *  boot check runs on the branch of the PR it is checking. */
+  startingRef?: string;
 }
 
 /**
- * A grooming verdict. Two outcomes, not three: an issue is either worth
- * building (with notes appended when there is something the implementer needs
- * to know) or it is not ready as written.
+ * A grooming verdict. An issue is either worth building (with notes appended
+ * when there is something the implementer needs to know) or not ready as
+ * written. `epic` is the ordinary groom finding a direction instead of a PR;
+ * `done` is an epic's groom finding the direction delivered; `close` is an
+ * issue's groom finding nothing to build and nothing an edit would rescue.
  */
-export type GroomVerdict = 'groomed' | 'needs-work' | 'epic';
+export type GroomVerdict = 'groomed' | 'needs-work' | 'epic' | 'done' | 'close';
 
 /** The work source boundary. V1 implementation: GitHub issues. */
 export interface WorkSource {
@@ -126,6 +142,12 @@ export interface WorkSource {
   /** File the children a groomed epic's groomer wrote, each linked back to the
    *  epic, and note them on the epic. Returns what was filed. */
   fileChildren(epic: Task, children: { title: string; body: string }[]): Promise<{ number: number; url: string }[]>;
+  /** Close these needs-work children of an epic as not planned: its groom let them go. */
+  dropChildren(epic: Task, children: number[]): Promise<void>;
+  /** The epic's groom found the direction delivered: close it as completed. */
+  closeEpic(epic: Task): Promise<void>;
+  /** The issue's groom found nothing to build: close it as not planned. */
+  closeTask(task: Task): Promise<void>;
   /** The groomer read an unlabelled issue and found a direction, not a PR: give
    *  it the repo's epic label and say why, so it is groomed as an epic. */
   markEpic(task: Task, reasoning: string): Promise<void>;
@@ -188,7 +210,7 @@ export interface OutcomeRecord {
   prUrl: string;
   /** Which pipeline opened it. Absent on records written before env passes
    *  existed, which were all implementer PRs. */
-  source?: 'implementer' | 'environment' | 'simplify';
+  source?: 'implementer' | 'environment' | 'simplify' | 'security';
   issueNumber: number | null;
   merged: boolean;
   closedAt: string;
@@ -206,8 +228,11 @@ export interface OutcomeRecord {
 export interface EnvRecord extends AgentPass {
   type: 'env';
   prsExamined: string[];
-  outcome: 'pr-opened' | 'no-gap' | 'failed';
+  /** `unbootable`: it opened a PR whose environment an agent could not boot on, and the factory closed it. */
+  outcome: 'pr-opened' | 'unbootable' | 'no-gap' | 'failed';
   prUrl: string | null;
+  /** Why the boot check failed, for an `unbootable` pass. */
+  bootFailure?: string;
   /** Repo defects the pass filed as issues: gaps that were the repo's, not the machine's. */
   issuesFiled?: string[];
   failureReason?: string;
@@ -230,7 +255,63 @@ export interface SimplifyRecord extends AgentPass {
   failureReason?: string;
 }
 
-export type TelemetryRecord = RunRecord | GroomRecord | OutcomeRecord | EnvRecord | SimplifyRecord;
+/**
+ * One review of a PR the factory did not open. `verdict` is what the agent
+ * answered; `outcome` is what the factory did, which differs when a rule of its
+ * own held the merge back — `reason` says which.
+ */
+export interface ReviewRecord extends AgentPass {
+  type: 'review';
+  prUrl: string;
+  prNumber: number;
+  author: string;
+  /** The factory reopened it first: its author replied after a close. */
+  reopened?: boolean;
+  verdict: 'merge' | 'close' | 'leave' | null;
+  outcome: 'merged' | 'superseded' | 'closed' | 'left' | 'failed';
+  reason?: string;
+  /** The PR carrying the author's commits and the review's fixes, for a fork PR. */
+  replacementUrl?: string;
+  fixRounds?: number;
+  checks?: RunRecord['checks'];
+}
+
+/**
+ * One dependency batch. `offered` is the Dependabot PRs the agent was handed,
+ * `carried` the ones its PR said it superseded. `merged`: the factory merged
+ * the batch and closed what it carried. `left`: a rule of the factory's held
+ * the merge back — `reason` says which — and the batch awaits a human.
+ * `no-pr`: the agent carried nothing.
+ */
+export interface DepsRecord extends AgentPass {
+  type: 'deps';
+  offered: string[];
+  carried: string[];
+  outcome: 'merged' | 'left' | 'no-pr' | 'failed';
+  prUrl: string | null;
+  reason?: string;
+  fixRounds?: number;
+  checks?: RunRecord['checks'];
+}
+
+/**
+ * One security fix. `offered` is the alerts the agent was handed, `fixed` the
+ * ones its PR claims, `dismissed` the code scanning findings the factory
+ * dismissed as false positives on its word. `no-pr`: it fixed nothing.
+ */
+export interface SecurityRecord extends AgentPass {
+  type: 'security';
+  offered: string[];
+  fixed: string[];
+  dismissed: string[];
+  outcome: 'pr-opened' | 'no-pr' | 'failed';
+  prUrl: string | null;
+  fixRounds?: number;
+  checks?: RunRecord['checks'];
+  failureReason?: string;
+}
+
+export type TelemetryRecord = RunRecord | GroomRecord | OutcomeRecord | EnvRecord | SimplifyRecord | ReviewRecord | DepsRecord | SecurityRecord;
 
 // --- Pipeline state for crash detection ---
 

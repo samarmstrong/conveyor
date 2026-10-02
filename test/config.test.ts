@@ -40,3 +40,38 @@ describe('agent credentials', () => {
     expect(() => loadConfig(configDir({ agentEnv: [{ name: 'OK_NAME', description: '' }] }))).toThrow(/needs a description/);
   });
 });
+
+describe('model override', () => {
+  const models = {
+    opus: { id: 'claude-opus-5-5', params: { effort: 'medium' } },
+    grok: { id: 'grok-4.7', params: { reasoning_effort: 'medium' } },
+  };
+  const withModel = (value: string | undefined, fn: () => void) => {
+    const prev = process.env['FACTORY_MODEL'];
+    if (value === undefined) delete process.env['FACTORY_MODEL']; else process.env['FACTORY_MODEL'] = value;
+    try { fn(); } finally {
+      if (prev === undefined) delete process.env['FACTORY_MODEL']; else process.env['FACTORY_MODEL'] = prev;
+    }
+  };
+
+  it('an empty FACTORY_MODEL leaves worker.model as configured', () => {
+    withModel('', () => {
+      expect(loadConfig(configDir({ model: models.opus, models })).worker.model).toEqual(models.opus);
+    });
+  });
+
+  it('FACTORY_MODEL runs the named model instead', () => {
+    withModel('grok', () => {
+      expect(loadConfig(configDir({ model: models.opus, models })).worker.model).toEqual(models.grok);
+    });
+  });
+
+  it('refuses a name worker.models does not have', () => {
+    withModel('gpt', () => {
+      expect(() => loadConfig(configDir({ model: models.opus, models }))).toThrow(/names no model/);
+    });
+    withModel('grok', () => {
+      expect(() => loadConfig(configDir({}))).toThrow(/has: none/);
+    });
+  });
+});

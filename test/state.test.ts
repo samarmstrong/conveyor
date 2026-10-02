@@ -6,8 +6,22 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const listPrsByLabel = vi.fn();
 const listIssuesByLabel = vi.fn<(...args: unknown[]) => Promise<{ number: number }[]>>(async () => []);
 const removeIssueLabels = vi.fn(async (_repo: string, _issue: number, _labels: string[]) => {});
+const listOpenPrs = vi.fn<(...args: unknown[]) => Promise<unknown[]>>(async () => []);
+const referenceState = vi.fn(async (_repo: string, _n: number) => 'open' as 'open' | 'closed' | 'unknown');
+const markPrReady = vi.fn(async (_repo: string, _url: string) => {});
+const addPrLabels = vi.fn(async (_repo: string, _url: string, _labels: string[]) => {});
+const addIssueLabels = vi.fn(async (_repo: string, _issue: number, _labels: string[]) => {});
+const closePr = vi.fn(async (_repo: string, _url: string, _comment: string) => {});
+const commentOnIssue = vi.fn(async (_repo: string, _issue: number, _body: string) => {});
 vi.mock('../src/github.ts', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../src/github.ts')>()),
+  listOpenPrs: (...args: unknown[]) => listOpenPrs(...args),
+  referenceState: (repo: string, n: number) => referenceState(repo, n),
+  markPrReady: (repo: string, url: string) => markPrReady(repo, url),
+  addPrLabels: (repo: string, url: string, labels: string[]) => addPrLabels(repo, url, labels),
+  addIssueLabels: (repo: string, issue: number, labels: string[]) => addIssueLabels(repo, issue, labels),
+  closePr: (repo: string, url: string, comment: string) => closePr(repo, url, comment),
+  commentOnIssue: (repo: string, issue: number, body: string) => commentOnIssue(repo, issue, body),
   listPrsByLabel: (...args: unknown[]) => listPrsByLabel(...args),
   listIssuesByLabel: (...args: unknown[]) => listIssuesByLabel(...args as [string, string]),
   removeIssueLabels: (repo: string, issue: number, labels: string[]) => removeIssueLabels(repo, issue, labels),
@@ -21,12 +35,15 @@ import type { CurrentRun } from '../src/types.ts';
 function config(maxConcurrentJobs: number): FactoryConfig {
   return {
     repo: { owner: 'o', name: 'r', url: 'https://github.com/o/r' },
-    worker: { kind: 'cursor', model: null, pollIntervalSeconds: 30, maxRunMinutes: 90, agentEnv: [] },
-    labels: { factoryPr: 'factory', issueInProgress: 'factory:wip', groomed: 'factory:groomed', needsWork: 'factory:needs-work', environmentPr: 'factory:env', simplifyPr: 'factory:simplify', epic: 'type:epic', blocker: 'factory:blocker' },
+    worker: { kind: 'cursor', model: null, models: {}, pollIntervalSeconds: 30, maxRunMinutes: 90, agentEnv: [] },
+    labels: { factoryPr: 'factory', issueInProgress: 'factory:wip', groomed: 'factory:groomed', needsWork: 'factory:needs-work', environmentPr: 'factory:env', simplifyPr: 'factory:simplify', reviewPr: 'factory:review', depsPr: 'factory:deps', epic: 'type:epic', blocker: 'factory:blocker', securityPr: 'factory:security' },
     groom: { maxPerTick: 5, principlesFile: 'principles.example.md' },
     selector: { enabled: false, maxCandidates: 100 },
     environment: { enabled: true, maxPrsPerPass: 3 },
     simplify: { enabled: true },
+    review: { enabled: false, maxPerTick: 3, maxCommitsBehind: 100 },
+    deps: { enabled: false },
+    security: { enabled: false, minSeverity: 'high' },
     assignedIssues: { groom: true, implement: false },
     telemetryDir: 'telemetry',
     staleRunHours: 24,
@@ -231,3 +248,77 @@ describe('reconcileOutcomes', () => {
     expect(removeIssueLabels).toHaveBeenCalledWith('o/r', 44, ['factory:wip']);
   });
 });
+
+describe('reconcileOutcomes: what a dead pipeline left behind', () => {
+  beforeEach(() => {
+    for (const m of [listPrsByLabel, listOpenPrs, referenceState, markPrReady, addPrLabels, addIssueLabels, closePr, commentOnIssue]) m.mockClear();
+    listPrsByLabel.mockReset();
+    listPrsByLabel.mockResolvedValue([]);
+    listOpenPrs.mockResolvedValue([]);
+    referenceState.mockResolvedValue('open');
+  });
+
+  const open = (n: number, over: Record<string, unknown> = {}) => ({
+    number: n, url: `https://github.com/o/r/pull/${n}`, state: 'OPEN', isDraft: true, labels: [],
+    headRefName: `cursor/factory-42-the-issue-title-${n}`, body: 'Closes #42', reviews: [], comments: [], ...over,
+  });
+
+  it('adopts an unlabelled draft from a factory branch: ready, labelled, its issue claimed', async () => {
+    const { state } = stateFor(3);
+    listOpenPrs.mockResolvedValue([open(9)]);
+
+    await state.reconcileOutcomes(() => {});
+    expect(markPrReady).toHaveBeenCalledWith('o/r', 'https://github.com/o/r/pull/9');
+    expect(addPrLabels).toHaveBeenCalledWith('o/r', 'https://github.com/o/r/pull/9', ['factory']);
+    expect(addIssueLabels).toHaveBeenCalledWith('o/r', 42, ['factory:wip']);
+    expect(commentOnIssue.mock.calls[0]![2]).toContain('nobody watched its CI');
+    expect(closePr).not.toHaveBeenCalled();
+  });
+
+  it('closes an orphan whose issue another factory PR already answers', async () => {
+    const { state } = stateFor(3);
+    listOpenPrs.mockResolvedValue([open(9), open(10, { isDraft: false, labels: [{ name: 'factory' }] })]);
+
+    await state.reconcileOutcomes(() => {});
+    expect(closePr.mock.calls[0]![1]).toBe('https://github.com/o/r/pull/9');
+    expect(closePr.mock.calls[0]![2]).toContain('pull/10 already answers #42');
+    expect(addPrLabels).not.toHaveBeenCalled();
+  });
+
+  it('closes an orphan whose issue has closed, and adopts only one of two for the same issue', async () => {
+    const { state } = stateFor(3);
+    listOpenPrs.mockResolvedValue([open(9), open(10)]);
+    await state.reconcileOutcomes(() => {});
+    expect(addPrLabels).toHaveBeenCalledTimes(1);
+    expect(closePr).toHaveBeenCalledTimes(1);
+
+    closePr.mockClear();
+    referenceState.mockResolvedValue('closed');
+    listOpenPrs.mockResolvedValue([open(11)]);
+    await state.reconcileOutcomes(() => {});
+    expect(closePr.mock.calls[0]![2]).toContain('#42 has closed');
+  });
+
+  it('leaves alone a PR that is not the factory implementer\'s', async () => {
+    const { state } = stateFor(3);
+    listOpenPrs.mockResolvedValue([
+      open(9, { headRefName: 'feat/a-human-branch' }),
+      open(10, { headRefName: 'cursor/factory-simplify-b961', body: 'Closes #42' }),
+      open(11, { body: 'Closes #7' }),
+    ]);
+
+    await state.reconcileOutcomes(() => {});
+    expect(addPrLabels).not.toHaveBeenCalled();
+    expect(closePr).not.toHaveBeenCalled();
+  });
+
+  it('takes a labelled factory PR out of draft', async () => {
+    const { state } = stateFor(3);
+    listPrsByLabel.mockImplementation(async (_repo: string, label: string) =>
+      label === 'factory' ? [{ ...open(12, { labels: [{ name: 'factory' }] }), mergedAt: null, closedAt: null }] : []);
+
+    await state.reconcileOutcomes(() => {});
+    expect(markPrReady).toHaveBeenCalledWith('o/r', 'https://github.com/o/r/pull/12');
+  });
+});
+

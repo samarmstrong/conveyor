@@ -2,7 +2,7 @@
 // factory CLI — the daily trigger runs `factory run`; everything else is
 // for humans operating the factory.
 
-import { admissible, buildContext, buildWorker, candidateTasks, environmentInputs, log, openSet, runEnvironmentPhase, runGroomPhase, runSelector, runSimplifyPhase, simplifySkip, tick } from './controller.ts';
+import { admissible, buildContext, buildWorker, candidateTasks, depsInputs, environmentInputs, log, openSet, reviewInputs, runEnvironmentPhase, runDepsPhase, runGroomPhase, runReviewPhase, runSecurityPhase, runSelector, runSimplifyPhase, securityInputs, simplifySkip, tick } from './controller.ts';
 import { repoSlug } from './config.ts';
 import { isEpic, isGroomed, needsGroom, verdict } from './groom.ts';
 import { defaultBranchHead } from './github.ts';
@@ -23,11 +23,21 @@ Usage:
   npm run factory -- simplify          Run just the simplification phase: an agent reads the codebase, starting from the
                                        factory's own merged PRs, and opens one PR that removes more code than it adds.
                                        A PR that grows the code is closed by the factory before a human sees it.
+  npm run factory -- review [--pr N]   Run just the review phase: an agent per PR the factory did not open (bots and drafts
+                                       aside) reviews it against principles.md, verifies it, pushes fixes to its branch, and the
+                                       factory merges or closes it. --pr reviews that one PR whether or not it is due.
+  npm run factory -- deps              Run just the dependency phase: one agent carries every open Dependabot PR onto one branch,
+                                       regenerates what the repo installs from, and the factory merges the batch on green CI and
+                                       closes the Dependabot PRs it carried.
+  npm run factory -- security          Run just the security phase: one agent takes the most severe group of open Dependabot and
+                                       code scanning alerts no factory PR claims (at security.minSeverity or above) that one PR
+                                       can fix, and opens that PR.
   npm run factory -- status            Show grooming progress, capacity, in-flight jobs, pending PRs, and recent telemetry.
   npm run factory -- abort [--issue N] Abandon stuck local pipelines — all of them, or just issue N's
                                        (cancels the runs if the worker still can).
 
 Environment: FACTORY_WORKER=cursor|claude-code overrides worker.kind for one invocation.
+             FACTORY_MODEL=<name> runs worker.models.<name> instead of worker.model.
 `;
 
 async function groom(opts: { limit?: number; force?: boolean }): Promise<void> {
@@ -105,6 +115,22 @@ async function status(): Promise<void> {
     if (last) log(`  last pass: ${last.startedAt} → ${last.outcome}${last.prUrl ? ` ${last.prUrl}` : ''} (read ${last.prsExamined.length} PR(s))`);
   }
 
+  const reviews = await reviewInputs(ctx.config);
+  log(`review: ${reviews.skip ?? `${reviews.open.length + reviews.reopen.length} PR(s) from outside the factory due; next pass reviews ${Math.min(reviews.open.length + reviews.reopen.length, ctx.config.review.maxPerTick)}`}.`);
+  for (const r of ctx.telemetry.reviews().slice(-5)) {
+    log(`  ${r.startedAt} #${r.prNumber} (${r.author}) → ${r.verdict ?? 'no verdict'}; ${r.outcome}${r.reason ? ` (${r.reason})` : ''}`);
+  }
+
+  const deps = await depsInputs(ctx.config);
+  log(`deps: ${deps.skip ?? `next pass batches ${deps.offered.length} Dependabot PR(s): ${deps.offered.map((p) => `#${p.number}`).join(' ')}`}.`);
+  const lastDeps = ctx.telemetry.depsPasses().at(-1);
+  if (lastDeps) log(`  last batch: ${lastDeps.startedAt} → ${lastDeps.outcome}${lastDeps.prUrl ? ` ${lastDeps.prUrl}` : ''} (carried ${lastDeps.carried.length} of ${lastDeps.offered.length})${lastDeps.reason ? ` (${lastDeps.reason})` : ''}`);
+
+  const security = await securityInputs(ctx.config);
+  log(`security: ${security.skip ?? `next pass is offered ${security.offered.length} open alert(s)`}${security.openPrs.length ? `; ${security.openPrs.length} security PR(s) open` : ''}.`);
+  const lastSecurity = ctx.telemetry.securityPasses().at(-1);
+  if (lastSecurity) log(`  last pass: ${lastSecurity.startedAt} → ${lastSecurity.outcome}${lastSecurity.prUrl ? ` ${lastSecurity.prUrl}` : ''} (fixed ${lastSecurity.fixed.length} of ${lastSecurity.offered.length} alert(s), dismissed ${lastSecurity.dismissed.length})`);
+
   const { sha } = await defaultBranchHead(repoSlug(ctx.config));
   const simplifySkipped = await simplifySkip(ctx, sha);
   log(`simplify: ${simplifySkipped ?? `next tick looks for one simplification at ${sha.slice(0, 8)}`}.`);
@@ -121,6 +147,28 @@ async function simplify(): Promise<void> {
   if (!record) return;
   const lines = record.additions !== undefined ? ` (−${record.deletions} +${record.additions})` : '';
   log(`simplification pass → ${record.outcome}${record.prUrl ? ` ${record.prUrl}` : ''}${lines}${record.failureReason ? ` (${record.failureReason})` : ''}`);
+}
+
+async function review(opts: { only?: number }): Promise<void> {
+  const ctx = buildContext();
+  const records = await runReviewPhase(ctx, await buildWorker(ctx.config), opts);
+  for (const r of records) {
+    log(`  #${r.prNumber} (${r.author}) → ${r.verdict ?? 'no verdict'}; ${r.outcome}${r.reason ? ` (${r.reason})` : ''}`);
+  }
+}
+
+async function deps(): Promise<void> {
+  const ctx = buildContext();
+  const record = await runDepsPhase(ctx, await buildWorker(ctx.config));
+  if (!record) return;
+  log(`dependency batch → ${record.outcome}${record.prUrl ? ` ${record.prUrl}` : ''} (carried ${record.carried.length} of ${record.offered.length})${record.reason ? ` (${record.reason})` : ''}`);
+}
+
+async function security(): Promise<void> {
+  const ctx = buildContext();
+  const record = await runSecurityPhase(ctx, await buildWorker(ctx.config));
+  if (!record) return;
+  log(`security fix → ${record.outcome}${record.prUrl ? ` ${record.prUrl}` : ''}: fixed ${record.fixed.length} of ${record.offered.length} alert(s), dismissed ${record.dismissed.length}${record.failureReason ? ` (${record.failureReason})` : ''}`);
 }
 
 async function env(): Promise<void> {
@@ -205,6 +253,12 @@ async function main(): Promise<void> {
   if (limit !== undefined && (!Number.isInteger(limit) || limit < 1)) {
     throw new Error(`--limit must be a positive integer, got "${limitArg}"`);
   }
+  const prArg = args.find((a) => a.startsWith('--pr'))?.split('=')[1]
+    ?? (args.includes('--pr') ? args[args.indexOf('--pr') + 1] : undefined);
+  const only = prArg !== undefined ? Number(prArg) : undefined;
+  if (only !== undefined && (!Number.isInteger(only) || only < 1)) {
+    throw new Error(`--pr must be a positive integer, got "${prArg}"`);
+  }
   const issueArg = args.find((a) => a.startsWith('--issue'))?.split('=')[1]
     ?? (args.includes('--issue') ? args[args.indexOf('--issue') + 1] : undefined);
   const issueNumber = issueArg !== undefined ? Number(issueArg) : undefined;
@@ -227,6 +281,15 @@ async function main(): Promise<void> {
       break;
     case 'simplify':
       await simplify();
+      break;
+    case 'deps':
+      await deps();
+      break;
+    case 'security':
+      await security();
+      break;
+    case 'review':
+      await review({ ...(only !== undefined ? { only } : {}) });
       break;
     case 'status':
       await status();

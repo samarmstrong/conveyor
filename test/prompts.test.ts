@@ -41,13 +41,22 @@ describe('size is judged once', () => {
   it('groomer is told the real run budget', () => {
     expect(groomPrompt(task, 'principles', { maxRunMinutes: 90 })).toContain('about 90 minutes');
   });
+
+  // Reading and verifying dominate a run, so a slice that shares that ground
+  // with the rest is a second agent re-learning it.
+  it('groomer sizes by what the agent reads and runs, and keeps shared ground in one PR', () => {
+    const p = groomPrompt(task, 'principles', { maxRunMinutes: 90 });
+    expect(p).toContain('room to use, not only a limit');
+    expect(p).toContain('not by the lines it will write');
+  });
 });
 
-// The live test is the check the factory was built to get, so no prompt may
-// leave it optional or let another agent scope it away.
-describe('verification is required and reported', () => {
-  it('implementer is told to live-test with agent-browser and to report every check in the PR', () => {
+// Whether a change needs a live test is the implementer's call, but it has the
+// tools for one, reports every check, and no groomer may scope one away.
+describe('verification is the agent\'s call and always reported', () => {
+  it('implementer may live-test with agent-browser and reports every check in the PR', () => {
     const p = implementPrompt(task);
+    expect(p).toContain('Test the change live when it has behavior worth seeing work');
     expect(p).toContain('agent-browser');
     expect(p).toContain('**Verification** section');
     expect(p).toContain('**Did not run**');
@@ -56,8 +65,9 @@ describe('verification is required and reported', () => {
     expect(p).toMatch(/even if you then worked around it/);
   });
 
-  it('implementer triages review findings: fix or dismiss with a reason, never a follow-up', () => {
+  it('implementer triages review findings, when it asks for a review: fix or dismiss with a reason, never a follow-up', () => {
     const p = implementPrompt(task);
+    expect(p).toContain('When a change is large or subtle enough');
     expect(p).toContain('gets fixed now');
     expect(p).toContain('dismissed with a sentence saying why');
     expect(p).not.toMatch(/react to what it finds/);
@@ -89,8 +99,17 @@ describe('epics', () => {
 
   it('writes children in fenced child blocks, sized to the implementer budget', () => {
     expect(p).toContain('```child');
+    expect(p).toContain('Make each child as large as that standard allows');
+    expect(p).toContain('however many children that is');
+    expect(p).toContain('WAITING: #<issue or PR number>');
+    expect(p).toContain('Do not join unrelated work');
     expect(p).toContain('about 90 minutes');
-    expect(p).toContain('Write no children for a needs-work epic');
+    expect(p).toContain('Write no children for a needs-work or done epic');
+    expect(p).toContain('VERDICT: done');
+    expect(p).toContain('a child groomed needs-work');
+    expect(p).toContain('CLOSE: #<issue number>');
+    expect(p).toContain('yours to answer');
+    expect(p).not.toContain('may do on its own');
   });
 
   it('ratchets on a re-review: settled decisions stand unless the reply names them', () => {
@@ -108,12 +127,14 @@ describe('epics', () => {
 
   it('the ordinary groom may answer "epic" only when the repo has an epic label', () => {
     const with_ = groomPrompt(task, 'principles', { maxRunMinutes: 90 }, 'type:epic');
-    expect(with_).toContain('Three verdicts');
+    expect(with_).toContain('Four verdicts');
+    expect(with_).toContain('VERDICT: close');
     expect(with_).toContain('VERDICT: epic');
     expect(with_).toContain('`type:epic`');
     expect(with_).toContain('Size alone does not make an epic');
     const without = groomPrompt(task, 'principles', { maxRunMinutes: 90 });
-    expect(without).toContain('Two verdicts');
+    expect(without).toContain('Three verdicts');
+    expect(without).toContain('yours to answer');
     expect(without).not.toContain('VERDICT: epic');
   });
 });
@@ -174,6 +195,10 @@ describe('environment agent judges against CI and sees its own history', () => {
     expect(p).toMatch(/do not put it in the environment file/);
   });
 
+  it('is told the factory boots an agent on its branch before a human sees the PR', () => {
+    expect(environmentPrompt(prs)).toContain('an environment that builds is not one that boots');
+  });
+
   it('the implementer files a shipped config that would not start under the same heading', () => {
     expect(implementPrompt(task)).toMatch(/a shipped config or script of this repo that would not start until you changed it/);
   });
@@ -182,18 +207,17 @@ describe('environment agent judges against CI and sees its own history', () => {
 // CI is the repo's own verdict. The factory relays a red check to the agent
 // that wrote the code rather than to a human, and the agent judges whose it is.
 describe('red checks go back to the implementer', () => {
-  it('working rules ask for the suites CI runs, not the ones near the change', () => {
-    expect(implementPrompt(task)).toContain('the full suites CI runs');
+  it('working rules leave the full suites to CI, which hands a red check back', () => {
+    const p = implementPrompt(task);
+    expect(p).toContain('the tests that cover what you changed');
+    expect(p).toContain('hands a red check back to you');
   });
 
-  it('fix prompt hands links to the failing jobs and forbids a new PR or a skipped check', () => {
+  it('fix prompt says only to fix the failing checks, with links to their jobs', () => {
     const p = fixChecksPrompt('https://github.com/o/r/pull/959', [
       { name: 'Unit Tests - Backend', link: 'https://github.com/o/r/actions/runs/1/job/2' },
     ]);
-    expect(p).toContain('https://github.com/o/r/pull/959');
-    expect(p).toContain('- Unit Tests - Backend: https://github.com/o/r/actions/runs/1/job/2');
-    expect(p).toContain('fails the same way on the default branch');
-    expect(p).toContain('Do not open a new PR');
+    expect(p).toBe('Fix the failing CI checks on https://github.com/o/r/pull/959:\n\n- Unit Tests - Backend: https://github.com/o/r/actions/runs/1/job/2');
   });
 });
 

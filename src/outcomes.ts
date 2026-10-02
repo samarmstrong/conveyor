@@ -48,6 +48,29 @@ export function unrecordedOutcomes(prs: SourcedPr[], recorded: Set<string>, now 
 }
 
 /**
+ * Implementer PRs a dead pipeline left behind, each with the issue it closes.
+ * The pipeline labels its PR only after its agent finishes, so a tick that
+ * dies first — a cancelled runner, a launch whose response was lost while the
+ * agent started anyway — leaves an unlabelled draft, and its issue, claimed by
+ * no factory PR, is picked again and built twice. Such a PR is recognised by
+ * what the factory itself set: Cursor names the branch after the agent
+ * (`factory: #N …` becomes `cursor/factory-N-…`), and the body closes #N as
+ * the implement prompt asks. Nothing else the factory or a human opens has both.
+ */
+export function orphanedPrs<P extends PrData & { labels: { name: string }[] }>(
+  open: P[],
+  factoryLabels: string[],
+): { pr: P; issue: number }[] {
+  const orphans: { pr: P; issue: number }[] = [];
+  for (const pr of open) {
+    if (pr.labels.some((l) => factoryLabels.includes(l.name))) continue;
+    const branch = pr.headRefName.match(/^cursor\/factory-(\d+)-/);
+    if (branch && linkedIssueNumber(pr.body) === Number(branch[1])) orphans.push({ pr, issue: Number(branch[1]) });
+  }
+  return orphans;
+}
+
+/**
  * Issues still carrying the in-progress label that nothing is working on: no
  * open factory PR links them and no pipeline on this runner has them in
  * flight. Their PR closed, or their pipeline died, and the label stayed.

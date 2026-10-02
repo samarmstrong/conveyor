@@ -8,6 +8,31 @@ import {
 
 const BASE_URL = 'https://api.cursor.com';
 const TERMINAL: RunStatus[] = ['FINISHED', 'ERROR', 'CANCELLED', 'EXPIRED'];
+/** The backoff Cursor's API docs recommend. */
+const RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 16_000];
+
+/** `status` is unset when the request never got an answer. */
+class CursorApiError extends Error {
+  constructor(message: string, readonly status: number | undefined) {
+    super(message);
+  }
+
+  get transient(): boolean {
+    return this.status === undefined || this.status === 429 || this.status >= 500;
+  }
+}
+
+/**
+ * Cursor reports neither a run's context size nor its compactions, only token
+ * totals. Under Anthropic prompt caching every token enters the context once,
+ * as uncached input or a cache write, so those two over the run track its peak
+ * context: 0.90–0.96 of it across seven Claude Code transcripts that recorded
+ * both. Other providers' cache accounting does not hold to that, so no estimate.
+ */
+export function peakContextEstimate(model: ModelSpec | null, run: TokenUsage): number | undefined {
+  if (!model?.id.startsWith('claude-')) return undefined;
+  return Math.round((run.inputTokens + run.cacheWriteTokens) / 0.93);
+}
 
 export interface CursorWorkerOptions {
   apiKey: string;
@@ -54,7 +79,28 @@ export class CursorWorker implements CodingWorker {
     this.opts.log?.(msg);
   }
 
+  /**
+   * A GET that fails in transit, is rate-limited, or meets a 5xx is asked
+   * again: on 2026-09-30 single dropped polls killed seven runs in four ticks,
+   * each already doing or done with its work. A POST is retried only on 429,
+   * the one answer that says nothing was created: the same day, two launches
+   * whose response never came back had each started an agent anyway.
+   */
   private async api<T>(method: string, path: string, body?: unknown): Promise<T> {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this.request<T>(method, path, body);
+      } catch (err) {
+        const delay = RETRY_DELAYS_MS[attempt];
+        const retryable = err instanceof CursorApiError && (err.status === 429 || (method === 'GET' && err.transient));
+        if (!retryable || delay === undefined) throw err;
+        this.log(`${err.message}; retrying in ${delay / 1000}s`);
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    }
+  }
+
+  private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
     const res = await fetch(`${BASE_URL}${path}`, {
       method,
       headers: {
@@ -62,10 +108,15 @@ export class CursorWorker implements CodingWorker {
         'Content-Type': 'application/json',
       },
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    }).catch((err: Error) => {
+      // Node's fetch says only "fetch failed"; what failed is in the cause.
+      const cause = err.cause as { code?: string; message?: string } | undefined;
+      const why = cause ? ` (${[cause.code, cause.message].filter(Boolean).join(': ')})` : '';
+      throw new CursorApiError(`Cursor API ${method} ${path}: ${err.message}${why}`, undefined);
     });
     if (!res.ok) {
       const text = await res.text().catch(() => '');
-      throw new Error(`Cursor API ${method} ${path} → ${res.status}: ${text.slice(0, 500)}`);
+      throw new CursorApiError(`Cursor API ${method} ${path} → ${res.status}: ${text.slice(0, 500)}`, res.status);
     }
     return (await res.json()) as T;
   }
@@ -73,14 +124,17 @@ export class CursorWorker implements CodingWorker {
   async start(prompt: string, opts: StartOptions = {}): Promise<RunHandle> {
     const body: Record<string, unknown> = {
       prompt: { text: prompt },
+      // On an existing PR, Cursor checks out its head and `workOnCurrentBranch`
+      // sends the agent's pushes there rather than to a new cursor/ branch.
       repos: [{
         url: this.opts.repoUrl,
-        ...(this.opts.startingRef ? { startingRef: this.opts.startingRef } : {}),
+        ...(opts.prUrl ? { prUrl: opts.prUrl } : (opts.startingRef ?? this.opts.startingRef) ? { startingRef: opts.startingRef ?? this.opts.startingRef } : {}),
       }],
       autoCreatePR: opts.autoCreatePR ?? false,
+      ...(opts.prUrl ? { workOnCurrentBranch: true } : {}),
     };
     if (opts.name) body['name'] = opts.name;
-    const envNames = Object.keys(this.opts.envVars ?? {});
+    const envNames = opts.withholdCredentials ? [] : Object.keys(this.opts.envVars ?? {});
     if (envNames.length > 0) body['envVars'] = this.opts.envVars;
     if (this.opts.model) {
       const { id, params } = this.opts.model;
@@ -105,6 +159,14 @@ export class CursorWorker implements CodingWorker {
     if (!runId) throw new Error('Cursor API: follow-up run response had no run id');
     this.log(`follow-up on agent ${handle.agentId}: run ${runId}`);
     return { agentId: handle.agentId, runId };
+  }
+
+  async agentForPr(prUrl: string): Promise<RunHandle | null> {
+    const json = await this.api<{ items: { id: string; latestRunId?: string }[] }>(
+      'GET', `/v1/agents?prUrl=${encodeURIComponent(prUrl)}&limit=1`,
+    );
+    const agent = json.items[0];
+    return agent?.latestRunId ? { agentId: agent.id, runId: agent.latestRunId } : null;
   }
 
   async awaitResult(handle: RunHandle): Promise<RunResult> {
@@ -152,11 +214,17 @@ export class CursorWorker implements CodingWorker {
 
   async usage(agentId: string): Promise<TokenUsage | undefined> {
     try {
-      const json = await this.api<{ totalUsage: TokenUsage; cost?: { chargedCents?: number } }>(
+      const json = await this.api<{ totalUsage: TokenUsage; cost?: { chargedCents?: number }; runs?: { usage: TokenUsage }[] }>(
         'GET', `/v1/agents/${agentId}/usage`,
       );
       const costCents = json.cost?.chargedCents;
-      return { ...json.totalUsage, ...(costCents !== undefined ? { costCents } : {}) };
+      const firstRun = json.runs?.[0]?.usage;
+      const peakContextTokens = firstRun ? peakContextEstimate(this.opts.model, firstRun) : undefined;
+      return {
+        ...json.totalUsage,
+        ...(costCents !== undefined ? { costCents } : {}),
+        ...(peakContextTokens !== undefined ? { peakContextTokens } : {}),
+      };
     } catch {
       return undefined; // usage is telemetry-only; never fail the pipeline on it
     }

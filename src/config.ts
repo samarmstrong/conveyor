@@ -3,6 +3,7 @@ import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import type { ModelSpec, WorkerKind } from './types.ts';
+import { parseSeverity, type Severity } from './security.ts';
 
 /**
  * A credential the factory holds and hands to every coding agent: the name of
@@ -26,6 +27,10 @@ export interface FactoryConfig {
     /** Model for either worker. Written in Cursor's shape — `id` plus
      *  `params` — and translated for Claude Code (see modelArgs). */
     model: ModelSpec | null;
+    /** Alternative models by name. The FACTORY_MODEL environment variable
+     *  names one to run instead of `model` for one run, which is how a
+     *  dispatched tick picks between them. */
+    models: Record<string, ModelSpec>;
     pollIntervalSeconds: number;
     maxRunMinutes: number;
     /** Credentials every agent is handed, by environment variable name. Only
@@ -43,6 +48,14 @@ export interface FactoryConfig {
     environmentPr: string;
     /** Likewise for the simplification agent's PRs. */
     simplifyPr: string;
+    /** A replacement PR the review phase opened for a fork PR that needed
+     *  fixes: the author's commits plus the review's. Merged in the same pass
+     *  when it can be; the label keeps it out of every other queue. */
+    reviewPr: string;
+    /** The dependency phase's batch PR: every open Dependabot PR carried onto
+     *  one branch with the lockfile regenerated. Keeps it out of every other
+     *  queue, as the others do. */
+    depsPr: string;
     /** The repo's own epic label. An issue carrying it is groomed as a
      *  direction — the groomer settles its open decisions and writes its
      *  children — and is never handed to the selector. Not a factory label:
@@ -54,6 +67,10 @@ export interface FactoryConfig {
      *  every PR opened meanwhile hits it. An ordering claim only: the groomer
      *  still judges it. */
     blocker: string;
+    /** The security phase's fix PRs. Keeps them out of every other queue and
+     *  out of the `maxConcurrentJobs` count, as the other phases' labels do;
+     *  it is also how the phase finds the alerts its PRs already claim. */
+    securityPr: string;
   };
   groom: { maxPerTick: number; principlesFile: string };
   /** How a free slot gets its issue. Off (the default), the oldest groomed
@@ -71,6 +88,23 @@ export interface FactoryConfig {
   /** The simplification phase: an agent whose only job is to open a PR that
    *  removes more code than it adds. One such PR is open at a time. */
   simplify: { enabled: boolean };
+  /** The review phase: PRs the factory did not open, reviewed against the
+   *  principles, verified, fixed, and merged or closed by the factory itself.
+   *  `maxPerTick` bounds how many one tick reviews. Off by default: it is the
+   *  one phase that merges. A PR more than `maxCommitsBehind` commits behind the
+   *  default branch, or conflicting with it, is closed with a request to rebase,
+   *  before any agent is spent on it. */
+  review: { enabled: boolean; maxPerTick: number; maxCommitsBehind: number };
+  /** The dependency phase: Dependabot's open PRs carried onto one branch by one
+   *  agent, the lockfile regenerated, and the batch merged on green CI under
+   *  the review phase's rules. Off by default: it merges. */
+  deps: { enabled: boolean };
+  /** The security phase: each tick one agent takes the most severe group of
+   *  the repo's open Dependabot and code scanning alerts, at or above
+   *  `minSeverity`, that one PR can fix, and opens that PR — no issue, no
+   *  groom. On by default: with no alerts it never starts, and it merges
+   *  nothing itself. */
+  security: { enabled: boolean; minSeverity: Severity };
   /**
    * Whether a phase may act on an issue a human has assigned to themselves.
    * Grooming defaults to true — vetting costs the assignee nothing and the
@@ -116,6 +150,16 @@ export function loadConfig(root: string = projectRoot): FactoryConfig {
   // An empty FACTORY_WORKER is "as configured": Actions passes the dispatch
   // input through even when nobody set it.
   config.worker.kind = workerKind(process.env['FACTORY_WORKER']?.trim() || config.worker.kind || 'cursor');
+  config.worker.models ??= {};
+  // Likewise an empty FACTORY_MODEL: the configured model stands.
+  const modelName = process.env['FACTORY_MODEL']?.trim();
+  if (modelName) {
+    const model = config.worker.models[modelName];
+    if (!model) {
+      throw new Error(`FACTORY_MODEL=${modelName} names no model in worker.models (has: ${Object.keys(config.worker.models).join(', ') || 'none'})`);
+    }
+    config.worker.model = model;
+  }
   config.worker.agentEnv ??= [];
   for (const cred of config.worker.agentEnv) {
     // Cursor rejects env var names in its own namespace; the rest is shell.
@@ -133,9 +177,28 @@ export function loadConfig(root: string = projectRoot): FactoryConfig {
   }
   config.labels.environmentPr ??= 'factory:env';
   config.labels.simplifyPr ??= 'factory:simplify';
+  config.labels.reviewPr ??= 'factory:review';
+  config.labels.depsPr ??= 'factory:deps';
   config.labels.epic ??= 'type:epic';
   config.labels.blocker ??= 'factory:blocker';
-  config.simplify ??= { enabled: true };
+  config.labels.securityPr ??= 'factory:security';
+  config.security ??= { enabled: true, minSeverity: 'high' };
+  config.security.enabled ??= true;
+  config.security.minSeverity = parseSeverity(config.security.minSeverity ?? 'high');
+  config.simplify ??= { enabled: false };
+  // The one phase that merges is the one a deployment has to ask for.
+  config.review ??= { enabled: false, maxPerTick: 3, maxCommitsBehind: 100 };
+  config.review.enabled ??= false;
+  config.deps ??= { enabled: false };
+  config.deps.enabled ??= false;
+  config.review.maxPerTick ??= 3;
+  config.review.maxCommitsBehind ??= 100;
+  if (!Number.isInteger(config.review.maxPerTick) || config.review.maxPerTick < 1) {
+    throw new Error(`review.maxPerTick must be a positive integer, got ${JSON.stringify(config.review.maxPerTick)}`);
+  }
+  if (!Number.isInteger(config.review.maxCommitsBehind) || config.review.maxCommitsBehind < 0) {
+    throw new Error(`review.maxCommitsBehind must be a non-negative integer, got ${JSON.stringify(config.review.maxCommitsBehind)}`);
+  }
   config.selector ??= { enabled: false, maxCandidates: 100 };
   config.selector.enabled ??= false;
   config.selector.maxCandidates ??= 100;

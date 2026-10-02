@@ -10,8 +10,9 @@ import { resolve } from 'node:path';
 import type { CurrentRun } from './types.ts';
 import type { FactoryConfig } from './config.ts';
 import { repoSlug } from './config.ts';
-import { listIssuesByLabel, listPrsByLabel, removeIssueLabels } from './github.ts';
-import { leakedClaims, unrecordedOutcomes, withSource } from './outcomes.ts';
+import { addIssueLabels, addPrLabels, closePr, commentOnIssue, linkedIssueNumber, listIssuesByLabel, listOpenPrs, listPrsByLabel, markPrReady, referenceState, removeIssueLabels } from './github.ts';
+import { factoryComment } from './groom.ts';
+import { leakedClaims, orphanedPrs, unrecordedOutcomes, withSource } from './outcomes.ts';
 import type { Telemetry } from './telemetry.ts';
 
 export interface Capacity {
@@ -85,16 +86,19 @@ export class FactoryState {
    */
   async reconcileOutcomes(log: (msg: string) => void): Promise<number> {
     const { labels } = this.config;
-    const [implementer, environment, simplify, claimed] = await Promise.all([
+    await this.adoptOrphans(log);
+    const [implementer, environment, simplify, security, claimed] = await Promise.all([
       listPrsByLabel(this.repo, labels.factoryPr, 'all'),
       listPrsByLabel(this.repo, labels.environmentPr, 'all'),
       listPrsByLabel(this.repo, labels.simplifyPr, 'all'),
+      listPrsByLabel(this.repo, labels.securityPr, 'all'),
       listIssuesByLabel(this.repo, labels.issueInProgress),
     ]);
     const prs = [
       ...withSource(implementer, 'implementer'),
       ...withSource(environment, 'environment'),
       ...withSource(simplify, 'simplify'),
+      ...withSource(security, 'security'),
     ];
 
     const recorded = new Set(this.telemetry.outcomes().map((o) => o.prUrl));
@@ -104,12 +108,59 @@ export class FactoryState {
       log(`outcome recorded: ${row.prUrl} → ${row.merged ? 'MERGED' : 'CLOSED'}`);
     }
 
+    // A draft waits on nobody. The pipeline readies its PR as it labels it,
+    // but that call can fail, and Cursor opens drafts at random.
+    for (const pr of prs.filter((p) => p.state === 'OPEN' && p.isDraft)) {
+      await markPrReady(this.repo, pr.url)
+        .then(() => log(`marked ${pr.url} ready for review: it was still a draft`))
+        .catch((err: Error) => log(`could not mark ${pr.url} ready for review: ${err.message}`));
+    }
+
     const openPrs = implementer.filter((pr) => pr.state === 'OPEN');
     for (const issue of leakedClaims(claimed, openPrs, this.readRuns())) {
       log(`releasing #${issue}: no open factory PR or running pipeline claims it`);
       await removeIssueLabels(this.repo, issue, [labels.issueInProgress]).catch(() => {});
     }
     return rows.length;
+  }
+
+  /**
+   * Take back the PRs a dead pipeline opened and never labelled (see
+   * `orphanedPrs`), before anything is picked, so their issues are not built
+   * again. One whose issue another factory PR already answers, or that closed
+   * since, is a duplicate and is closed. The rest are labelled, readied, and
+   * their issues claimed, as the pipeline would have done; nobody watched their
+   * CI, and the issue comment says so.
+   */
+  private async adoptOrphans(log: (msg: string) => void): Promise<void> {
+    const { labels } = this.config;
+    const factoryLabels = [labels.factoryPr, labels.environmentPr, labels.simplifyPr, labels.reviewPr, labels.depsPr, labels.securityPr];
+    const open = await listOpenPrs(this.repo);
+    const answered = new Map<number, string>();
+    for (const pr of open) {
+      const issue = pr.labels.some((l) => l.name === labels.factoryPr) ? linkedIssueNumber(pr.body) : null;
+      if (issue !== null) answered.set(issue, pr.url);
+    }
+    for (const { pr, issue } of orphanedPrs(open, factoryLabels)) {
+      try {
+        const other = answered.get(issue);
+        if (other || (await referenceState(this.repo, issue)) === 'closed') {
+          const why = other ? `${other} already answers #${issue}` : `#${issue} has closed`;
+          await closePr(this.repo, pr.url, factoryComment(`🏭 Closing: the factory pipeline that opened this died before it took it up, and ${why}.`));
+          log(`closed orphaned ${pr.url}: ${why}`);
+          continue;
+        }
+        await markPrReady(this.repo, pr.url);
+        await addPrLabels(this.repo, pr.url, [labels.factoryPr]);
+        await addIssueLabels(this.repo, issue, [labels.issueInProgress]);
+        await commentOnIssue(this.repo, issue, factoryComment(
+          `🏭 The factory opened ${pr.url} for this issue. The pipeline that started it died before it took the PR up, so nobody watched its CI or handed a red check back; it is awaiting human review as it stands.`));
+        answered.set(issue, pr.url);
+        log(`adopted orphaned ${pr.url} for #${issue}: its pipeline died before labelling it`);
+      } catch (err) {
+        log(`could not adopt orphaned ${pr.url}: ${(err as Error).message}`);
+      }
+    }
   }
 
   /**

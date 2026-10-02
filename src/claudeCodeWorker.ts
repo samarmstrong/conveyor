@@ -354,6 +354,11 @@ export class ClaudeCodeWorker implements CodingWorker {
   }
 
   async start(prompt: string, opts: StartOptions = {}): Promise<RunHandle> {
+    // A PR review runs a stranger's code, and this worker runs agents on the
+    // tick's own machine; the review phase is Cursor-only for that reason.
+    if (opts.prUrl) throw new Error('ClaudeCodeWorker does not work on existing PRs; reviews run on the cursor worker');
+    // Only the environment boot check starts elsewhere, and that phase is Cursor's.
+    if (opts.startingRef) throw new Error('ClaudeCodeWorker starts every agent from the tick\'s pinned commit');
     const sessionId = randomUUID();
     const session = await this.prepareWorkspace(sessionId, opts);
     return this.launch(sessionId, session, prompt, false);

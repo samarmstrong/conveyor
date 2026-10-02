@@ -10,6 +10,10 @@ on:
         type: choice
         options: ['', 'cursor', 'claude-code']
         default: ''
+      model:
+        description: 'Run this model from worker.models instead of worker.model (blank = as configured)'
+        type: string
+        default: ''
 
 concurrency:
   group: factory
@@ -61,6 +65,7 @@ jobs:
         run: npm run factory -- run
         env:
           FACTORY_WORKER: ${{ inputs.worker }}
+          FACTORY_MODEL: ${{ inputs.model }}
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
           # Subscription token from `claude setup-token`, for the claude-code
           # worker. Tied to the seat of whoever generated it.

@@ -54,10 +54,19 @@
 // one place, on the epic, and the children follow it without anyone having to
 // remember which ones were built against what.
 //
-// The epic's own stamp names its children (`children=#a,#b`, plus whatever the
-// factory files right after). When none of them is open any more the slice has
-// landed, the verdict is stale, and the epic is groomed again — which is when
-// the next slice gets written.
+// The epic's own stamp names its open children (`children=#a,#b`, plus
+// whatever the factory files right after). When none of them is open any more,
+// or the ones still open were groomed needs-work, the slice has settled: the
+// verdict is stale, and the epic is groomed again — which is when the next
+// slice gets written, a child's finding against the record is weighed, or the
+// epic is found done and closed. The children already needs-work when it was
+// groomed are named too (`weighed=#c`): the epic has had its say on them, so
+// one still needs-work does not bring it back again, but one that lands does.
+//
+// Work an epic holds back for something outside its slice — a page another
+// epic is building, a PR in flight — has no child to land, so the stamp names
+// what it waits on (`waiting=#d,#e`), and the verdict goes stale once any of
+// them closes. That re-groom writes what the wait was holding back.
 
 import { createHash } from 'node:crypto';
 import type { GroomVerdict, IssueComment, Task } from './types.ts';
@@ -90,12 +99,16 @@ interface Stamp {
   blocked?: number;
   premise?: Premise;
   children?: number[];
+  weighed?: number[];
+  waiting?: number[];
 }
 
 /** What a stamp carries beyond the fingerprint: a child's premise, an epic's children. */
 export interface StampExtras {
   premise?: Premise | null;
   children?: number[];
+  /** An epic's children that were already needs-work when it was groomed. */
+  weighed?: number[];
 }
 
 /** The stamp's attributes, in any order. A stamp without `sha` is not one. */
@@ -107,12 +120,17 @@ function parseStamp(body: string): Stamp | null {
   if (!sha) return null;
   const blocked = attrs.get('blocked')?.match(/^#?(\d+)$/)?.[1];
   const premise = attrs.get('premise')?.match(/^#?(\d+)@([0-9a-f]+)$/);
-  const children = attrs.get('children')?.split(',').map((c) => Number(c.replace('#', ''))).filter((n) => n > 0);
+  const list = (key: string) => attrs.get(key)?.split(',').map((c) => Number(c.replace('#', ''))).filter((n) => n > 0);
+  const children = list('children');
+  const weighed = list('weighed');
+  const waiting = list('waiting');
   return {
     sha,
     ...(blocked ? { blocked: Number(blocked) } : {}),
     ...(premise ? { premise: { epic: Number(premise[1]), sha: premise[2]! } } : {}),
     ...(children?.length ? { children } : {}),
+    ...(weighed?.length ? { weighed } : {}),
+    ...(waiting?.length ? { waiting } : {}),
   };
 }
 
@@ -212,6 +230,11 @@ export function readBlocker(task: Task): number | null {
   return latestStamp(task)?.blocked ?? null;
 }
 
+/** What a groomed epic's held-back work waits on outside its slice. */
+export function readWaiting(task: Task): number[] {
+  return latestStamp(task)?.waiting ?? [];
+}
+
 /** The epic record the current verdict was judged against, if it named one. */
 export function readPremise(task: Task): Premise | null {
   return latestStamp(task)?.premise ?? null;
@@ -275,12 +298,12 @@ export function openIssues(tasks: Task[], heldOpen: Iterable<number> = []): Open
 }
 
 /**
- * The blockers current verdicts name that the open issues do not account for.
- * Each is either closed — and the verdict waiting on it is stale — or open
- * somewhere the issue list does not reach; only a lookup can tell which.
+ * The blockers and waits current verdicts name that the open issues do not
+ * account for. Each is either closed — and the verdict waiting on it is stale —
+ * or open somewhere the issue list does not reach; only a lookup can tell which.
  */
 export function unaccountedBlockers(tasks: Task[], open: OpenIssues): number[] {
-  const named = tasks.map((t) => readBlocker(t)).filter((n): n is number => n !== null && !open.has(n));
+  const named = tasks.flatMap((t) => [readBlocker(t), ...readWaiting(t)]).filter((n): n is number => n !== null && !open.has(n));
   return [...new Set(named)].sort((a, b) => a - b);
 }
 
@@ -323,16 +346,34 @@ function premiseChanged(premise: Premise, open: OpenIssues): boolean {
 /** What goes into this issue's stamp besides the fingerprint. */
 export function stampExtrasFor(task: Task, labels: GroomLabels, open?: OpenIssues): StampExtras {
   if (!open) return {};
-  return isEpic(task, labels) ? { children: openChildren(task, open) } : { premise: premiseOf(task, labels, open) };
+  if (!isEpic(task, labels)) return { premise: premiseOf(task, labels, open) };
+  const children = openChildren(task, open);
+  const weighed = children.filter((n) => verdict(open.get(n)!, labels) === 'needs-work');
+  return { children, ...(weighed.length ? { weighed } : {}) };
 }
 
 /**
- * A groomed epic's slice has landed when every child its record knew about is
- * closed. That is the moment to groom it again and write the next slice.
+ * A groomed epic's slice has settled when every child its record knew about is
+ * closed or was groomed needs-work, and one of them is news to the record: it
+ * closed, or went needs-work after the epic was groomed. That is the moment to
+ * groom it again: write the next slice, answer what a needs-work child found,
+ * or close it as done.
+ *
+ * A needs-work child whose blocker has cleared has not settled: it is stale
+ * itself and about to be groomed on its own, so the epic waits for that
+ * verdict. Otherwise a sibling landing re-grooms the epic only to say what the
+ * child's own re-groom is about to find — the wait is over.
  */
-function sliceLanded(epic: Task, open: OpenIssues): boolean {
+function sliceSettled(epic: Task, open: OpenIssues, labels: GroomLabels): boolean {
   const children = readChildren(epic);
-  return children.length > 0 && children.every((n) => !open.has(n));
+  const weighed = new Set(latestStamp(epic)?.weighed ?? []);
+  const needsWork = (n: number) => {
+    const child = open.get(n)!;
+    if (verdict(child, labels) !== 'needs-work') return false;
+    const blocker = readBlocker(child);
+    return blocker === null || !blockerCleared(blocker, open, labels);
+  };
+  return children.every((n) => !open.has(n) || needsWork(n)) && children.some((n) => !open.has(n) || !weighed.has(n));
 }
 
 /**
@@ -348,7 +389,10 @@ export function groomState(task: Task, labels: GroomLabels, open?: OpenIssues): 
   if (open && blocker !== null && blockerCleared(blocker, open, labels)) return 'stale';
   const premise = readPremise(task);
   if (open && premise && premiseChanged(premise, open)) return 'stale';
-  if (open && isEpic(task, labels) && verdict(task, labels) === 'groomed' && sliceLanded(task, open)) return 'stale';
+  if (open && isEpic(task, labels) && verdict(task, labels) === 'groomed') {
+    if (sliceSettled(task, open, labels)) return 'stale';
+    if (readWaiting(task).some((n) => !open.has(n) && !open.heldOpen.has(n))) return 'stale';
+  }
   return 'current';
 }
 
@@ -367,10 +411,14 @@ export function groomNotes(task: Task): string | undefined {
  */
 export function groomComment(task: Task, reply: GroomReply, epic = false, extras: StampExtras = {}): string {
   const headline = epic
-    ? reply.verdict === 'groomed'
+    ? reply.verdict === 'done'
+      ? '🏭 **Factory groom — epic done.** The direction is delivered, as recorded below; the factory closes this epic, and any child still open under it as needs-work closes with it.'
+      : reply.verdict === 'groomed'
       ? '🏭 **Factory groom — epic groomed.** The direction is settled, with the decisions below as its record; the factory files the first slice of children under it and builds toward it one PR at a time.'
       : '🏭 **Factory groom — epic needs work.** The factory is not building toward this as written; the decision it needs is named below.'
-    : reply.verdict === 'groomed'
+    : reply.verdict === 'close'
+      ? '🏭 **Factory groom — closed.** There is nothing here to build, for the reason below; the factory closes it as not planned.'
+      : reply.verdict === 'groomed'
       ? '🏭 **Factory groom — groomed.** An agent can pick this up as written.'
       : reply.blocked !== undefined
         ? `🏭 **Factory groom — needs work, blocked on #${reply.blocked}.** The factory reviews this again once that issue closes.`
@@ -379,10 +427,14 @@ export function groomComment(task: Task, reply: GroomReply, epic = false, extras
   if (reply.blocked !== undefined && reply.verdict === 'needs-work') attrs.push(`blocked=#${reply.blocked}`);
   if (extras.premise) attrs.push(`premise=#${extras.premise.epic}@${extras.premise.sha}`);
   if (extras.children?.length) attrs.push(`children=${extras.children.map((n) => `#${n}`).join(',')}`);
+  if (extras.weighed?.length) attrs.push(`weighed=${extras.weighed.map((n) => `#${n}`).join(',')}`);
+  if (epic && reply.verdict === 'groomed' && reply.waiting?.length) attrs.push(`waiting=${reply.waiting.map((n) => `#${n}`).join(',')}`);
   const stamp = `<!-- factory-groom ${attrs.join(' ')} -->`;
   const parts = [
     stamp,
-    `${headline} Edit the description or reply here and it gets reviewed again on a later tick.`,
+    reply.verdict === 'done' || reply.verdict === 'close'
+      ? `${headline} Reopen it to have it reviewed again.`
+      : `${headline} Edit the description or reply here and it gets reviewed again on a later tick.`,
     reply.reasoning.trim(),
   ];
   if (reply.notes) parts.push(`${NOTES_HEADING}\n\n${reply.notes.trim()}`);
@@ -397,6 +449,13 @@ export function childrenFiledComment(children: { number: number; url: string }[]
   const list = children.map((c) => `- ${c.url}`).join('\n');
   return factoryComment(
     `${CHILDREN_FILED} ${children.length} child issue${children.length === 1 ? '' : 's'} filed.** Each is groomed on its own on a later tick, with this epic's decisions as its premise.\n\n${list}`,
+  );
+}
+
+/** The factory's note on a needs-work child its epic's groom let go: dropped, or left behind by a done epic. */
+export function childDroppedComment(epic: Task): string {
+  return factoryComment(
+    `🏭 **Factory epic — let go by #${epic.issueNumber}.** The epic's groom weighed this issue and does not need it for the direction, so it is closed as not planned; the epic's last comment says why. Reopen it to have it groomed again on its own.`,
   );
 }
 
@@ -484,10 +543,16 @@ export interface GroomReply {
   blocked?: number;
   /** Children written for an epic, from fenced ```child blocks. Empty otherwise. */
   children: ChildDraft[];
+  /** Needs-work children an epic's groom lets go, from `CLOSE: #N` lines. */
+  close?: number[];
+  /** What a groomed epic's held-back work waits on, from `WAITING: #N` lines. */
+  waiting?: number[];
 }
 
-const VERDICT_RE = /^\s*VERDICT:\s*(groomed|needs[-_ ]?work|epic)\s*$/gim;
+const VERDICT_RE = /^\s*VERDICT:\s*(groomed|needs[-_ ]?work|epic|done|close)\s*$/gim;
 const BLOCKED_RE = /^\s*BLOCKED:\s*#?(\d+)\s*$/gim;
+const CLOSE_RE = /^\s*CLOSE:\s*#?(\d+)\s*$/gim;
+const WAITING_RE = /^\s*WAITING:\s*#?(\d+)\s*$/gim;
 const NOTES_RE = /```notes[ \t]*\n([\s\S]*?)```/g;
 const CHILD_RE = /```child[ \t]*\n([\s\S]*?)```/g;
 
@@ -516,19 +581,22 @@ export function parseDraftBlocks(text: string, tag: string): { drafts: ChildDraf
 /**
  * Parse the groom agent's reply: a trailing verdict line, optionally a
  * `BLOCKED: #N` line, a fenced ```notes block, and for epics any number of
- * fenced ```child blocks. Returns null if there is no verdict to act on — a
+ * fenced ```child blocks, `CLOSE: #N` and `WAITING: #N` lines. Returns null if there is no verdict to act on — a
  * groom with no verdict is skipped, not guessed at.
  */
 export function parseGroomReply(text: string): GroomReply | null {
   const verdicts = [...text.matchAll(VERDICT_RE)];
   const last = verdicts.at(-1);
   if (!last) return null;
-  const verdict: GroomVerdict = /^groomed$/i.test(last[1]!) ? 'groomed' : /^epic$/i.test(last[1]!) ? 'epic' : 'needs-work';
+  const word = last[1]!.toLowerCase();
+  const verdict: GroomVerdict = word === 'groomed' || word === 'epic' || word === 'done' || word === 'close' ? word : 'needs-work';
 
   const notes = [...text.matchAll(NOTES_RE)].at(-1)?.[1]?.trim() || undefined;
   const blockedLine = [...text.matchAll(BLOCKED_RE)].at(-1)?.[1];
   const blocked = blockedLine && verdict === 'needs-work' ? Number(blockedLine) : undefined;
   const children = parseDraftBlocks(text, 'child').drafts;
+  const close = [...new Set([...text.matchAll(CLOSE_RE)].map((m) => Number(m[1])))];
+  const waiting = [...new Set([...text.matchAll(WAITING_RE)].map((m) => Number(m[1])))];
 
   // The reasoning is everything except the machinery, for the issue comment.
   const reasoning = text
@@ -536,7 +604,9 @@ export function parseGroomReply(text: string): GroomReply | null {
     .replace(CHILD_RE, '')
     .replace(VERDICT_RE, '')
     .replace(BLOCKED_RE, '')
+    .replace(CLOSE_RE, '')
+    .replace(WAITING_RE, '')
     .trim();
 
-  return { verdict, notes, reasoning, ...(blocked !== undefined ? { blocked } : {}), children };
+  return { verdict, notes, reasoning, ...(blocked !== undefined ? { blocked } : {}), children, ...(close.length ? { close } : {}), ...(waiting.length ? { waiting } : {}) };
 }
