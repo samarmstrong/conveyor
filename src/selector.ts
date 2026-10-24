@@ -33,6 +33,16 @@ export function filterEpics(tasks: Task[], epicLabel: string | undefined): Task[
   return epicLabel ? tasks.filter((t) => !t.labels.includes(epicLabel)) : tasks;
 }
 
+/**
+ * Issues not marked as drafts. The draft label is how a human says "still
+ * writing this": the factory neither grooms nor implements an issue carrying
+ * it, so an epic can be drafted in the open without being settled on the
+ * next tick. Take the label off and it joins the queue like any other issue.
+ */
+export function filterDrafts(tasks: Task[], draftLabel: string | undefined): Task[] {
+  return draftLabel ? tasks.filter((t) => !t.labels.includes(draftLabel)) : tasks;
+}
+
 export type Selection =
   | { kind: 'picked'; task: Task }
   | { kind: 'none' }

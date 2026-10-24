@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
-  fingerprint, groomComment, groomNotes, groomState, hasLegacyBlock, isEpic, isFactoryComment, isGroomed, needsGroom, openIssues,
+  fingerprint, groomComment, groomNotes, groomState, hasLegacyBlock, isDraft, isEpic, isFactoryComment, isGroomed, needsGroom, openIssues,
   childDroppedComment, childrenFiledComment, epicRecognizedComment, openChildren, parentEpic, parseGroomReply, premiseOf, readBlocker, readChildren,
-  readFingerprint, readPremise, recordFingerprint, stampExtrasFor, stripLegacyBlock, unaccountedBlockers, verdict,
+  readFingerprint, readPremise, recordFingerprint, settlesDirection, stampExtrasFor, stripLegacyBlock, unaccountedBlockers, verdict,
 } from '../src/groom.ts';
 import type { GroomVerdict, IssueComment, Task } from '../src/types.ts';
 
@@ -157,6 +157,22 @@ describe('backlog filters', () => {
 
   it('offers every issue carrying the groomed label for implementation', () => {
     expect([groomed, rejected, fresh, stale].filter((t) => isGroomed(t, LABELS)).map((t) => t.issueNumber)).toEqual([10, 9]);
+  });
+
+  it('holds the children of a draft epic: their premise is still being written', () => {
+    const labels = { ...LABELS, epic: 'type:epic', draft: 'factory:draft' };
+    const draftEpic = task(100, 'a direction, half written', [], ['type:epic', 'factory:draft']);
+    const child = task(101, 'Part of #100\n\nfirst slice');
+    const unrelated = task(102, 'Part of #99\n\nanother epic');
+    expect(isDraft(draftEpic, labels)).toBe(true);
+    expect(isDraft(child, labels)).toBe(false);
+    // The draft itself never reaches needsGroom — admission filters it — but
+    // it is in the open set, which is where its children find it.
+    const open = openIssues([draftEpic, child, unrelated]);
+    expect(needsGroom([child, unrelated], labels, false, open).map((t) => t.issueNumber)).toEqual([102]);
+    // The label comes off: the epic is groomed, and the child waits for that groom as any child does.
+    const epic = { ...draftEpic, labels: ['type:epic'] };
+    expect(needsGroom([epic, child, unrelated], labels, false, openIssues([epic, child, unrelated])).map((t) => t.issueNumber)).toEqual([100, 102]);
   });
 });
 
@@ -344,6 +360,24 @@ describe('epics', () => {
 
   it('an ordinary reply has no children', () => {
     expect(parseGroomReply('Clear.\n\nVERDICT: groomed')!.children).toEqual([]);
+  });
+
+  // Settling a direction is the judgment worth the stronger model; the
+  // re-reviews the factory's own bookkeeping brings back only track the work.
+  it('settles the direction until an epic record stands, and again once a human replies', () => {
+    const asEpic = (t: Task, v: GroomVerdict): Task => ({
+      ...t,
+      comments: [...t.comments, { body: groomComment(t, { verdict: v, notes: undefined, reasoning: 'Settled.', children: [] }, true) }],
+      labels: [...t.labels, v === 'groomed' ? LABELS.groomed : LABELS.needsWork],
+    });
+    expect(settlesDirection(epic, EPIC_LABELS)).toBe(true);
+    expect(settlesDirection(asEpic(epic, 'needs-work'), EPIC_LABELS)).toBe(true);
+    const groomed = asEpic(epic, 'groomed');
+    expect(settlesDirection(groomed, EPIC_LABELS)).toBe(false);
+    expect(settlesDirection({ ...groomed, comments: [...groomed.comments, { body: 'Cut the second screen.' }] }, EPIC_LABELS)).toBe(true);
+    // Groomed as one PR, then found to be an epic: no epic record yet.
+    const promoted = { ...verdictOn(task(32, 'One PR?'), 'groomed'), labels: [LABELS.groomed, 'type:epic'] };
+    expect(settlesDirection(promoted, EPIC_LABELS)).toBe(true);
   });
 });
 

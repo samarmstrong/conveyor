@@ -33,6 +33,17 @@ export interface FactoryConfig {
     models: Record<string, ModelSpec>;
     pollIntervalSeconds: number;
     maxRunMinutes: number;
+    /** claude-code only: usage, in percent of the subscription's five-hour or
+     *  weekly window, at which no agent starts until that window resets.
+     *  Default 90; null never waits. */
+    pauseAtUsagePercent?: number | null;
+    /** claude-code only: the wall-clock budget of one run. Default
+     *  `maxRunMinutes` + 60. Local sessions share one machine with up to
+     *  `maxConcurrentJobs` others, so the same work takes longer than on a
+     *  cloud VM: on Oct 12–15 runs that landed took up to 93 minutes and
+     *  twelve were cut off at 90. The groomer still sizes against
+     *  `maxRunMinutes`, so an issue is no bigger for running here. */
+    localMaxRunMinutes?: number;
     /** Credentials every agent is handed, by environment variable name. Only
      *  the ones actually set where the tick runs are forwarded (see
      *  agentCredentials); the rest are logged and left out. */
@@ -71,14 +82,33 @@ export interface FactoryConfig {
      *  out of the `maxConcurrentJobs` count, as the other phases' labels do;
      *  it is also how the phase finds the alerts its PRs already claim. */
     securityPr: string;
+    /** An issue still being written. The factory neither grooms nor
+     *  implements it while the label is on, and holds the children of a
+     *  draft epic with it. A human applies and removes it. */
+    draft: string;
+    /** An issue a runner is grooming right now. Put on just before the groom
+     *  starts and taken off when it ends, so a second runner — the local
+     *  Claude Code tick beside the Actions one — leaves it alone instead of
+     *  grooming it again. The factory's own; nobody applies it by hand. */
+    grooming: string;
   };
-  groom: { maxPerTick: number; principlesFile: string };
+  groom: {
+    maxPerTick: number;
+    principlesFile: string;
+    /** A name from `worker.models` to settle an epic's direction with, when
+     *  that deserves a stronger model than the one that builds toward it: the
+     *  first groom, and any after a human replies (see settlesDirection). The
+     *  re-reviews that only track the work run `worker.model`, as does every
+     *  groom when this is unset. */
+    epicModel?: string;
+  };
   /** How a free slot gets its issue. Off (the default), the oldest groomed
    *  issue by number is handed straight to the implementer: grooming already
    *  judged each one buildable, and a ranking agent that reads the whole
    *  groomed backlog per slot costs more as the backlog grows without changing
    *  what lands. On, a selector agent ranks the groomed issues and picks.
-   *  `maxCandidates` bounds the open-issue fetch either way. */
+   *  `maxCandidates` bounds how many groomed issues one selector prompt is
+   *  offered, oldest first; every open issue is fetched and groomed regardless. */
   selector: { enabled: boolean; maxCandidates: number };
   /** The environment phase: an agent that reads the factory's own PRs looking
    *  for checks the implementer could not run, and fixes the cloud-agent
@@ -91,10 +121,12 @@ export interface FactoryConfig {
   /** The review phase: PRs the factory did not open, reviewed against the
    *  principles, verified, fixed, and merged or closed by the factory itself.
    *  `maxPerTick` bounds how many one tick reviews. Off by default: it is the
-   *  one phase that merges. A PR more than `maxCommitsBehind` commits behind the
-   *  default branch, or conflicting with it, is closed with a request to rebase,
-   *  before any agent is spent on it. */
-  review: { enabled: boolean; maxPerTick: number; maxCommitsBehind: number };
+   *  one phase that merges. A PR that conflicts with the default branch is
+   *  caught up by the review agent, not handed back to its author. `model`
+   *  names an entry in `worker.models` to review with, when the one judgment
+   *  that merges a stranger's code deserves a stronger model than the one
+   *  that builds issues; unset, reviews run `worker.model`. */
+  review: { enabled: boolean; maxPerTick: number; model?: string };
   /** The dependency phase: Dependabot's open PRs carried onto one branch by one
    *  agent, the lockfile regenerated, and the batch merged on green CI under
    *  the review phase's rules. Off by default: it merges. */
@@ -147,6 +179,14 @@ export function loadConfig(root: string = projectRoot): FactoryConfig {
   // grown, so a missing one is simply absent. Default to the original
   // one-job-at-a-time throttle rather than failing the next tick.
   config.maxConcurrentJobs ??= 1;
+  // A local tick spends the machine's subscription, not the Cursor budget the
+  // committed value is sized for, so it may run more at once.
+  const maxJobs = process.env['FACTORY_MAX_JOBS']?.trim();
+  if (maxJobs) {
+    const n = Number(maxJobs);
+    if (!Number.isInteger(n) || n < 1) throw new Error(`FACTORY_MAX_JOBS must be a positive integer, got ${JSON.stringify(maxJobs)}`);
+    config.maxConcurrentJobs = n;
+  }
   // An empty FACTORY_WORKER is "as configured": Actions passes the dispatch
   // input through even when nobody set it.
   config.worker.kind = workerKind(process.env['FACTORY_WORKER']?.trim() || config.worker.kind || 'cursor');
@@ -161,6 +201,12 @@ export function loadConfig(root: string = projectRoot): FactoryConfig {
     config.worker.model = model;
   }
   config.worker.agentEnv ??= [];
+  config.worker.localMaxRunMinutes ??= config.worker.maxRunMinutes + 60;
+  if (config.worker.pauseAtUsagePercent === undefined) config.worker.pauseAtUsagePercent = 90;
+  const pauseAt = config.worker.pauseAtUsagePercent;
+  if (pauseAt !== null && !(typeof pauseAt === 'number' && pauseAt > 0 && pauseAt <= 100)) {
+    throw new Error(`worker.pauseAtUsagePercent must be a percentage in (0, 100] or null, got ${JSON.stringify(pauseAt)}`);
+  }
   for (const cred of config.worker.agentEnv) {
     // Cursor rejects env var names in its own namespace; the rest is shell.
     if (typeof cred?.name !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(cred.name) || cred.name.startsWith('CURSOR_')) {
@@ -182,22 +228,26 @@ export function loadConfig(root: string = projectRoot): FactoryConfig {
   config.labels.epic ??= 'type:epic';
   config.labels.blocker ??= 'factory:blocker';
   config.labels.securityPr ??= 'factory:security';
+  config.labels.draft ??= 'factory:draft';
+  config.labels.grooming ??= 'factory:grooming';
+  if (config.groom.epicModel !== undefined && !config.worker.models[config.groom.epicModel]) {
+    throw new Error(`groom.epicModel=${config.groom.epicModel} names no model in worker.models (has: ${Object.keys(config.worker.models).join(', ') || 'none'})`);
+  }
   config.security ??= { enabled: true, minSeverity: 'high' };
   config.security.enabled ??= true;
   config.security.minSeverity = parseSeverity(config.security.minSeverity ?? 'high');
   config.simplify ??= { enabled: false };
   // The one phase that merges is the one a deployment has to ask for.
-  config.review ??= { enabled: false, maxPerTick: 3, maxCommitsBehind: 100 };
+  config.review ??= { enabled: false, maxPerTick: 3 };
   config.review.enabled ??= false;
   config.deps ??= { enabled: false };
   config.deps.enabled ??= false;
   config.review.maxPerTick ??= 3;
-  config.review.maxCommitsBehind ??= 100;
   if (!Number.isInteger(config.review.maxPerTick) || config.review.maxPerTick < 1) {
     throw new Error(`review.maxPerTick must be a positive integer, got ${JSON.stringify(config.review.maxPerTick)}`);
   }
-  if (!Number.isInteger(config.review.maxCommitsBehind) || config.review.maxCommitsBehind < 0) {
-    throw new Error(`review.maxCommitsBehind must be a non-negative integer, got ${JSON.stringify(config.review.maxCommitsBehind)}`);
+  if (config.review.model !== undefined && !config.worker.models[config.review.model]) {
+    throw new Error(`review.model=${config.review.model} names no model in worker.models (has: ${Object.keys(config.worker.models).join(', ') || 'none'})`);
   }
   config.selector ??= { enabled: false, maxCandidates: 100 };
   config.selector.enabled ??= false;
@@ -214,6 +264,16 @@ export function loadConfig(root: string = projectRoot): FactoryConfig {
     );
   }
   return config;
+}
+
+/** The model an epic's groom runs, when the config names one. */
+export function epicGroomModel(config: FactoryConfig): ModelSpec | undefined {
+  return config.groom.epicModel === undefined ? undefined : config.worker.models[config.groom.epicModel];
+}
+
+/** The model an outside PR's review runs, when the config names one. */
+export function reviewModel(config: FactoryConfig): ModelSpec | undefined {
+  return config.review.model === undefined ? undefined : config.worker.models[config.review.model];
 }
 
 /** The product-direction principles grooming judges against. Factory-local by

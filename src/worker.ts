@@ -11,14 +11,27 @@ const TERMINAL: RunStatus[] = ['FINISHED', 'ERROR', 'CANCELLED', 'EXPIRED'];
 /** The backoff Cursor's API docs recommend. */
 const RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 16_000];
 
+/**
+ * Failures that happen before a connection exists: no name lookup, nothing
+ * listening, no route, no handshake in time. A request that fails this way was
+ * never sent. A socket closed or a header timed out after the connection is a
+ * different case: the request may have arrived and been acted on.
+ */
+const NEVER_SENT = new Set(['ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'ENETUNREACH', 'EHOSTUNREACH', 'UND_ERR_CONNECT_TIMEOUT']);
+
 /** `status` is unset when the request never got an answer. */
 class CursorApiError extends Error {
-  constructor(message: string, readonly status: number | undefined) {
+  constructor(message: string, readonly status: number | undefined, readonly causeCode?: string) {
     super(message);
   }
 
   get transient(): boolean {
     return this.status === undefined || this.status === 429 || this.status >= 500;
+  }
+
+  /** Cursor cannot have acted on the request: it said so, or never got it. */
+  get nothingCreated(): boolean {
+    return this.status === 429 || (this.status === undefined && NEVER_SENT.has(this.causeCode ?? ''));
   }
 }
 
@@ -82,9 +95,12 @@ export class CursorWorker implements CodingWorker {
   /**
    * A GET that fails in transit, is rate-limited, or meets a 5xx is asked
    * again: on 2026-09-30 single dropped polls killed seven runs in four ticks,
-   * each already doing or done with its work. A POST is retried only on 429,
-   * the one answer that says nothing was created: the same day, two launches
-   * whose response never came back had each started an agent anyway.
+   * each already doing or done with its work. A POST is retried only when
+   * nothing can have been created: on 429, or when the connection itself never
+   * opened. The same day, two launches whose response never came back had each
+   * started an agent anyway, so a socket reset or a header timeout on a launch
+   * fails it rather than risk two agents on one issue; the issue keeps its
+   * place in the queue and is taken again next tick.
    */
   private async api<T>(method: string, path: string, body?: unknown): Promise<T> {
     for (let attempt = 0; ; attempt++) {
@@ -92,7 +108,7 @@ export class CursorWorker implements CodingWorker {
         return await this.request<T>(method, path, body);
       } catch (err) {
         const delay = RETRY_DELAYS_MS[attempt];
-        const retryable = err instanceof CursorApiError && (err.status === 429 || (method === 'GET' && err.transient));
+        const retryable = err instanceof CursorApiError && (err.nothingCreated || (method === 'GET' && err.transient));
         if (!retryable || delay === undefined) throw err;
         this.log(`${err.message}; retrying in ${delay / 1000}s`);
         await new Promise((r) => setTimeout(r, delay));
@@ -112,7 +128,7 @@ export class CursorWorker implements CodingWorker {
       // Node's fetch says only "fetch failed"; what failed is in the cause.
       const cause = err.cause as { code?: string; message?: string } | undefined;
       const why = cause ? ` (${[cause.code, cause.message].filter(Boolean).join(': ')})` : '';
-      throw new CursorApiError(`Cursor API ${method} ${path}: ${err.message}${why}`, undefined);
+      throw new CursorApiError(`Cursor API ${method} ${path}: ${err.message}${why}`, undefined, cause?.code);
     });
     if (!res.ok) {
       const text = await res.text().catch(() => '');
@@ -136,8 +152,9 @@ export class CursorWorker implements CodingWorker {
     if (opts.name) body['name'] = opts.name;
     const envNames = opts.withholdCredentials ? [] : Object.keys(this.opts.envVars ?? {});
     if (envNames.length > 0) body['envVars'] = this.opts.envVars;
-    if (this.opts.model) {
-      const { id, params } = this.opts.model;
+    const model = opts.model ?? this.opts.model;
+    if (model) {
+      const { id, params } = model;
       body['model'] = {
         id,
         ...(params ? { params: Object.entries(params).map(([pid, value]) => ({ id: pid, value })) } : {}),

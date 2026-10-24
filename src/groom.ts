@@ -36,7 +36,7 @@
 // after #N is no longer open — the same move a human reply makes, without a
 // human having to make it. "No longer open" is checked against every open
 // issue in the repo, and #N is not always one of those: the groomer may name a
-// pull request, or an issue past the fetch cap. A number the open issues do
+// pull request, or an issue filed since the list was read. A number the open issues do
 // not account for is looked up on its own and held open until GitHub says it
 // is closed, so a verdict blocked on an open PR stays current instead of
 // going stale every tick and being groomed again to the same conclusion.
@@ -143,6 +143,13 @@ export interface GroomLabels {
   epic?: string;
   /** Blocks the agents' own verification; goes ahead of the ordinary backlog. */
   blocker?: string;
+  /** Still being written: not groomed, not implemented, and its children wait. */
+  draft?: string;
+}
+
+/** A draft: a human is still writing it, so the factory leaves it alone. */
+export function isDraft(task: Task, labels: GroomLabels): boolean {
+  return labels.draft !== undefined && task.labels.includes(labels.draft);
 }
 
 /** An epic: a direction the groomer settles and decomposes, never a PR. */
@@ -287,9 +294,9 @@ export function verdict(task: Task, labels: GroomLabels): GroomVerdict | null {
 /**
  * Every open issue in the repo, claimed or not, by number — plus `heldOpen`:
  * numbers a verdict is blocked on that are not among those issues but are not
- * known to be closed either. A pull request, an issue past the fetch cap, or a
- * reference the lookup could not settle. Absence from the map is only evidence
- * of closure for the numbers this set does not hold.
+ * known to be closed either. A pull request, an issue filed since the list was
+ * read, or a reference the lookup could not settle. Absence from the map is
+ * only evidence of closure for the numbers this set does not hold.
  */
 export type OpenIssues = Map<number, Task> & { readonly heldOpen: ReadonlySet<number> };
 
@@ -396,6 +403,23 @@ export function groomState(task: Task, labels: GroomLabels, open?: OpenIssues): 
   return 'current';
 }
 
+const EPIC_GROOMED = '🏭 **Factory groom — epic groomed.**';
+
+/**
+ * Whether an epic's next groom settles its direction, or only tracks the work
+ * against a direction already settled. Settling is the judgment every child
+ * inherits: the first groom, a groom after needs-work, and one after a human
+ * has said something since — a reply or edit may revise the record. Only the
+ * factory's own bookkeeping bringing it back (a slice that landed, a wait that
+ * closed) is tracking. An issue groomed as one PR and then promoted to an epic
+ * has no epic record yet, so its first epic groom settles.
+ */
+export function settlesDirection(task: Task, labels: GroomLabels): boolean {
+  if (verdict(task, labels) !== 'groomed') return true;
+  if (!latestGroomComment(task)?.body.includes(EPIC_GROOMED)) return true;
+  return readFingerprint(task) !== fingerprint(task);
+}
+
 /** The implementation direction from the current verdict, if it carried any. */
 export function groomNotes(task: Task): string | undefined {
   const body = latestGroomComment(task)?.body ?? '';
@@ -414,7 +438,7 @@ export function groomComment(task: Task, reply: GroomReply, epic = false, extras
     ? reply.verdict === 'done'
       ? '🏭 **Factory groom — epic done.** The direction is delivered, as recorded below; the factory closes this epic, and any child still open under it as needs-work closes with it.'
       : reply.verdict === 'groomed'
-      ? '🏭 **Factory groom — epic groomed.** The direction is settled, with the decisions below as its record; the factory files the first slice of children under it and builds toward it one PR at a time.'
+      ? `${EPIC_GROOMED} The direction is settled, with the decisions below as its record; the factory files the first slice of children under it and builds toward it one PR at a time.`
       : '🏭 **Factory groom — epic needs work.** The factory is not building toward this as written; the decision it needs is named below.'
     : reply.verdict === 'close'
       ? '🏭 **Factory groom — closed.** There is nothing here to build, for the reason below; the factory closes it as not planned.'
@@ -499,7 +523,9 @@ export function failedAttemptComment(report: string): string {
  * before the backlog's. Going first is not enough
  * when the batch runs in parallel, so a child whose epic is itself waiting for a
  * groom is left out altogether until the epic has one: its verdict would be
- * about a record that is about to change.
+ * about a record that is about to change. A child whose epic is a draft waits
+ * the same way: the direction it would be judged against is still being
+ * written.
  *
  * `force` re-grooms issues whose verdict is still current. The fingerprint covers
  * the issue, not the principles, so editing principles.md or the groom prompt
@@ -512,7 +538,9 @@ export function needsGroom(tasks: Task[], labels: GroomLabels, force = false, op
   const pendingEpics = new Set(pending.filter((t) => isEpic(t, labels)).map((t) => t.issueNumber));
   return pending.filter((t) => {
     const parent = parentEpic(t);
-    return parent === null || !pendingEpics.has(parent);
+    if (parent === null) return true;
+    const epic = open?.get(parent);
+    return !pendingEpics.has(parent) && !(epic && isDraft(epic, labels));
   });
 }
 

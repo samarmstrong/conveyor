@@ -2,7 +2,7 @@
 // factory CLI — the daily trigger runs `factory run`; everything else is
 // for humans operating the factory.
 
-import { admissible, buildContext, buildWorker, candidateTasks, depsInputs, environmentInputs, log, openSet, reviewInputs, runEnvironmentPhase, runDepsPhase, runGroomPhase, runReviewPhase, runSecurityPhase, runSelector, runSimplifyPhase, securityInputs, simplifySkip, tick } from './controller.ts';
+import { admissible, buildContext, buildWorker, candidateTasks, depsInputs, environmentInputs, implementIssues, log, openSet, reviewInputs, runEnvironmentPhase, runDepsPhase, runGroomPhase, runReviewPhase, runSecurityPhase, runSelector, runSimplifyPhase, selectorCandidates, securityInputs, simplifySkip, tick } from './controller.ts';
 import { repoSlug } from './config.ts';
 import { isEpic, isGroomed, needsGroom, verdict } from './groom.ts';
 import { defaultBranchHead } from './github.ts';
@@ -30,14 +30,21 @@ Usage:
                                        regenerates what the repo installs from, and the factory merges the batch on green CI and
                                        closes the Dependabot PRs it carried.
   npm run factory -- security          Run just the security phase: one agent takes the most severe group of open Dependabot and
-                                       code scanning alerts no factory PR claims (at security.minSeverity or above) that one PR
-                                       can fix, and opens that PR.
+                                       code scanning alerts (at security.minSeverity or above) and privately reported advisories
+                                       in triage that no factory PR claims and one PR can fix, and opens that PR; a report it
+                                       shows is not a vulnerability is closed, one it rates differently is re-rated.
+  npm run factory -- implement --issue N[,M...] [--parallel K]
+                                       Implement the named issues in the order given, K at a time (default 1), outside
+                                       the capacity gate and without a groom: naming an issue is the verdict that it is
+                                       one PR, and the attempt tests it as it would a groom's. Skips any already claimed,
+                                       so re-running resumes.
   npm run factory -- status            Show grooming progress, capacity, in-flight jobs, pending PRs, and recent telemetry.
   npm run factory -- abort [--issue N] Abandon stuck local pipelines — all of them, or just issue N's
                                        (cancels the runs if the worker still can).
 
 Environment: FACTORY_WORKER=cursor|claude-code overrides worker.kind for one invocation.
              FACTORY_MODEL=<name> runs worker.models.<name> instead of worker.model.
+             FACTORY_MAX_JOBS=<n> overrides maxConcurrentJobs.
 `;
 
 async function groom(opts: { limit?: number; force?: boolean }): Promise<void> {
@@ -116,7 +123,7 @@ async function status(): Promise<void> {
   }
 
   const reviews = await reviewInputs(ctx.config);
-  log(`review: ${reviews.skip ?? `${reviews.open.length + reviews.reopen.length} PR(s) from outside the factory due; next pass reviews ${Math.min(reviews.open.length + reviews.reopen.length, ctx.config.review.maxPerTick)}`}.`);
+  log(`review: ${reviews.skip ?? `${reviews.open.length + reviews.reopen.length} PR(s) from outside the factory due; next pass reviews ${Math.min(reviews.open.length + reviews.reopen.length, ctx.config.review.maxPerTick)}${reviews.merge.length ? ` and retries the merge on ${reviews.merge.map((p) => `#${p.number}`).join(' ')}` : ''}`}.`);
   for (const r of ctx.telemetry.reviews().slice(-5)) {
     log(`  ${r.startedAt} #${r.prNumber} (${r.author}) → ${r.verdict ?? 'no verdict'}; ${r.outcome}${r.reason ? ` (${r.reason})` : ''}`);
   }
@@ -127,9 +134,10 @@ async function status(): Promise<void> {
   if (lastDeps) log(`  last batch: ${lastDeps.startedAt} → ${lastDeps.outcome}${lastDeps.prUrl ? ` ${lastDeps.prUrl}` : ''} (carried ${lastDeps.carried.length} of ${lastDeps.offered.length})${lastDeps.reason ? ` (${lastDeps.reason})` : ''}`);
 
   const security = await securityInputs(ctx.config);
-  log(`security: ${security.skip ?? `next pass is offered ${security.offered.length} open alert(s)`}${security.openPrs.length ? `; ${security.openPrs.length} security PR(s) open` : ''}.`);
+  const reports = security.offered.filter((o) => o.alert.kind === 'advisory').length;
+  log(`security: ${security.skip ?? `next pass is offered ${security.offered.length - reports} open alert(s) and ${reports} reported advisor${reports === 1 ? 'y' : 'ies'}`}${security.openPrs.length ? `; ${security.openPrs.length} security PR(s) open` : ''}.`);
   const lastSecurity = ctx.telemetry.securityPasses().at(-1);
-  if (lastSecurity) log(`  last pass: ${lastSecurity.startedAt} → ${lastSecurity.outcome}${lastSecurity.prUrl ? ` ${lastSecurity.prUrl}` : ''} (fixed ${lastSecurity.fixed.length} of ${lastSecurity.offered.length} alert(s), dismissed ${lastSecurity.dismissed.length})`);
+  if (lastSecurity) log(`  last pass: ${lastSecurity.startedAt} → ${lastSecurity.outcome}${lastSecurity.prUrl ? ` ${lastSecurity.prUrl}` : ''} (fixed ${lastSecurity.fixed.length} of ${lastSecurity.offered.length} alert(s), dismissed ${lastSecurity.dismissed.length}${lastSecurity.rerated?.length ? `, re-rated ${lastSecurity.rerated.length}` : ''})`);
 
   const { sha } = await defaultBranchHead(repoSlug(ctx.config));
   const simplifySkipped = await simplifySkip(ctx, sha);
@@ -168,7 +176,7 @@ async function security(): Promise<void> {
   const ctx = buildContext();
   const record = await runSecurityPhase(ctx, await buildWorker(ctx.config));
   if (!record) return;
-  log(`security fix → ${record.outcome}${record.prUrl ? ` ${record.prUrl}` : ''}: fixed ${record.fixed.length} of ${record.offered.length} alert(s), dismissed ${record.dismissed.length}${record.failureReason ? ` (${record.failureReason})` : ''}`);
+  log(`security fix → ${record.outcome}${record.prUrl ? ` ${record.prUrl}` : ''}: fixed ${record.fixed.length} of ${record.offered.length} alert(s), dismissed ${record.dismissed.length}${record.rerated?.length ? `, re-rated ${record.rerated.length}` : ''}${record.failureReason ? ` (${record.failureReason})` : ''}`);
 }
 
 async function env(): Promise<void> {
@@ -185,8 +193,9 @@ async function select(): Promise<void> {
     log('no groomed issues. Run `factory groom` first.');
     return;
   }
-  log(`handing ${tasks.length} groomed issue(s) to the selector agent`);
-  const picked = await runSelector(await buildWorker(ctx.config), tasks);
+  const offered = selectorCandidates(tasks, ctx.config.labels, ctx.config.selector.maxCandidates);
+  log(`handing ${offered.length} of ${tasks.length} groomed issue(s) to the selector agent`);
+  const picked = await runSelector(await buildWorker(ctx.config), offered);
   console.log(`\n${picked.reply}\n`);
   if (picked.selection.kind === 'picked') {
     log(`pick: #${picked.selection.task.issueNumber} "${picked.selection.task.title}"`);
@@ -261,9 +270,25 @@ async function main(): Promise<void> {
   }
   const issueArg = args.find((a) => a.startsWith('--issue'))?.split('=')[1]
     ?? (args.includes('--issue') ? args[args.indexOf('--issue') + 1] : undefined);
-  const issueNumber = issueArg !== undefined ? Number(issueArg) : undefined;
-  if (issueNumber !== undefined && (!Number.isInteger(issueNumber) || issueNumber < 1)) {
-    throw new Error(`--issue must be a positive integer, got "${issueArg}"`);
+  const parallelArg = args.find((a) => a.startsWith('--parallel'))?.split('=')[1]
+    ?? (args.includes('--parallel') ? args[args.indexOf('--parallel') + 1] : undefined);
+  const parallel = parallelArg !== undefined ? Number(parallelArg) : 1;
+  if (!Number.isInteger(parallel) || parallel < 1) {
+    throw new Error(`--parallel must be a positive integer, got "${parallelArg}"`);
+  }
+  // `implement` takes a list (`--issue 1,2,3`, or the flag repeated); `abort` takes one.
+  const issueNumbers = args.flatMap((a, i) => a.startsWith('--issue=') ? [a.split('=')[1]!] : a === '--issue' && args[i + 1] ? [args[i + 1]!] : [])
+    .flatMap((v) => v.split(','))
+    .map((v) => v.trim())
+    .filter(Boolean)
+    .map((v) => {
+      const n = Number(v);
+      if (!Number.isInteger(n) || n < 1) throw new Error(`--issue must be a positive integer, got "${v}"`);
+      return n;
+    });
+  const issueNumber = issueNumbers[0];
+  if (issueArg !== undefined && issueNumbers.length > 1 && command !== 'implement') {
+    throw new Error(`--issue takes one issue for ${command}`);
   }
 
   switch (command) {
@@ -290,6 +315,10 @@ async function main(): Promise<void> {
       break;
     case 'review':
       await review({ ...(only !== undefined ? { only } : {}) });
+      break;
+    case 'implement':
+      if (issueNumbers.length === 0) throw new Error('implement needs --issue N[,M...]');
+      await implementIssues(issueNumbers, parallel);
       break;
     case 'status':
       await status();

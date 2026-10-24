@@ -28,6 +28,42 @@
 // makes — the factory reopens it and looks again. A closed PR someone reopened
 // is reviewed again whether or not they said anything.
 //
+// A PR the agent answered merge on and the factory could not merge for a
+// mechanical reason — GitHub refused, CI had not finished, no CI reported —
+// is stamped `outcome=left verdict=merge`. The review's judgment stands while
+// the PR does, so each tick tries the merge again, with no agent, until it
+// lands or the PR changes and is reviewed afresh. A human is not the next
+// step for a PR the factory already decided to merge. When the merge that was
+// refused was a replacement's (below), the stamp names it, `replacement=N`,
+// and the retry merges that PR and closes this one as superseded — a
+// replacement that conflicts meanwhile is handed back to the agent that opened
+// it, like any factory PR (handBackStuckPrs), not left for the babysitter. A
+// replacement still red after the review's fix round is pending the same way:
+// it is the factory's own PR, so the hand-back turns it green and the retry
+// merges it.
+//
+// A pending merge of the PR itself that goes red or conflicts has no agent to
+// hand it back to, and an unchanged PR is never reviewed again on its own. So
+// the retry stamps it `again=now`, and the next tick reviews it afresh — the
+// review fixes what the agent of a factory PR would. The same holds for a
+// replacement once its hand-backs run out: it is closed, and the review starts
+// over. A review that ended red is stamped `again=<default branch head>`: CI
+// red after the agent's fix rounds is often main's doing, not the PR's, and
+// the PR is reviewed again once main moves past what that review saw — not
+// every tick on the same commit, and not never.
+//
+// A review that fails — no verdict, a run that died — leaves no stamp, only
+// a `<!-- factory-review-failed sha=… -->` marker, at most one per PR as it
+// stands. A PR whose review has failed FAILURES_TO_THE_BACK times as it stands
+// goes to the back of the queue, so
+// a PR no agent can get through does not take a slot from every other one.
+//
+// The `.github/` rule is about who could already run workflows with the repo's
+// secrets. An author with write access to the repo can push a workflow to any
+// branch and watch it run; the factory merging their change adds nothing to
+// what they can do, so it merges it. Anyone else — a fork contributor with read
+// access — gets a human's eyes on it, as the rule has always said.
+//
 // A PR from a fork is the common case and the awkward one: the agents' machine
 // cannot push to a contributor's fork, and Cursor cannot check one out by PR.
 // So the agent starts on the default branch and fetches `pull/N/head` itself.
@@ -65,6 +101,12 @@ const STAMP_RE = /<!--\s*factory-review\s+([^>]*?)\s*-->/;
 interface ReviewStamp {
   sha: string;
   outcome: ReviewOutcome | null;
+  /** The agent answered merge and only a mechanical refusal stood in the way. */
+  mergePending: boolean;
+  /** The replacement PR the pending merge is of, when the fixes went to one. */
+  replacement?: number;
+  /** When an unchanged PR is due again: `now`, or once the default branch moves off this commit. */
+  again?: string;
 }
 
 function parseStamp(body: string): ReviewStamp | null {
@@ -74,7 +116,15 @@ function parseStamp(body: string): ReviewStamp | null {
   const sha = attrs.get('sha');
   if (!sha) return null;
   const outcome = attrs.get('outcome');
-  return { sha, outcome: outcome === 'merged' || outcome === 'superseded' || outcome === 'closed' || outcome === 'left' ? outcome : null };
+  const replacement = Number(attrs.get('replacement'));
+  const again = attrs.get('again');
+  return {
+    sha,
+    outcome: outcome === 'merged' || outcome === 'superseded' || outcome === 'closed' || outcome === 'left' ? outcome : null,
+    mergePending: outcome === 'left' && attrs.get('verdict') === 'merge',
+    ...(Number.isInteger(replacement) && replacement > 0 ? { replacement } : {}),
+    ...(outcome === 'left' && again ? { again } : {}),
+  };
 }
 
 /** The index of the factory's latest review comment, or -1. */
@@ -93,8 +143,47 @@ export function reviewFingerprint(pr: Pick<ReviewPr, 'headRefOid' | 'body' | 'co
   return createHash('sha256').update([pr.headRefOid, pr.body.trim(), ...human].join('\n\n')).digest('hex').slice(0, 12);
 }
 
-export function reviewStamp(pr: Pick<ReviewPr, 'headRefOid' | 'body' | 'comments'>, outcome: ReviewOutcome): string {
-  return `<!-- factory-review sha=${reviewFingerprint(pr)} outcome=${outcome} -->`;
+/** What a stamp carries besides its outcome: a merge still pending, of which PR, or when the PR is due again. */
+export interface StampOpts { mergePending?: boolean; replacement?: number; again?: string }
+
+export function reviewStamp(pr: Pick<ReviewPr, 'headRefOid' | 'body' | 'comments'>, outcome: ReviewOutcome, opts: StampOpts = {}): string {
+  const pending = outcome === 'left' && opts.mergePending === true;
+  const verdict = pending ? ' verdict=merge' : '';
+  const replacement = pending && opts.replacement ? ` replacement=${opts.replacement}` : '';
+  const again = outcome === 'left' && !pending && opts.again ? ` again=${opts.again}` : '';
+  return `<!-- factory-review sha=${reviewFingerprint(pr)} outcome=${outcome}${verdict}${replacement}${again} -->`;
+}
+
+const FAILED_RE = /<!--\s*factory-review-failed\s+sha=(\S+)\s*-->/;
+
+/** Reviews that failed on a PR as it stands, before it goes to the back of the queue. */
+export const FAILURES_TO_THE_BACK = 1;
+
+/** The marker a review that reached no stamp leaves, so the next tick can tell. */
+export function reviewFailedMarker(pr: Pick<ReviewPr, 'headRefOid' | 'body' | 'comments'>): string {
+  return `<!-- factory-review-failed sha=${reviewFingerprint(pr)} -->`;
+}
+
+/** How many reviews since the last stamp failed on the PR as it stands now. */
+export function failedReviews(pr: ReviewPr): number {
+  const sha = reviewFingerprint(pr);
+  return pr.comments.slice(latestStampIndex(pr) + 1).filter((c) => c.body.match(FAILED_RE)?.[1] === sha).length;
+}
+
+/**
+ * Closing references in the PR's description — `Fixes #12`, `Closes o/r#3`,
+ * `Resolves <issue url>` — as `Closes …` lines. A replacement carries them, or
+ * the issue the author fixed stays open when the replacement lands (#1113, #1560).
+ */
+export function closingRefs(body: string): string[] {
+  const re = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\s+((?:[\w.-]+\/[\w.-]+)?#\d+|https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/issues\/\d+)/gi;
+  return [...new Set([...body.matchAll(re)].map((m) => `Closes ${m[1]}`))];
+}
+
+/** The squash commit body that lands an outside PR's work as a replacement: who wrote it, what it closes, the author's credit. */
+export function supersedesBody(pr: Pick<ReviewPr, 'number' | 'body' | 'author'>, trailer: string): string {
+  const refs = closingRefs(pr.body);
+  return `Supersedes #${pr.number} by @${pr.author.login}: the author's commits with the factory review's fixes.${refs.length ? `\n\n${refs.join('\n')}` : ''}\n\n${trailer}`;
 }
 
 /** Bots are someone else's automation: release-please, and Dependabot, whose PRs the dependency batch takes (deps.ts). Not reviewed here. */
@@ -106,16 +195,20 @@ export function isBot(pr: Pick<ReviewPr, 'author'>): boolean {
  * Whether an open PR is the review phase's to look at now. Not a draft, not the
  * factory's own (its labels say so — the factory opens PRs under a human's
  * account, so the author does not), not a bot's, and either never reviewed, or
- * changed since, or reopened after the factory closed it.
+ * changed since, or reopened after the factory closed it, or stamped to be
+ * reviewed again — at once, or once `mainHead`, the default branch's head, has
+ * moved off the one a red review saw.
  */
-export function needsReview(pr: ReviewPr, factoryLabels: string[]): boolean {
+export function needsReview(pr: ReviewPr, factoryLabels: string[], mainHead?: string): boolean {
   if (pr.state !== 'OPEN' || pr.isDraft || isBot(pr)) return false;
   if (pr.labels.some((l) => factoryLabels.includes(l.name))) return false;
   const last = latestReview(pr);
   if (!last) return true;
   // Open again after the factory closed it, whoever reopened it.
   if (last.outcome === 'closed' || last.outcome === 'superseded') return true;
-  return last.sha !== reviewFingerprint(pr);
+  if (last.sha !== reviewFingerprint(pr)) return true;
+  if (last.again === 'now') return true;
+  return last.again !== undefined && mainHead !== undefined && !mainHead.startsWith(last.again);
 }
 
 /**
@@ -131,37 +224,51 @@ export function authorReplied(pr: ReviewPr): boolean {
   return pr.comments.slice(i + 1).some((c) => c.author?.login === pr.author.login && !isFactoryComment(c.body));
 }
 
-/** Oldest first, the same rule both issue queues follow. */
-export function reviewQueue(prs: ReviewPr[], factoryLabels: string[]): { open: ReviewPr[]; reopen: ReviewPr[] } {
-  const byNumber = (a: ReviewPr, b: ReviewPr) => a.number - b.number;
-  return {
-    open: prs.filter((p) => needsReview(p, factoryLabels)).sort(byNumber),
-    reopen: prs.filter(authorReplied).sort(byNumber),
-  };
+/**
+ * An open PR whose review answered merge, held back only by something
+ * mechanical, and unchanged since: its merge is retried without an agent.
+ * A changed PR is not one of these — `needsReview` takes it instead.
+ */
+export function mergeDue(pr: ReviewPr, factoryLabels: string[]): boolean {
+  if (pr.state !== 'OPEN' || pr.isDraft || isBot(pr)) return false;
+  if (pr.labels.some((l) => factoryLabels.includes(l.name))) return false;
+  const last = latestReview(pr);
+  return last !== null && last.mergePending && last.sha === reviewFingerprint(pr);
 }
 
 /**
- * Why a PR is too far from the default branch to review, or null. Catching one
- * up is the author's job: an agent that merges the default branch in, resolves
- * conflicts, and verifies the result has done an implementer's run on someone
- * else's code. GitHub reports that a PR conflicts, not how much, so any
- * conflict counts. `UNKNOWN` mergeability is GitHub still computing it, not a
- * conflict.
+ * Oldest first, the same rule both issue queues follow — except that a red PR
+ * due again only because main moved waits behind PRs that are new or changed,
+ * and a PR whose reviews keep failing waits behind everything.
  */
-export function staleReason(state: { mergeable: string; behindBy: number }, maxCommitsBehind: number): string | null {
-  if (state.mergeable === 'CONFLICTING') return 'it conflicts with the default branch';
-  if (state.behindBy > maxCommitsBehind) return `it is ${state.behindBy} commits behind the default branch`;
-  return null;
-}
-
-/** The factory's report on a PR it closed without a review for being stale. */
-export function staleReport(reason: string, maxCommitsBehind: number): string {
-  return `Nothing was reviewed: ${reason}, and the factory reviews a PR that is within ${maxCommitsBehind} commits of the default branch and merges cleanly. Rebase it onto the default branch and open a new PR — GitHub cannot reopen a closed PR whose branch was force-pushed — and it is reviewed as it stands.`;
+export function reviewQueue(prs: ReviewPr[], factoryLabels: string[], mainHead?: string): { open: ReviewPr[]; reopen: ReviewPr[]; merge: ReviewPr[] } {
+  const byNumber = (a: ReviewPr, b: ReviewPr) => a.number - b.number;
+  const rank = (p: ReviewPr) => {
+    if (failedReviews(p) >= FAILURES_TO_THE_BACK) return 2;
+    const last = latestReview(p);
+    return last?.again && last.again !== 'now' && last.sha === reviewFingerprint(p) ? 1 : 0;
+  };
+  return {
+    open: prs.filter((p) => needsReview(p, factoryLabels, mainHead)).sort((a, b) => rank(a) - rank(b) || byNumber(a, b)),
+    reopen: prs.filter(authorReplied).sort(byNumber),
+    merge: prs.filter((p) => mergeDue(p, factoryLabels)).sort(byNumber),
+  };
 }
 
 /** A path under `.github/`: workflows, actions, CODEOWNERS, dependabot config. */
 export function touchesGithub(files: { path: string }[]): string[] {
   return files.map((f) => f.path).filter((p) => p === '.github' || p.startsWith('.github/'));
+}
+
+/**
+ * Whether a change under `.github/` from this author is the factory's to merge.
+ * `permission` is GitHub's role name for them on the repo. Write and above can
+ * already push a workflow to a branch and have it run with the repo's secrets,
+ * so a merge adds nothing; read, triage, and no access are the outside PRs the
+ * rule exists for.
+ */
+export function mayMergeGithub(permission: string): boolean {
+  return permission === 'write' || permission === 'maintain' || permission === 'admin';
 }
 
 export interface ReviewReply {
@@ -201,8 +308,10 @@ export function sameCommit(named: string, head: string): boolean {
 }
 
 /** The body of the factory's review comment, below the stamp. */
-export function reviewComment(outcome: ReviewOutcome, report: string, note?: string): string {
-  const heading = {
+export function reviewComment(outcome: ReviewOutcome, report: string, note?: string, opts: StampOpts = {}): string {
+  const pending = outcome === 'left' && opts.mergePending === true;
+  const again = outcome === 'left' && !pending ? opts.again : undefined;
+  const heading = pending ? '🏭 **Factory review — merge pending.**' : again ? '🏭 **Factory review — to be reviewed again.**' : {
     merged: '🏭 **Factory review — merged.**',
     superseded: '🏭 **Factory review — merged with fixes.**',
     closed: '🏭 **Factory review — closed.**',
@@ -210,9 +319,17 @@ export function reviewComment(outcome: ReviewOutcome, report: string, note?: str
   }[outcome];
   const tail = outcome === 'closed'
     ? '\n\nIf this misreads your change, reply here: the factory reopens a PR it closed when its author replies, and reviews it again with your reply in view.'
-    : outcome === 'left'
-      ? '\n\nPush to the branch or reply here and the factory reviews it again.'
-      : '';
+    : pending
+      ? opts.replacement
+        ? `\n\nThe factory tries the merge of #${opts.replacement} again every tick, hands it back to its agent if it conflicts or goes red, and closes this PR once it lands. A push or a reply here sends this PR back for a fresh review instead.`
+        : '\n\nThe factory tries the merge again every tick while the PR stands as it is. A push or a reply here sends it back for a fresh review instead.'
+      : again === 'now'
+        ? '\n\nThe factory reviews it afresh on the next tick.'
+        : again
+          ? '\n\nThe factory reviews it again once the default branch moves. A push or a reply here brings it back sooner.'
+          : outcome === 'left'
+            ? '\n\nPush to the branch or reply here and the factory reviews it again.'
+            : '';
   return `${heading}${note ? ` ${note}` : ''}\n\n${report.trim() || '_(no report)_'}${tail}`;
 }
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { carried, concluded, depsQueue, depsStamp, skipReason, type DepsPr } from '../src/deps.ts';
+import { bumpOf, carried, concluded, depsQueue, depsStamp, droppedReasons, skipReason, upgradeIssue, upgradeKey, upgradeKeyOf, type DepsPr } from '../src/deps.ts';
 import { factoryComment } from '../src/groom.ts';
 import { depsPrompt } from '../src/prompts.ts';
 
@@ -69,5 +69,35 @@ describe('the batch prompt', () => {
     const prompt = depsPrompt(['https://github.com/o/r/pull/1', 'https://github.com/o/r/pull/2']);
     expect(prompt).toContain('https://github.com/o/r/pull/2');
     expect(prompt).toContain('Supersedes #<number>');
+  });
+});
+
+describe('a dropped bump becomes an issue the pipeline owns', () => {
+  const sqlalchemy = { number: 1220, url: 'https://github.com/o/r/pull/1220', title: 'chore(deps): update sqlalchemy requirement from >=2.0.54 to >=2.1.0' };
+
+  it('reads each Dropped line, only for offered PRs, first reason wins', () => {
+    const body = 'Supersedes #1218\n\nDropped #1220: SQLAlchemy 2.1 makes bare postgresql:// URLs import psycopg.\n- Dropped #1221 — conflicts with #1218\nDropped #9: not offered\nDropped #1220: again';
+    expect([...droppedReasons(body, [1218, 1220, 1221])]).toEqual([
+      [1220, 'SQLAlchemy 2.1 makes bare postgresql:// URLs import psycopg.'],
+      [1221, 'conflicts with #1218'],
+    ]);
+  });
+
+  it('knows a package by Dependabot\'s title, with its directory when it names one', () => {
+    expect(bumpOf(sqlalchemy.title)).toEqual({ pkg: 'sqlalchemy', to: '>=2.1.0', dir: null });
+    expect(upgradeKey({ number: 3, title: 'chore(deps): bump axios from 1.6.7 to 1.20.0 in /clients/web' })).toBe('axios@/clients/web');
+    expect(upgradeKey({ number: 3, title: 'Bump vitest from 1.0.0 to 2.0.0 in /' })).toBe('vitest');
+    expect(upgradeKey({ number: 3, title: 'chore(deps): something odd' })).toBe('pr-3');
+  });
+
+  it('files the reason, the done, and a stamp the next bump of the package finds', () => {
+    const issue = upgradeIssue(sqlalchemy, 'needs psycopg, or\nURLs moved to psycopg2', 'https://github.com/o/r/pull/1235');
+    expect(issue.title).toBe('Upgrade sqlalchemy to >=2.1.0');
+    expect(upgradeKeyOf(issue.body)).toBe('sqlalchemy');
+    expect(issue.body).toContain('> needs psycopg, or\n> URLs moved to psycopg2');
+    expect(issue.body).toContain('https://github.com/o/r/pull/1235');
+    expect(issue.body).toContain('**Done**');
+    expect(upgradeIssue(sqlalchemy, 'why', null).body).not.toContain('null');
+    expect(upgradeKeyOf('an ordinary issue')).toBeNull();
   });
 });

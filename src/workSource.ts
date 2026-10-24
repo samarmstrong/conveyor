@@ -2,7 +2,7 @@ import type { Task, WorkSource } from './types.ts';
 import type { FactoryConfig } from './config.ts';
 import { repoSlug } from './config.ts';
 import {
-  addIssueLabels, closeIssue, commentOnIssue, createIssue, editIssueBody, ensureLabel, listOpenIssues, referenceState, removeIssueLabels,
+  addIssueLabels, closeIssue, commentOnIssue, createIssue, editIssueBody, ensureLabel, labelHistory, listOpenIssues, referenceState, removeIssueLabels,
 } from './github.ts';
 import {
   childDroppedComment, childrenFiledComment, epicRecognizedComment, failedAttemptComment, groomComment, hasLegacyBlock, isEpic, stripLegacyBlock,
@@ -17,7 +17,7 @@ export class GitHubIssueSource implements WorkSource {
   }
 
   async eligibleTasks(): Promise<Task[]> {
-    const issues = await listOpenIssues(this.repo, this.config.selector.maxCandidates);
+    const issues = await listOpenIssues(this.repo);
     return issues.map((i) => ({
       id: `${this.repo}#${i.number}`,
       issueNumber: i.number,
@@ -53,6 +53,35 @@ export class GitHubIssueSource implements WorkSource {
 
   async markFinished(task: Task): Promise<void> {
     await removeIssueLabels(this.repo, task.issueNumber, [this.config.labels.issueInProgress]).catch(() => {});
+  }
+
+  /**
+   * Read fresh, not from the snapshot the tick took when it began: hand-backs
+   * run first and can take an hour, and the other runner may have started a
+   * groom since. A claim older than `claimMs` outlived any groom, so its
+   * runner died holding it and the issue is free. An issue whose history
+   * cannot be read is held this tick, as `labelHistory` callers do.
+   */
+  async freeToGroom(tasks: Task[], claimMs: number): Promise<Task[]> {
+    if (tasks.length === 0) return [];
+    const label = this.config.labels.grooming;
+    const history = await labelHistory(this.repo, tasks.map((t) => t.issueNumber));
+    const now = Date.now();
+    return tasks.filter((t) => {
+      const h = history.get(t.issueNumber);
+      if (!h?.open) return false;
+      // Free unless provably fresh: a label whose event is past the timeline read is old.
+      return !h.labels.includes(label) || !(now - Date.parse(h.labelledAt[label] ?? '') < claimMs);
+    });
+  }
+
+  async markGrooming(task: Task): Promise<void> {
+    await ensureLabel(this.repo, this.config.labels.grooming, 'C5DEF5', 'Being groomed by the software factory right now');
+    await addIssueLabels(this.repo, task.issueNumber, [this.config.labels.grooming]);
+  }
+
+  async unmarkGrooming(task: Task): Promise<void> {
+    await removeIssueLabels(this.repo, task.issueNumber, [this.config.labels.grooming]).catch(() => {});
   }
 
   /**

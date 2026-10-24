@@ -22,7 +22,9 @@
     "depsPr": "factory:deps",
     "epic": "type:epic",
     "blocker": "factory:blocker",
-    "securityPr": "factory:security"
+    "securityPr": "factory:security",
+    "draft": "factory:draft",
+    "grooming": "factory:grooming"
   },
   "groom": {
     "maxPerTick": 5,
@@ -41,8 +43,7 @@
   },
   "review": {
     "enabled": false,
-    "maxPerTick": 3,
-    "maxCommitsBehind": 100
+    "maxPerTick": 3
   },
   "deps": {
     "enabled": false
