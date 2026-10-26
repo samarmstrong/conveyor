@@ -2,3 +2,4 @@ node_modules/
 telemetry/
 .env
 *.tsbuildinfo
+.DS_Store

@@ -1,7 +1,8 @@
 # conveyor
 
 An opinionated software factory: agents groom your backlog, one PR is in flight
-at a time, and humans merge. Cursor cloud agents do the coding — or Claude Code
+at a time, humans merge what the factory built, and the factory reviews — and
+merges or closes — what everyone else opened. Cursor cloud agents do the coding — or Claude Code
 sessions on the machine running the tick, see [Workers](#workers) — and this repo owns
 only the **factory policy** — what is worth building, when work happens, which
 issue is admissible, verification requirements, review policy, the
@@ -32,17 +33,20 @@ Plenty of tools point an agent at a backlog. This one takes positions:
   implement — it cannot tell "assigned and untouched" from "assigned and half-written
   locally", and guessing wrong wastes a person's work, not an agent's. It will still
   groom it, because a verdict costs the assignee nothing and may be useful to them.
-- **Every change is tested live, and every PR says what was checked.** Unit tests stand
-  in for nothing: the implementer starts the app and exercises the change through its real
-  entry point, with `agent-browser` for anything that has a UI, and ends its PR with a
-  Verification section listing each check it ran and each it did not, with the reason.
-  The groomer budgets for that and may not scope it away to make an issue fit.
+- **Every PR says what was checked.** The implementer runs the tests that cover its
+  change — CI runs the full suites and hands a red check back — and, when the change has
+  behavior worth seeing work, starts the app and exercises it through its real entry point,
+  with `agent-browser` for anything that has a UI. That call is the agent's: a live test
+  on a change the tests already pin down is spend, not safety. The PR ends with a
+  Verification section listing each check it ran and each it did not, with the reason, and
+  the groomer may not scope a live test away to make an issue fit.
 - **CI's verdict goes back to the agent, not to the reviewer.** A PR with a failing check
   is not finished work. The factory waits for the checks and, if one is red, hands the
   failing jobs back to the implementer that wrote the code — same agent, same branch —
-  for one fix round. It judges whether the failure is its own; one that is red on main
-  too is reported on the PR and left. Only then does a human see the PR, and the issue
-  comment says if it is still red. This is not a review gate: the check is the repo's
+  with one instruction: fix them. Red is red whoever caused it; a failure main shares
+  still holds the PR, and every slot like it. Up to three rounds in its pipeline, then
+  once a tick, three more times, for a PR still red when a later tick starts. Only then
+  is it left to a human, and the issue comment says if it is still red. This is not a review gate: the check is the repo's
   own, and the factory only relays it.
 - **The factory owns the machine it builds on.** When an agent cannot verify its own
   change because the sandbox lacks something, that is the factory's bug, not the
@@ -52,6 +56,15 @@ Plenty of tools point an agent at a backlog. This one takes positions:
   is to remove code, in a simplification PR that must delete more lines than it adds or
   the factory closes it before a human sees it. A test proving something is gone, or a
   helper standing in for three plain lines, is not simpler.
+- **A PR from outside is finished here, not handed back.** Contributors, teammates, and
+  other people's coding agents open PRs too. An agent reviews each one against the same
+  principles grooming uses, verifies it to the implementer's standard, and fixes what stands
+  between it and merge on the PR's own branch — the agent is already spun up, so a list of
+  requested changes thrown back over the fence is the expensive answer. Then the factory
+  merges it, or closes it with the reason and an invitation to reply. It is the one place the
+  factory merges, and the rules it holds a merge to are mechanical: CI green on the exact
+  commit the agent verified, no admin bypass, and a change under `.github/` only from an
+  author who could already run it with the repo's secrets.
 - **Telemetry exists to earn autonomy.** Every groom, run, environment pass, and PR
   outcome is recorded so that "which classes of task can automerge?" becomes an
   empirical question, not a leap of faith.
@@ -60,7 +73,15 @@ Plenty of tools point an agent at a backlog. This one takes positions:
 
 ```
 reconcile with GitHub: record the verdict on every factory PR that has closed, release the
-   in-progress label on every issue nothing is working on any more
+   in-progress label on every issue nothing is working on any more (its PR closed since it
+   was claimed, or the claim is older than staleRunHours — short of that, a pipeline on
+   another runner may hold it), take any factory PR out of draft, and adopt the PRs a dead
+   pipeline opened but never labelled (a cursor/factory-N-… branch closing #N, older than
+   the run budget), or close one another PR already answers. An issue still open after its
+   factory PR merged loses factory:groomed, so what remains is groomed before it is built
+→ hand every open factory PR that cannot merge back to the agent that opened it: merge
+   conflicts to resolve, else red checks to fix (three ticks per PR for each; a local
+   worker's handbacks finish before the tick ends)
 → GROOM agents (up to groom.maxPerTick, in parallel; epics, then blockers, then oldest
    first): vet issues against
    principles.md — "groomed" or "needs-work", recorded as a label, alongside a comment
@@ -75,6 +96,27 @@ reconcile with GitHub: record the verdict on every factory PR that has closed, r
    abstractions with one caller, fallback paths nothing reaches, hand-rolled copies of
    what the SDK ships. A PR that grows the code is closed by the factory, unseen. One
    open at a time; a commit the last pass already judged is not looked at again
+→ REVIEW agents, alongside too (up to review.maxPerTick, in parallel; authors replying to
+   a close first, then oldest first): each open PR the factory did not open — bots and
+   drafts aside — that is new or changed since its last review. The agent reads it against
+   principles.md, closes it if something is fundamentally wrong, otherwise merges the
+   default branch in where it conflicts, tests it live (the suites are CI's), pushes the
+   fixes it needs to its branch, and answers merge; the factory waits for CI on that
+   commit, hands a red check back once, and squash-merges it
+→ DEPENDENCY agent, alongside too (deps.enabled): every open Dependabot PR not yet
+   batched at its current head, except Actions bumps under .github/, is carried onto one
+   branch with whatever the repo installs from regenerated, as one PR labelled
+   factory:deps. CI runs once, on the versions that ship; the factory merges it on green
+   under the review phase's rules and closes the Dependabot PRs it carried. One open at a time
+→ SECURITY agent, alongside too (security.enabled, on by default; Cursor worker only): every
+   open Dependabot and code scanning alert at security.minSeverity or above, and every
+   privately reported advisory still awaiting an answer, that no factory PR claims is handed to one
+   agent, which fixes the most severe group one PR can and opens it, labelled
+   factory:security — no issue, no groom. A report is verified first: one that does not hold
+   is closed with the reason, one rated wrong is re-rated, one that holds is accepted as a
+   draft naming the PR, and closed by the factory once that PR merges. The factory claims the
+   alerts on the PR, hands a red check back, and leaves it for a human. Nothing due, or three
+   security PRs already awaiting a merge, no agent
 count the jobs already in flight (open factory PRs + running pipelines)
    → no free slot under maxConcurrentJobs? stop here
 for each free slot:
@@ -88,8 +130,9 @@ for each free slot:
 → handoff to a FRESH implementer agent per pick, running concurrently, each with a
    short workflow prompt and the issue LINK (not its text — the agent reads the
    issue itself, notes and all)
-wait for each PR's checks. A red check goes back to the SAME implementer, once, with
-   the failing jobs' links: fix it if it is yours, say so on the PR if it is not
+wait for each PR's checks. A red check goes back to the SAME implementer, up to three
+   rounds, with the failing jobs' links and the one instruction to fix them; a factory PR
+   still red at the start of a later tick is handed back to its agent then, three ticks at most
 label the resulting PRs `factory`, comment on the issues, record telemetry
    → a run that ends with NO PR, or runs out of worker.maxRunMinutes, retracts the
       groom verdict: the issue is relabelled needs-work with the agent's report
@@ -140,6 +183,11 @@ again when a human replies or edits, and that groom is told to weigh the failed
 attempt. Failures that say nothing about the issue (a worker error, a cancelled run, a
 GitHub hiccup) only release it for a later tick.
 
+A merge spends the verdict too. A groom may scope one slice of a large issue, and its PR
+then says "Part of #N" rather than closing it. When that PR merges and the issue stays
+open, `factory:groomed` comes off with a comment naming the PR, so the issue is groomed
+again — the remainder, judged as it now stands — before anything builds it a second time.
+
 ## Grooming
 
 Grooming is the one place the factory is opinionated about **what** to build. It is not
@@ -165,6 +213,14 @@ so it is groomed ahead of the backlog and, once groomed, implemented ahead of it
 new its number. The label is an ordering claim and nothing more: the groomer still judges
 the issue, can still say `needs-work`, and the implementer's attempt still tests the
 verdict. It does not skip the gate; it goes to the front of the line for it.
+
+**A draft is nobody's to judge yet.** An issue labelled `factory:draft` (`labels.draft`)
+is one a human is still writing, and the factory leaves it alone: not groomed, not
+implemented, and the children of a draft epic wait with it. That is how a team drafts an
+epic in the open — over days, with edits and replies — without the next tick settling its
+direction and filing children under a half-written premise. Take the label off and it
+joins the queue like any other issue. The factory creates the label on the repo so it is
+there to apply; only a human ever puts it on or takes it off.
 
 `principles.md` holds the product-direction principles grooming judges against. Its
 first section, *What the product is*, is the short list of settled commitments an epic's
@@ -225,6 +281,13 @@ branches, so the only collisions are ones a human resolves at review time. Crash
 pipelines are detected via stale records in the local `telemetry/current-runs.json`
 (> `staleRunHours`), recorded as aborted, and cleaned up, so a crash cannot leak a slot.
 
+Ticks on two machines — the local one and the Actions one — may run at once, and each
+sees only its own pipelines. So a tick releases a claim it cannot account for only once
+the claim's PR has closed since it was claimed, or the claim is older than
+`staleRunHours`: the age at which the runner holding the pipeline counts it dead itself.
+Neither tick ever strips the other's in-flight work; the price is that a claim a cancelled
+Actions runner leaked waits out `staleRunHours` before its issue is picked again.
+
 ## Epics: where direction comes from
 
 Grooming one issue at a time has a blind spot. Every capability that needs more than one
@@ -252,8 +315,20 @@ or licensing exposure, or anything that widens what the system may do on its own
 the way every verdict here is vetoed: reply on the epic, and it is groomed again with the
 reply in view. Nothing waits for an approval nobody asked for.
 
-**A groomed epic's children are the work.** The groomer writes the first slice — the issues
-that can start against the code as it stands or against a sibling in the same slice — each
+**An epic's groom may run a stronger model than the work it starts.** Settling a direction
+is the one judgment every child inherits, and the failure it guards against is a specific
+one: a groomer that executes well inside the frame an epic hands it and never asks whether
+the frame is the right size. `groom.epicModel` names an entry of `worker.models` for the
+grooms that settle a direction: an epic's first, one after needs-work, and one after a human
+replies or edits. Everything else — children, ordinary issues, the implementers — stays on
+`worker.model`, and so do the re-reviews the factory's own bookkeeping brings back (a slice
+that landed, a wait that closed). Those are not rare — every slice that lands brings its epic
+back — and they settle nothing: they get a slimmer prompt that starts from the record and
+what changed since, compares only the screens the landed children touched, and compares
+every screen only before calling the epic done. Unset, every groom runs the worker model.
+
+**A groomed epic's children are the work.** The groomer writes the slice — every issue that
+can start against the code as it stands or against a sibling in the same slice, uncapped — each
 one PR by the usual standard, in fenced ```` ```child ```` blocks. The factory files them
 under the epic, each opening with a `Part of #N` line, inheriting the epic's labels minus
 the factory's own. Each child is then groomed on a later tick like any issue, with one
@@ -295,7 +370,11 @@ verdict knew about — `children=#a,#b`, plus the ones the factory filed for it 
 verdict goes stale once none of them is open. That re-groom is where the next slice of
 children gets written, so a capability keeps moving without anyone remembering to ask. A
 child a human closes as rejected counts as landed for this purpose, which is what you want:
-the groomer sees the closure and writes around it.
+the groomer sees the closure and writes around it. Work the groomer holds back for something
+outside the slice — a page another epic is building, a PR in flight — is named in a
+`WAITING: #N` line, carried into the stamp as `waiting=#N`, and the verdict goes stale once
+any of those closes, so held-back work is written when it can be rather than whenever a
+child happens to land.
 
 **Direction changes in one place, and it ratchets.** A revised design document is not a
 change of direction. A reply on the epic is — one that links the revision and names the
@@ -331,6 +410,17 @@ read yet and reads them itself, looking for one thing: **a check the author woul
 and could not, because the machine lacked something.** If the environment can close the
 gap, it commits `.cursor/environment.json` (and any Dockerfile it needs) to the target repo
 and opens a PR that changes nothing else.
+
+**An environment that builds is not one that boots, so the factory boots it.** Before an
+environment PR reaches a human, the controller starts one agent on its branch, handed the
+same credentials every implementer is, with a one-line task: say OK. If that agent does not
+finish, the PR is closed with what happened, and the PRs it was written from say so. This is
+the environment's version of the simplifier's line count — a check on what the agent
+produced, not on how it worked — and it exists because of one PR: a single added apt package
+whose Dockerfile built cleanly, after which every agent launched with credentials died forty
+seconds in, and runs without them silently kept the old image. Nothing in the API said why; a
+one-line agent on the branch would have. A check that cannot launch at all is logged and not
+held against the PR.
 
 **Nothing is parsed, in either direction.** The implementer is not asked for a structured
 report and its reply is not scanned for one — deciding whether a PR describes a blocked
@@ -456,7 +546,7 @@ complexity most likely is — and told what to look for: abstractions with one c
 legacy and fallback paths nothing reaches, two implementations of one idea, features
 nobody asked for, and hand-rolled versions of what the framework provides. It has the
 same run budget as an implementer, so the PR can be substantial, and it works to the same
-rules: verify live, get a subagent review, report every check in the PR.
+rules: verify, get a subagent review where one is worth it, report every check in the PR.
 
 **The one rule the factory enforces itself is that the PR must remove more lines than it
 adds**, as GitHub counts them over the whole diff. This is enforced mechanically, not
@@ -476,7 +566,230 @@ time. A pass that reached a conclusion on a commit — opened a PR, found nothin
 the code — is not repeated until the default branch moves, so an idle repo does not buy a
 fresh 90-minute search every day. A simplification a human closes unmerged is recorded
 like any other rejected PR, and the next pass is handed its link and told not to propose
-it again. Set `simplify.enabled` to `false` to turn the phase off.
+it again.
+
+The phase is off by default: set `simplify.enabled` to `true` to turn it on. During a
+period of heavy implementation the code it would take out is still being built on, so
+simplifying then fights the implementers; it earns its keep once the codebase reaches a
+steadier state.
+
+## Reviewing outside PRs
+
+The factory is not the only thing opening PRs. Contributors do, teammates do, and more and
+more of them are somebody's coding agent opening PRs on its owner's behalf. Every one of
+those used to wait on a human, and the usual review — leave comments, send it back, wait —
+makes less sense when the reviewer is an agent that could simply make the change. So the
+review phase finishes them.
+
+**One agent, one PR, three answers.** The agent gets the PR's link and `principles.md` —
+the same standard grooming holds issues to — and decides everything itself:
+
+- **close** — something is fundamentally wrong: a duplicate, a false premise, a change the
+  principles reject, a tangle no one could review, churn with no point. This needs no build,
+  and the prompt says not to spend a verification on a PR it would close anyway. That is the
+  cheap filter for generated noise. The factory posts the reason and closes the PR, saying
+  that if it misread the change, the author should reply.
+- **merge** — the PR is worth having. The agent verified it the way an implementer verifies
+  its own work (the behavior live, where it has any; CI runs the suites), fixed what stood between it and
+  merge — a failing test, a conflict, a defect it found — by pushing to the PR's own branch,
+  and names the head commit it verified.
+- **leave** — a decision that needs a person: irreversible, legal or licensing exposure,
+  widening what the system may do on its own, or a fix it needed and could not push.
+
+Verification is a slice here, not a copy. The implementer's verification rule is one block
+in `src/prompts.ts` that the implementer, the simplifier, and the reviewer all include, and
+the CI wait-and-fix-once is the same `greenChecks` the implementer's PRs go through. A
+review is held to exactly the standard the factory's own code is.
+
+**A fork PR gets a replacement when it needs fixes.** Most outside PRs come from forks,
+and the agents' machine can push to neither a fork's branch nor, through Cursor, check one
+out by PR. So a fork PR's agent starts on the default branch and fetches `pull/N/head`
+itself. A PR that is right as it stands is merged as it stands. One that needs fixes gets
+them on the agent's own session branch, on top of the author's commits; the agent pushes
+it (Cursor does not), and it opens as a replacement PR. The factory
+labels it `factory:review` (so no queue takes it for an outside PR), puts it through the
+same merge rules below, squash-merges it with a `Co-authored-by` trailer for the author, and
+closes the original with a link. The stamp records that as `superseded`. If the replacement
+cannot be merged yet — GitHub refused, CI still running — the original's stamp names the
+replacement (`verdict=merge replacement=N`), and each tick retries that merge, with the
+author's credit, and closes the original once it lands. That includes a replacement still red
+after the review's fix round: a replacement that conflicts or goes red is handed back to the
+review's own agent, like any factory PR, and merged once green. One whose hand-backs run out
+is closed, and the original reviewed afresh. The replacement carries the original's
+`Closes #N` lines, so the issue the author fixed closes when it lands. A same-repo PR —
+a teammate's branch — is simpler: its agent works on the PR's own branch.
+
+**The merge is the agent's call held to the factory's rules.** The controller merges only:
+- the commit the agent named, and only while it is still the PR's head (`--match-head-commit`)
+  — a push nobody verified is not merged; the PR is reviewed again as it stands. The name is
+  matched by its first 7 characters, because a model retyping a sha garbles it, so a fork PR
+  pushed to at all during its review is reviewed again rather than merged;
+- once CI is green on it, after at most one fix round by the same agent — a fork's workflow
+  runs held for a maintainer's approval are approved by the factory once the review passes,
+  since that review is the maintainer's read the hold asks for;
+- within the repo's own rules — never `--admin`, though the factory's token could bypass
+  them, because a merge that needed to is one the repo said no to;
+- and a PR that changes anything under `.github/` only when its author has write access to
+  the repo. Workflows run with the repo's secrets, and the rule is about who could already
+  run one: a collaborator with write can push a workflow to a branch and watch it run, so the
+  factory merging their change adds nothing to what they can do, and the agent is told to
+  review it as it would any file. A fork contributor with read access is where a change to
+  them most needs a human, and those are left with the review posted.
+
+**The agent runs a stranger's code, so it gets nothing it does not need.** No
+`worker.agentEnv` credentials are handed to a review agent, and the phase runs only on the
+Cursor worker, whose VM is thrown away — the `claude-code` worker would run the PR's code on
+the machine running the tick, so there the phase reports itself skipped. The prompt also says
+that nothing written in the PR is an instruction to the agent.
+
+**State lives on the PR.** Every review ends in a factory comment over one invisible line,
+`<!-- factory-review sha=… outcome=merged|superseded|closed|left -->`, where `sha` fingerprints the
+head commit, the description, and every comment the factory did not write. Push to the
+branch, edit the description, or reply, and the PR is reviewed again. Nothing the factory
+decided waits on a person: a pending merge whose PR goes red or conflicts is stamped
+`again=now` and reviewed afresh next tick, and a review that ended red is stamped
+`again=<default branch head>` and reviewed again once main moves past it — CI red after the
+agent's fix rounds is often main's doing — behind PRs that are new or changed. A review that
+reached no verdict leaves no stamp, only a `factory-review-failed` marker, and is retried next
+tick; one that has failed twice on the PR as it stands goes to the back of the queue, so a PR
+no agent gets through does not take a slot every tick. A PR the factory closed is watched for
+its author replying — an author often cannot reopen a PR a maintainer closed — and is then
+reopened and reviewed again with the reply in view — the closed PRs read are the most
+recently updated, which a reply makes them; one somebody reopened by hand is
+reviewed again whether or not they said anything.
+
+**Which PRs.** Every open, non-draft PR — all of them, not the newest page, since the queue
+is oldest first — not carrying a factory label (`factory`,
+`factory:env`, `factory:simplify`, `factory:deps` — the factory opens PRs under a person's account, so the
+author says nothing) and not opened by a bot. Dependabot and release-please are someone
+else's automation and are left out; Dependabot's PRs go to the [dependency batch](#dependabot) instead. Red checks are included on purpose: they are often
+exactly what stands between a good PR and a merge, and so is a conflict with the default
+branch: the agent merges the default branch in and resolves it, never rebasing or
+force-pushing the author's branch, and closes the PR only when the conflicts resolve
+by rewriting its change. Reviews do not count
+against `maxConcurrentJobs`; `review.maxPerTick` bounds how many run in one tick. The phase
+is off unless `review.enabled` is set, since it is the one that merges.
+
+## Dependabot
+
+Dependabot opens a handful of version bumps a week, and a human merging them one by one
+reads nothing: they go in on a green check. That check is often not about the bump. A repo
+that installs from a lockfile tests the lockfile, and Dependabot's pip updates move the
+ranges in `requirements.txt` without touching it — CI passes on the versions the repo
+already had, and the new ones are first installed whenever someone next regenerates the
+lock by hand. So the dependency phase does not merge Dependabot's PRs at all.
+
+**One batch, one CI run.** One agent is handed the links to every open Dependabot PR, brings
+their changes onto its own branch, regenerates what the repo actually installs from (its own
+script, where it has one), and opens one PR labelled `factory:deps`. It runs no suites and no
+live test — the batch exists so that a week of bumps costs one agent and one CI run, not one
+of each per bump. The PR carries a `Supersedes #N` line per Dependabot PR it took. A bump
+that conflicts, or needs more than a small fix to the code, is dropped with a line saying
+why, and that includes one that turns CI red in the agent's one fix round.
+
+**The merge is the review phase's.** The factory merges the batch under exactly the rules
+in [Reviewing outside PRs](#reviewing-outside-prs): CI green after at most one fix round,
+`--match-head-commit`, no admin bypass, `.github/` only from an author with write access.
+That last rule is why Actions bumps are never offered to a batch — Dependabot has none —
+and they stay open for a human. Once it merges,
+the factory closes each Dependabot PR on a `Supersedes` line with a link, and comments on
+the ones it left. A batch it could not merge stays open for a human, and no new batch
+starts until it is gone.
+
+**State lives on the Dependabot PRs.** Every PR a batch concluded on gets a factory comment
+over `<!-- factory-deps head=… -->`, and is not offered again until its head moves:
+Dependabot rebasing it, or moving it to a newer release. A batch that errored stamps
+nothing and is retried next tick. Like reviews, the agent gets no `worker.agentEnv`
+credentials and runs only on the Cursor worker, because resolving and installing new
+releases runs their code. The phase is off unless `deps.enabled` is set, since it merges.
+
+## Security alerts and reported advisories
+
+A repo's security tab fills faster than anyone reads it: one dependency's advisories appear
+once per advisory per lockfile, and one CodeQL rule fires on every call site of the helper it
+flags. Fixed one alert at a time, a few hundred of them are a few hundred PRs. No rule groups
+them well — the right group is *what one change fixes*, and only reading the code says what
+that is — so the grouping is an agent's judgment. The same tab holds the vulnerabilities
+people report privately, which are a different thing: open-ended claims a person wrote, often
+with a model's help, that may not hold or may hold at another severity. One phase takes both.
+
+**Straight to a PR.** Each tick, every open Dependabot and code scanning alert at or above
+`security.minSeverity` (default `high`, so high and critical) that no factory PR claims is
+handed to one agent, most severe first. It reads the code — how each affected dependency is
+actually used, where each flagged input actually comes from — takes the most severe group one
+PR can fix, fixes it, verifies it to the implementer's standard, and opens the PR, labelled
+`factory:security`. Nothing else is prescribed, with one exception: a dependency nothing
+imports, a tool nothing runs, or code nothing calls is removed rather than patched. There is no
+issue and no groom in between. An alert is already a finished report, and on a public repo an
+issue or a groom comment describing one would publish an unfixed hole; the PR is the first
+public trace, and it arrives with the fix.
+
+The PR is then the factory's like any implementer's: a red check goes back to the agent, up to
+three rounds and then three ticks, a conflict likewise, and a human merges it. It takes no
+implementer slot; instead no new one starts while three are awaiting a merge, since each
+waits on a person.
+
+**GitHub's rescan is the check.** GitHub closes an alert itself once the default branch no
+longer has it. The agent ends its reply with the alerts its PR fixes, and the factory comments
+them onto the PR over an invisible line — `<!-- factory-security
+alerts=dependabot#102,code-scanning#45 -->`. An alert is not offered again while an open PR
+claims it, or once a PR claiming it closed unmerged (declined: it is a human's from there). A
+merged PR gives GitHub a day to rescan; an alert still open after that is offered again, naming
+the PR that did not fix it, and after two such PRs it is left for a human.
+
+**False positives are dismissed, on the record.** A code scanning finding the agent shows is a
+false positive — the flagged input is never attacker-controlled, the path is never reached —
+is named on a `FALSE POSITIVE:` line with its reason, and the factory dismisses the alert with
+that reason on it. That is reversible from the security tab, and it is the one way the factory
+touches an alert. A dependency alert is never dismissed: upgrading or removing it is always
+possible.
+
+**A reported advisory is a claim, verified first.** Every report still in triage — nobody has
+accepted or closed it — is offered whatever its reported severity, since the rating is the
+reporter's guess and answering a person's report is not optional; it is ranked by that rating
+among the alerts, an unrated one as medium. A maintainer's own report is offered the same way:
+filed with write access it skips triage and is born a draft, so a draft the factory has never
+written on is a report awaiting its answer, and the agent is told it is a maintainer's. The agent reads it as a starting point, not a
+verdict: it reproduces the report or traces the flow it describes through the code as it is
+now, and rates the severity itself from what an attacker can actually do and what they need
+first. It then answers, in lines the factory writes onto the advisory itself, where the
+reporter and the maintainers read them (an advisory has no comment API, so the note goes at
+the end of the description under a rule):
+
+- A fix: the PR claims `advisory#GHSA-…` like any alert, and the factory accepts the report
+  as a draft advisory with the PR named on it. GitHub closes no report on a merge, so the
+  acceptance is what takes it out of the queue, and the factory closes the report itself on
+  its first pass after the PR merges, with a line saying so. These reports track and close
+  security issues; nobody here publishes them, and a closed one can still be published, or
+  reopened, by a maintainer. A draft the factory did not accept — one a maintainer wrote
+  themselves, or one a human reopened after the factory closed it — is never closed this way.
+- `FALSE POSITIVE: advisory#GHSA-… — <reason>`: not a vulnerability. The factory closes the
+  report with the reason on it. A human can reopen it.
+- `SEVERITY: advisory#GHSA-… <low|medium|high|critical> — <reason>`: the agent's rating,
+  when it differs from the reporter's. The factory sets the advisory's severity to it,
+  whether the report was fixed, closed, or left for the next pass. A report filed with a CVSS
+  vector may refuse a bare severity; the note still records it.
+
+Any PR that claims a report holds it for good: one still in triage after its fix merged is a
+human's to accept or close, not a second fixer's. The reports reach the agent whole — every
+field and the entire description, quoted — in the same private prompt as the alerts, and the
+PR that fixes one says what was fixed without quoting the report's reproduction. A draft that
+carries any factory line — accepted, or closed and reopened by a human — is never offered:
+once the factory has answered a draft, it is a human's. A report's own request for coordinated
+disclosure or a private-fork fix is not the maintainers' wish — the reporter's tooling is
+cautious by default, and this software runs in no public deployment — so the agent is told to
+proceed with a public PR as for any report.
+
+The alerts reach the agent in its prompt, every field the tick read, rather than as links: an
+alert page is behind a permission the agents' GitHub access does not carry, and the prompt is
+private where an issue would not be. The tick reads them with its own `gh` login (in Actions,
+`FACTORY_GH_TOKEN`; on a private repo it needs `security_events`, and dismissing needs write;
+reading reported advisories needs the repository advisories permission, and closing,
+re-rating, or accepting one needs it with write). A source it cannot read — Dependabot alerts
+off, code scanning never run, advisories unreadable — is left out with a log line; with none
+readable, or nothing due, no agent starts. Like the dependency batch, the phase runs only on
+the Cursor worker and gets no `worker.agentEnv` credentials, because upgrading a dependency
+runs a release nobody here has read.
 
 ## Deploying
 
@@ -515,12 +828,32 @@ to. Everything else — prompts, phases, labels, telemetry — is the same eithe
   puts the agent on a `factory/…` branch, and runs `claude -p` there with
   `--dangerously-skip-permissions` — the same latitude a Cursor agent has in its VM, but
   on this machine, so run it somewhere you would let an agent run. The agent pushes and
-  opens the PR with `gh`; a CI fix round is `claude --resume` in the same clone. Auth is
+  opens the PR with `gh`; a CI fix round is `claude --resume` in the same clone, and a
+  later tick's handback is a fresh session on the PR's own branch (never a fork's). A run
+  gets `worker.localMaxRunMinutes` (default `maxRunMinutes` + 60), since sessions share one
+  machine; the groomer still sizes against `maxRunMinutes`. Auth is
   the machine's claude.ai login, so runs draw on the subscription rather than API
   keys; where there is no browser, `claude setup-token` prints a one-year token for
   `CLAUDE_CODE_OAUTH_TOKEN`. The agents see only the MCP servers the target repo's
   `.mcp.json` declares, never this machine's. `FACTORY_CLAUDE_BIN` points at the
   executable when `claude` is not on PATH.
+
+  **One machine, standing in for a VM each.** A Cursor agent's VM is thrown away with
+  it and has the repo's ports to itself. Here two things stand in for that, both in
+  `src/localMachine.ts`. First, *a run's leftovers end with it*: every process an
+  agent starts inherits `FACTORY_SESSION`, and every container carries a
+  `factory.session` label (a `docker` shim on the agent's PATH adds it) or belongs to the
+  session's compose project (`COMPOSE_PROJECT_NAME` is set per session). When a turn
+  ends, the worker removes all of it, and a tick that died has its sessions cleared by
+  the next one. Second, *one live slot*: a repo's own stack usually fixes its container
+  names and ports, so an agent runs `factory-slot take` before starting it and
+  `factory-slot release` after (which stops what it started). Implementation stays
+  parallel; only live stacks queue, and the wait is not charged to the run's budget.
+  The slot, the shims, and the record of sessions in flight live in
+  `telemetry/machine/`. A stack you run by hand on the same machine should use its own
+  compose project and ports: the repo's defaults belong to the slot holder. None of
+  this is a sandbox. Implementers run code the factory wrote, and phases that run code
+  nobody here wrote stay on Cursor.
 
 `worker.model` is written once, in Cursor's shape, and translated for Claude Code:
 `params.context: "1m"` becomes the `[1m]` suffix and `params.effort` becomes `--effort`;
@@ -530,6 +863,14 @@ is Claude Code's estimate of what the run would have cost on the API, not a bill
 **Falling back.** `FACTORY_WORKER=claude-code npm run factory -- run` overrides
 `worker.kind` for one tick; in Actions, the manual dispatch has a `worker` input that does
 the same. That is the move when the Cursor account is out of usage: nothing else changes.
+`FACTORY_MAX_JOBS=<n>` overrides `maxConcurrentJobs` the same way, for a local tick that
+spends the machine's subscription rather than the Cursor budget the committed value is sized for.
+
+**Switching models.** `worker.models` holds alternatives to `worker.model` by name, and
+`FACTORY_MODEL=<name>` runs one of them for one tick; the manual dispatch's `model` input
+does the same.
+`groom.epicModel` names one of them for the epic grooms that settle a direction, every
+tick, whatever the rest of the tick runs on.
 
 ## Commands
 
@@ -540,6 +881,9 @@ npm run factory -- groom           # run just the grooming phase
 npm run factory -- select          # run just the selector agent over the groomed issues (even with selector.enabled off)
 npm run factory -- env             # run just the environment phase over the unread factory PRs
 npm run factory -- simplify        # run just the simplification phase: one PR that removes more than it adds
+npm run factory -- review          # run just the review phase over the outside PRs that are due
+npm run factory -- review --pr 42  # ...or review PR #42 now, due or not
+npm run factory -- security        # run just the security phase: one PR fixing the most severe group of open alerts and reports
 npm run factory -- status          # grooming progress, capacity, in-flight jobs, recent telemetry
 npm run factory -- abort           # abandon every stuck pipeline (cancels the runs where the worker can)
 npm run factory -- abort --issue 42  # ...or just the one working issue #42
@@ -583,6 +927,24 @@ upstream repo.
   blocks the agents' own verification. Groomed and implemented ahead of the rest of the
   backlog; the environment pass applies it to the repo defects it files, and a human may
   apply or remove it. Ordering only: the groomer still judges the issue.
+- `factory.config.json` → `labels.draft` — (default `factory:draft`) an issue a human is
+  still writing. Neither groomed nor implemented while it carries the label, and the
+  children of a draft epic wait with it. A human applies and removes it.
+- `factory.config.json` → `labels.grooming` — (default `factory:grooming`) an issue a
+  runner is grooming right now. Put on just before the groom and taken off after it, and
+  read fresh before each groom phase, so the local Claude Code tick and the Actions one never
+  groom the same issue at once. A claim older than twice the longer run budget is taken to
+  be a dead runner's and ignored.
+- `factory.config.json` → `groom.epicModel` — a name from `worker.models` for the epic
+  grooms that settle a direction (unset = `worker.model`). The one place a stronger model
+  buys the most: the direction every child is built against. See "Epics" above.
+- `factory.config.json` → `security` — `enabled` (default true) and `minSeverity` (default
+  `high`; `low`, `medium` — or `moderate` — `high`, `critical`): the phase that fixes the
+  repo's open Dependabot and code scanning alerts, and its privately reported advisories, a
+  group per PR. The threshold applies to alerts only; every report in triage is offered. It
+  merges nothing itself, and starts no agent while nothing is due. `labels.securityPr`
+  (default `factory:security`) marks its PRs; see [Security alerts and reported
+  advisories](#security-alerts-and-reported-advisories).
 - `factory.config.json` → `assignedIssues` — whether each phase may act on an issue a
   human has assigned to themselves. Defaults to `{ "groom": true, "implement": false }`:
   vetting an assigned issue costs its assignee nothing, implementing one collides with
@@ -591,14 +953,22 @@ upstream repo.
 - `factory.config.json` → `environment` — `enabled` (default true) and `maxPrsPerPass`
   (default 3): the phase that owns the cloud-agent environment. Off means the factory
   keeps opening PRs whose verification was blocked and never fixes the cause.
-- `factory.config.json` → `simplify` — `enabled` (default true): the phase that removes
-  code. Off means the factory only ever adds.
+- `factory.config.json` → `simplify` — `enabled` (default false): the phase that removes
+  code. Off means the factory only ever adds; turn it on once heavy implementation settles.
+- `factory.config.json` → `labels.reviewPr` — (default `factory:review`) the replacement PR
+  the review phase opens for a fork PR that needed fixes.
+- `factory.config.json` → `review` — `enabled` (default false), `maxPerTick` (default
+  3), and `model` (a name from `worker.models`; unset = `worker.model`): the phase that
+  reviews PRs the factory did not open and merges or closes them. It is the one judgment that
+  merges a stranger's code, so it is the other place a stronger model earns its cost. Cursor
+  worker only. See [Reviewing outside PRs](#reviewing-outside-prs).
 - `factory.config.json` → `selector` — `enabled` (default false): whether an agent ranks
   the groomed issues before each implementer run. Off, the oldest groomed issue is
   implemented next; see [One judge of size](#one-judge-of-size) for why that is the
-  default. `maxCandidates` (default 100) bounds the open-issue fetch either way.
-- `src/prompts.ts` — all five prompts (groom / selector / implementer / environment /
-  simplify), each a few lines. The implementer and simplifier share one block of working
+  default. `maxCandidates` (default 100) bounds how many groomed issues one selector prompt
+  is offered, oldest first; the factory fetches and grooms every open issue regardless.
+- `src/prompts.ts` — all eight prompts (groom / selector / implementer / environment /
+  simplify / review / deps / security), each a few lines. The implementer and simplifier share one block of working
   rules so a simplification is held to exactly the standard the code it removes was built to. Add lines only for specific opinions where the model's default behavior isn't
   what you want. **Widening autonomy later = widening this policy, not adding
   machinery.**
@@ -613,6 +983,8 @@ upstream repo.
 - `src/simplify.ts` — only the mechanical bits: which merged PRs to point the agent at,
   which declined ones to warn it off, whether a PR shrank the code, and why a pass is not
   running.
+- `src/review.ts` — only the mechanical bits: which PRs are due a review, the stamp that
+  dates one, `VERDICT`-line parsing, and the `.github/` rule (who may change it).
 
 ## Telemetry
 
@@ -646,15 +1018,22 @@ Its rows:
   it was one and how many children were filed; for a blocked verdict, the blocker.
 - `run` records: issue, worker/model, implementer agent id (and the selector's, when one
   ran), start/end, outcome (`pr-opened`/`no-pr`/`failed`/`aborted`), token usage, duration.
-- `env` records: which factory PRs the pass read, whether it opened a PR and which,
+- `env` records: which factory PRs the pass read, whether it opened a PR and which (or
+  opened one an agent could not boot on, `unbootable`, and why),
   agent id, token usage, duration. A failed pass records no PRs as read, so they are
   offered to the next one.
 - `simplify` records: the commit the pass read, whether it opened a PR (`pr-opened`),
   opened one the factory closed for growing the code (`grew`), or proposed nothing
   (`no-change`), the PR's additions and deletions, agent id, token usage, duration.
+- `review` records: the outside PR, its author, the agent's verdict, what the factory did
+  (`merged` / `superseded` / `closed` / `left` / `failed`) and why, when a rule of its own
+  held a merge back; the replacement PR for a fork, fix rounds, checks, agent id, token usage,
+  duration.
+- `security` records: the alerts the fixer was handed, the ones its PR claims, the false
+  positives it dismissed, the PR, fix rounds, checks, agent id, token usage, duration.
 - `outcome` records: per PR — merged or rejected, human change requests, human
   comment count, time to close, and which pipeline opened it (`implementer`,
-  `environment`, or `simplify`).
+  `environment`, `simplify`, or `security`).
 
 Joining `groom` to `outcome` is the question worth measuring: do issues that carried
 grooming notes get merged with fewer human change requests than ones that passed clean?
@@ -678,17 +1057,21 @@ src/workSource.ts  GitHubIssueSource (incl. writing groom verdicts back to issue
 src/groom.ts       verdict labels + fingerprint, backlog filters, VERDICT parsing
 src/environment.ts unread-PR bookkeeping + report freshness for the environment phase
 src/simplify.ts    the shrink rule, what to point the simplifier at, when not to run it
+src/review.ts      which outside PRs are due, the review stamp, VERDICT parsing, merge rules
+src/deps.ts        which Dependabot PRs a batch is offered, its stamp, what it carried
+src/security.ts    which alerts are due, the claim stamp, ALERTS / FALSE POSITIVE parsing
 src/selector.ts    wip + assignee filters, SELECTED-line parsing (mechanical only)
-src/prompts.ts     groom + selector + implementer + environment + simplify prompts  ← factory policy
+src/prompts.ts     groom + selector + implementer + environment + simplify + review prompts  ← factory policy
 src/state.ts       capacity gate (open PRs + in-flight runs), outcome reconciliation
 src/controller.ts  the tick
 src/github.ts      thin `gh` CLI wrapper
 src/telemetry.ts   JSONL groom/run/outcome log
-src/cli.ts         run / groom / select / env / simplify / status / abort
+src/cli.ts         run / groom / select / env / simplify / review / deps / security / status / abort
 ```
 
 Non-goals (V1, on purpose): custom agent runtime, custom sandboxes, multi-agent
-framework, workflow engines, autonomous merging, persistent state machines. Parallelism
+framework, workflow engines, autonomous merging of the factory's own PRs (outside PRs are
+the exception, above), persistent state machines. Parallelism
 is one integer (`maxConcurrentJobs`), not a scheduler. A worker is one class implementing
 `CodingWorker` (start, continue, await, usage, cancel) chosen by `worker.kind`; there are
 two, and nothing outside them knows which runtime is coding.

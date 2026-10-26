@@ -2,10 +2,10 @@ import type { Task, WorkSource } from './types.ts';
 import type { FactoryConfig } from './config.ts';
 import { repoSlug } from './config.ts';
 import {
-  addIssueLabels, commentOnIssue, createIssue, editIssueBody, ensureLabel, listOpenIssues, referenceState, removeIssueLabels,
+  addIssueLabels, closeIssue, commentOnIssue, createIssue, editIssueBody, ensureLabel, labelHistory, listOpenIssues, referenceState, removeIssueLabels,
 } from './github.ts';
 import {
-  childrenFiledComment, epicRecognizedComment, failedAttemptComment, groomComment, hasLegacyBlock, isEpic, stripLegacyBlock,
+  childDroppedComment, childrenFiledComment, epicRecognizedComment, failedAttemptComment, groomComment, hasLegacyBlock, isEpic, stripLegacyBlock,
   type ChildDraft, type GroomReply, type StampExtras,
 } from './groom.ts';
 
@@ -17,7 +17,7 @@ export class GitHubIssueSource implements WorkSource {
   }
 
   async eligibleTasks(): Promise<Task[]> {
-    const issues = await listOpenIssues(this.repo, this.config.selector.maxCandidates);
+    const issues = await listOpenIssues(this.repo);
     return issues.map((i) => ({
       id: `${this.repo}#${i.number}`,
       issueNumber: i.number,
@@ -56,6 +56,35 @@ export class GitHubIssueSource implements WorkSource {
   }
 
   /**
+   * Read fresh, not from the snapshot the tick took when it began: hand-backs
+   * run first and can take an hour, and the other runner may have started a
+   * groom since. A claim older than `claimMs` outlived any groom, so its
+   * runner died holding it and the issue is free. An issue whose history
+   * cannot be read is held this tick, as `labelHistory` callers do.
+   */
+  async freeToGroom(tasks: Task[], claimMs: number): Promise<Task[]> {
+    if (tasks.length === 0) return [];
+    const label = this.config.labels.grooming;
+    const history = await labelHistory(this.repo, tasks.map((t) => t.issueNumber));
+    const now = Date.now();
+    return tasks.filter((t) => {
+      const h = history.get(t.issueNumber);
+      if (!h?.open) return false;
+      // Free unless provably fresh: a label whose event is past the timeline read is old.
+      return !h.labels.includes(label) || !(now - Date.parse(h.labelledAt[label] ?? '') < claimMs);
+    });
+  }
+
+  async markGrooming(task: Task): Promise<void> {
+    await ensureLabel(this.repo, this.config.labels.grooming, 'C5DEF5', 'Being groomed by the software factory right now');
+    await addIssueLabels(this.repo, task.issueNumber, [this.config.labels.grooming]);
+  }
+
+  async unmarkGrooming(task: Task): Promise<void> {
+    await removeIssueLabels(this.repo, task.issueNumber, [this.config.labels.grooming]).catch(() => {});
+  }
+
+  /**
    * Grooming is the only judge of whether an issue is one PR, and an attempt is
    * the only test of that judgment. When the attempt fails the verdict is
    * retracted here — label flipped, reason posted — rather than left standing
@@ -87,7 +116,8 @@ export class GitHubIssueSource implements WorkSource {
     await commentOnIssue(this.repo, task.issueNumber, groomComment(task, reply, isEpic(task, this.config.labels), extras));
 
     const { groomed, needsWork } = this.config.labels;
-    const [add, remove] = reply.verdict === 'groomed' ? [groomed, needsWork] : [needsWork, groomed];
+    const built = reply.verdict === 'groomed' || reply.verdict === 'done';
+    const [add, remove] = built ? [groomed, needsWork] : [needsWork, groomed];
     await ensureLabel(this.repo, groomed, '0E8A16', 'Vetted by the factory; eligible for an agent to implement');
     await ensureLabel(this.repo, needsWork, 'D93F0B', 'Not ready for the factory as written; edit the issue to have it re-reviewed');
     // The label is the verdict of record: remove one by hand and the issue is groomed again.
@@ -115,6 +145,27 @@ export class GitHubIssueSource implements WorkSource {
     if (epicLabel === undefined) throw new Error('no epic label configured');
     await commentOnIssue(this.repo, task.issueNumber, epicRecognizedComment(reasoning, epicLabel));
     await addIssueLabels(this.repo, task.issueNumber, [epicLabel]);
+  }
+
+  /**
+   * Each child points at the epic's groom comment, already posted, for why.
+   * One that fails to close stays needs-work, which is where it already was.
+   */
+  async dropChildren(epic: Task, children: number[]): Promise<void> {
+    for (const n of children) {
+      await commentOnIssue(this.repo, n, childDroppedComment(epic)).catch(() => {});
+      await closeIssue(this.repo, n, 'not planned').catch(() => {});
+    }
+  }
+
+  /** The epic's closing comment is its done verdict, already posted. */
+  async closeEpic(epic: Task): Promise<void> {
+    await closeIssue(this.repo, epic.issueNumber, 'completed');
+  }
+
+  /** The closing comment is the close verdict, already posted. */
+  async closeTask(task: Task): Promise<void> {
+    await closeIssue(this.repo, task.issueNumber, 'not planned');
   }
 
   async fileChildren(epic: Task, children: ChildDraft[]): Promise<{ number: number; url: string }[]> {

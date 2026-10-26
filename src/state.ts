@@ -10,9 +10,22 @@ import { resolve } from 'node:path';
 import type { CurrentRun } from './types.ts';
 import type { FactoryConfig } from './config.ts';
 import { repoSlug } from './config.ts';
-import { listIssuesByLabel, listPrsByLabel, removeIssueLabels } from './github.ts';
-import { leakedClaims, unrecordedOutcomes, withSource } from './outcomes.ts';
+import { addIssueLabels, addPrLabels, closePr, commentOnIssue, commentOnPr, ensureLabel, labelHistory, linkedIssueNumber, listIssuesByLabel, listOpenPrs, listPrsByLabel, markPrReady, prMergeable, referenceState, removeIssueLabels, type PrData } from './github.ts';
+import { factoryComment } from './groom.ts';
+import { leakedClaims, orphanedPrs, pastGrace, phaseOrphans, spentVerdicts, unheldClaims, unrecordedOutcomes, withSource, type OrphanPhase } from './outcomes.ts';
+import { keysIn, securityStamp } from './security.ts';
 import type { Telemetry } from './telemetry.ts';
+
+/** Whether a process with this pid exists on this machine. */
+export function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM: it exists, it is just not ours to signal.
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
 
 export interface Capacity {
   /** config.maxConcurrentJobs: how many jobs may exist at once. */
@@ -79,22 +92,26 @@ export class FactoryState {
 
   /**
    * Reconcile with GitHub: record the verdict on every factory PR that has
-   * closed and is not yet in the record, and release the in-progress label on
-   * every issue nothing is working on any more. Returns the number of outcomes
+   * closed and is not yet in the record, release the in-progress label on
+   * every issue nothing is working on any more, and take the groomed label off
+   * every issue a merged factory PR left open. Returns the number of outcomes
    * recorded. See outcomes.ts for why the decision and the record are separate.
    */
   async reconcileOutcomes(log: (msg: string) => void): Promise<number> {
     const { labels } = this.config;
-    const [implementer, environment, simplify, claimed] = await Promise.all([
+    const unadopted = await this.adoptOrphans(log);
+    const [implementer, environment, simplify, security, claimed] = await Promise.all([
       listPrsByLabel(this.repo, labels.factoryPr, 'all'),
       listPrsByLabel(this.repo, labels.environmentPr, 'all'),
       listPrsByLabel(this.repo, labels.simplifyPr, 'all'),
+      listPrsByLabel(this.repo, labels.securityPr, 'all'),
       listIssuesByLabel(this.repo, labels.issueInProgress),
     ]);
     const prs = [
       ...withSource(implementer, 'implementer'),
       ...withSource(environment, 'environment'),
       ...withSource(simplify, 'simplify'),
+      ...withSource(security, 'security'),
     ];
 
     const recorded = new Set(this.telemetry.outcomes().map((o) => o.prUrl));
@@ -104,12 +121,123 @@ export class FactoryState {
       log(`outcome recorded: ${row.prUrl} → ${row.merged ? 'MERGED' : 'CLOSED'}`);
     }
 
-    const openPrs = implementer.filter((pr) => pr.state === 'OPEN');
-    for (const issue of leakedClaims(claimed, openPrs, this.readRuns())) {
-      log(`releasing #${issue}: no open factory PR or running pipeline claims it`);
+    // A draft waits on nobody. The pipeline readies its PR as it labels it,
+    // but that call can fail, and Cursor opens drafts at random.
+    for (const pr of prs.filter((p) => p.state === 'OPEN' && p.isDraft)) {
+      await markPrReady(this.repo, pr.url)
+        .then(() => log(`marked ${pr.url} ready for review: it was still a draft`))
+        .catch((err: Error) => log(`could not mark ${pr.url} ready for review: ${err.message}`));
+    }
+
+    // An orphan too young to adopt may be a live pipeline's PR, and holds its issue as one.
+    const openPrs = [...implementer.filter((pr) => pr.state === 'OPEN'), ...unadopted];
+    const closedPrs = implementer.filter((pr) => pr.state !== 'OPEN');
+    const unheld = unheldClaims(claimed, openPrs, this.readRuns());
+    const merged = closedPrs.filter((pr) => pr.state === 'MERGED').map((pr) => linkedIssueNumber(pr.body)).filter((n): n is number => n !== null);
+    const history = unheld.length + merged.length ? await labelHistory(this.repo, [...unheld, ...merged]) : new Map();
+    const leaked = leakedClaims(unheld, history, closedPrs, labels.issueInProgress, this.config.staleRunHours * 3_600_000);
+    for (const issue of leaked) {
+      log(`releasing #${issue}: no open factory PR or running pipeline here claims it, and its claim is settled or older than ${this.config.staleRunHours}h`);
       await removeIssueLabels(this.repo, issue, [labels.issueInProgress]).catch(() => {});
     }
+    const held = unheld.filter((n) => !leaked.includes(n));
+    if (held.length) log(`holding ${held.map((n) => `#${n}`).join(' ')}: claimed with no PR yet, perhaps by a pipeline on another runner; released at ${this.config.staleRunHours}h`);
+
+    for (const { issue, prUrl } of spentVerdicts(closedPrs, history, labels)) {
+      try {
+        await removeIssueLabels(this.repo, issue, [labels.groomed]);
+        await commentOnIssue(this.repo, issue, factoryComment(
+          `🏭 ${prUrl} merged and this issue is still open, so the groom verdict it was built on is spent. The factory grooms what remains on a later tick.`));
+        log(`#${issue} is still open after ${prUrl} merged: its groom verdict is spent, and it is groomed again`);
+      } catch (err) {
+        log(`could not retire the groom verdict on #${issue}: ${(err as Error).message}`);
+      }
+    }
     return rows.length;
+  }
+
+  /**
+   * Take back the PRs a dead pipeline opened and never labelled (see
+   * `orphanedPrs`), before anything is picked, so their issues are not built
+   * again. One whose issue another factory PR already answers, or that closed
+   * since, is a duplicate and is closed. The rest are labelled, readied, and
+   * their issues claimed, as the pipeline would have done; nobody watched their
+   * CI, and the issue comment says so.
+   *
+   * Only a PR older than the run budget, plus half an hour, is taken for an
+   * orphan (see `pastGrace`). Returns the implementer PRs left alone for being
+   * younger, whose issues they hold.
+   */
+  private async adoptOrphans(log: (msg: string) => void): Promise<PrData[]> {
+    const { labels } = this.config;
+    const factoryLabels = [labels.factoryPr, labels.environmentPr, labels.simplifyPr, labels.reviewPr, labels.depsPr, labels.securityPr];
+    const graceMs = (this.config.worker.maxRunMinutes + 30) * 60_000;
+    const all = await listOpenPrs(this.repo);
+    const open = all.filter((pr) => pr.labels.some((l) => factoryLabels.includes(l.name)) || pastGrace(pr, graceMs));
+    const answered = new Map<number, string>();
+    for (const pr of open) {
+      const issue = pr.labels.some((l) => l.name === labels.factoryPr) ? linkedIssueNumber(pr.body) : null;
+      if (issue !== null) answered.set(issue, pr.url);
+    }
+    for (const { pr, issue } of orphanedPrs(open, factoryLabels)) {
+      try {
+        const other = answered.get(issue);
+        if (other || (await referenceState(this.repo, issue)) === 'closed') {
+          const why = other ? `${other} already answers #${issue}` : `#${issue} has closed`;
+          await closePr(this.repo, pr.url, factoryComment(`🏭 Closing: the factory pipeline that opened this died before it took it up, and ${why}.`));
+          log(`closed orphaned ${pr.url}: ${why}`);
+          continue;
+        }
+        await markPrReady(this.repo, pr.url);
+        await addPrLabels(this.repo, pr.url, [labels.factoryPr]);
+        await addIssueLabels(this.repo, issue, [labels.issueInProgress]);
+        await commentOnIssue(this.repo, issue, factoryComment(
+          `🏭 The factory opened ${pr.url} for this issue. The pipeline that started it died before it took the PR up, so nobody watched its CI or handed a red check back; it is awaiting human review as it stands.`));
+        answered.set(issue, pr.url);
+        log(`adopted orphaned ${pr.url} for #${issue}: its pipeline died before labelling it`);
+      } catch (err) {
+        log(`could not adopt orphaned ${pr.url}: ${(err as Error).message}`);
+      }
+    }
+    await this.adoptPhaseOrphans(open, factoryLabels, log);
+    return orphanedPrs(all.filter((pr) => !open.includes(pr)), factoryLabels).map((o) => o.pr);
+  }
+
+  /**
+   * The other phases' orphans (see `phaseOrphans`). A review's is closed: its
+   * review left no stamp, so the PR it was replacing is reviewed again. One
+   * that conflicts is closed too — its phase works from what is open now, and
+   * a security PR closed without a stamp claims no alert, so they are offered
+   * again. The rest are labelled and readied as their pipeline would have
+   * done, and the babysitter merges them like any factory PR. A security PR's
+   * claim is taken from the alerts its own description names.
+   */
+  private async adoptPhaseOrphans(open: Awaited<ReturnType<typeof listOpenPrs>>, factoryLabels: string[], log: (msg: string) => void): Promise<void> {
+    const { labels } = this.config;
+    const label: Record<Exclude<OrphanPhase, 'review'>, string> = {
+      security: labels.securityPr, env: labels.environmentPr, simplify: labels.simplifyPr, deps: labels.depsPr,
+    };
+    for (const { pr, phase } of phaseOrphans(open, factoryLabels)) {
+      try {
+        const conflicting = phase !== 'review' && (await prMergeable(this.repo, pr.url)).mergeable === 'CONFLICTING';
+        if (phase === 'review' || conflicting) {
+          const why = phase === 'review'
+            ? 'the review that opened this died before it took it up, and the PR it was replacing is reviewed again'
+            : `it conflicts with the default branch, and the ${phase} phase works again from what is open now`;
+          await closePr(this.repo, pr.url, factoryComment(`🏭 Closing: ${why}.`));
+          log(`closed orphaned ${pr.url}: ${why}`);
+          continue;
+        }
+        await ensureLabel(this.repo, label[phase], 'D93F0B', `Opened by the software factory's ${phase} phase`);
+        await addPrLabels(this.repo, pr.url, [label[phase]]);
+        await markPrReady(this.repo, pr.url);
+        const alerts = phase === 'security' ? [...new Set(keysIn(pr.body))] : [];
+        await commentOnPr(this.repo, pr.url, factoryComment(`${alerts.length ? `${securityStamp(alerts)}\n` : ''}🏭 The ${phase} pipeline that opened this died before it took it up, so the factory adopted it as it stands: nobody watched its CI.`));
+        log(`adopted orphaned ${pr.url} for the ${phase} phase: its pipeline died before labelling it`);
+      } catch (err) {
+        log(`could not adopt orphaned ${pr.url}: ${(err as Error).message}`);
+      }
+    }
   }
 
   /**
@@ -131,11 +259,16 @@ export class FactoryState {
     const inFlight: CurrentRun[] = [];
     for (const run of this.readRuns()) {
       const ageHours = (Date.now() - Date.parse(run.startedAt)) / 3_600_000;
-      if (ageHours < this.config.staleRunHours) {
+      // A local run died with its tick: on Oct 13 a full disk killed three
+      // pipelines mid-run and their records held three slots until an abort.
+      const dead = run.pid !== undefined && !processAlive(run.pid);
+      if (ageHours < this.config.staleRunHours && !dead) {
         inFlight.push(run);
         continue;
       }
-      log(`stale pipeline (${ageHours.toFixed(1)}h old) for ${run.taskId}; recording as failed and cleaning up`);
+      log(dead
+        ? `dead pipeline for ${run.taskId}: its tick (pid ${run.pid}) is gone; recording as failed and cleaning up`
+        : `stale pipeline (${ageHours.toFixed(1)}h old) for ${run.taskId}; recording as failed and cleaning up`);
       this.telemetry.append({
         type: 'run',
         taskId: run.taskId,
@@ -147,7 +280,7 @@ export class FactoryState {
         startedAt: run.startedAt,
         finishedAt: new Date().toISOString(),
         outcome: 'aborted',
-        failureReason: `stale pipeline older than ${this.config.staleRunHours}h (controller crash?)`,
+        failureReason: dead ? `its tick (pid ${run.pid}) exited mid-run` : `stale pipeline older than ${this.config.staleRunHours}h (controller crash?)`,
         prUrl: run.prUrl,
         usage: null,
         durationMs: Date.now() - Date.parse(run.startedAt),

@@ -18,8 +18,13 @@
     "needsWork": "factory:needs-work",
     "environmentPr": "factory:env",
     "simplifyPr": "factory:simplify",
+    "reviewPr": "factory:review",
+    "depsPr": "factory:deps",
     "epic": "type:epic",
-    "blocker": "factory:blocker"
+    "blocker": "factory:blocker",
+    "securityPr": "factory:security",
+    "draft": "factory:draft",
+    "grooming": "factory:grooming"
   },
   "groom": {
     "maxPerTick": 5,
@@ -34,7 +39,18 @@
     "maxPrsPerPass": 3
   },
   "simplify": {
-    "enabled": true
+    "enabled": false
+  },
+  "review": {
+    "enabled": false,
+    "maxPerTick": 3
+  },
+  "deps": {
+    "enabled": false
+  },
+  "security": {
+    "enabled": true,
+    "minSeverity": "high"
   },
   "assignedIssues": {
     "groom": true,
