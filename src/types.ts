@@ -100,6 +100,9 @@ export interface CodingWorker {
   /** True where a run ends with the process that started it (a local worker):
    *  what the tick would fire and forget, it has to await instead. */
   readonly runsEndWithProcess?: boolean;
+  /** The factory is finished with this agent and will send it nothing more: a
+   *  local worker frees what the agent held, its container included. */
+  done?(handle: RunHandle): Promise<void>;
 }
 
 export interface StartOptions {
@@ -110,6 +113,14 @@ export interface StartOptions {
   prUrl?: string;
   /** Hand the agent none of `worker.agentEnv`: it will run code nobody here wrote. */
   withholdCredentials?: boolean;
+  /** Give the agent a fresh machine of its own, as every Cursor agent has: a
+   *  review verifies a PR against a fresh instance of the app. The claude-code
+   *  worker runs it in a container (container.ts). */
+  container?: boolean;
+  /** With `autoCreatePR`: the agent pushes its branch only if the task needs
+   *  it, and the factory, not the agent, opens a PR from what it pushed. A fork
+   *  PR's review, whose branch becomes a replacement only when it needs fixes. */
+  pushOnly?: boolean;
   /** Start from this branch instead of the tick's pinned commit: the environment
    *  boot check runs on the branch of the PR it is checking. */
   startingRef?: string;

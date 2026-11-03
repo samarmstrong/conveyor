@@ -44,6 +44,17 @@ export interface FactoryConfig {
      *  twelve were cut off at 90. The groomer still sizes against
      *  `maxRunMinutes`, so an issue is no bigger for running here. */
     localMaxRunMinutes?: number;
+    /** claude-code only: how many sessions run on this machine at once, every
+     *  phase's together; the rest queue, and time in the queue is not charged
+     *  to a run's budget. Default 4. On Oct 29 2026 a tick ran six
+     *  implementers beside five review containers, `ls` took four minutes,
+     *  and three of the six were cut off at the budget. */
+    localMaxSessions?: number;
+    /** claude-code only: a run on code nobody here wrote (a review, a
+     *  dependency batch, a security fix) gets a Docker container of its own,
+     *  built from the target repo's `.cursor/environment.json`, instead of
+     *  sharing this machine. Off, those phases do not run on this worker. */
+    containers?: boolean;
     /** Credentials every agent is handed, by environment variable name. Only
      *  the ones actually set where the tick runs are forwarded (see
      *  agentCredentials); the rest are logged and left out. */
@@ -91,6 +102,10 @@ export interface FactoryConfig {
      *  Claude Code tick beside the Actions one — leaves it alone instead of
      *  grooming it again. The factory's own; nobody applies it by hand. */
     grooming: string;
+    /** A PR a runner is reviewing right now, for the same reason as
+     *  `grooming`: a review leaves its stamp only when it ends, and until then
+     *  a tick that starts beside it would review the PR again. */
+    reviewing: string;
   };
   groom: {
     maxPerTick: number;
@@ -202,6 +217,10 @@ export function loadConfig(root: string = projectRoot): FactoryConfig {
   }
   config.worker.agentEnv ??= [];
   config.worker.localMaxRunMinutes ??= config.worker.maxRunMinutes + 60;
+  config.worker.localMaxSessions ??= 4;
+  if (!Number.isInteger(config.worker.localMaxSessions) || config.worker.localMaxSessions < 1) {
+    throw new Error(`worker.localMaxSessions must be a positive integer, got ${JSON.stringify(config.worker.localMaxSessions)}`);
+  }
   if (config.worker.pauseAtUsagePercent === undefined) config.worker.pauseAtUsagePercent = 90;
   const pauseAt = config.worker.pauseAtUsagePercent;
   if (pauseAt !== null && !(typeof pauseAt === 'number' && pauseAt > 0 && pauseAt <= 100)) {
@@ -230,6 +249,7 @@ export function loadConfig(root: string = projectRoot): FactoryConfig {
   config.labels.securityPr ??= 'factory:security';
   config.labels.draft ??= 'factory:draft';
   config.labels.grooming ??= 'factory:grooming';
+  config.labels.reviewing ??= 'factory:reviewing';
   if (config.groom.epicModel !== undefined && !config.worker.models[config.groom.epicModel]) {
     throw new Error(`groom.epicModel=${config.groom.epicModel} names no model in worker.models (has: ${Object.keys(config.worker.models).join(', ') || 'none'})`);
   }

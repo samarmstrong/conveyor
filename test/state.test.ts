@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const listPrsByLabel = vi.fn();
+const ghLogin = vi.fn(async () => 'factory-bot');
 const listIssuesByLabel = vi.fn<(...args: unknown[]) => Promise<{ number: number }[]>>(async () => []);
 const removeIssueLabels = vi.fn(async (_repo: string, _issue: number, _labels: string[]) => {});
 const listOpenPrs = vi.fn<(...args: unknown[]) => Promise<unknown[]>>(async () => []);
@@ -34,6 +35,7 @@ vi.mock('../src/github.ts', async (importOriginal) => ({
   prMergeable: (repo: string, url: string) => prMergeable(repo, url),
   labelHistory: (repo: string, issues: number[]) => labelHistory(repo, issues),
   listPrsByLabel: (...args: unknown[]) => listPrsByLabel(...args),
+  ghLogin: () => ghLogin(),
   listIssuesByLabel: (...args: unknown[]) => listIssuesByLabel(...args as [string, string]),
   removeIssueLabels: (repo: string, issue: number, labels: string[]) => removeIssueLabels(repo, issue, labels),
 }));
@@ -48,7 +50,7 @@ function config(maxConcurrentJobs: number): FactoryConfig {
   return {
     repo: { owner: 'o', name: 'r', url: 'https://github.com/o/r' },
     worker: { kind: 'cursor', model: null, models: {}, pollIntervalSeconds: 30, maxRunMinutes: 90, agentEnv: [] },
-    labels: { factoryPr: 'factory', issueInProgress: 'factory:wip', groomed: 'factory:groomed', needsWork: 'factory:needs-work', environmentPr: 'factory:env', simplifyPr: 'factory:simplify', reviewPr: 'factory:review', depsPr: 'factory:deps', epic: 'type:epic', blocker: 'factory:blocker', securityPr: 'factory:security', draft: 'factory:draft', grooming: 'factory:grooming' },
+    labels: { factoryPr: 'factory', issueInProgress: 'factory:wip', groomed: 'factory:groomed', needsWork: 'factory:needs-work', environmentPr: 'factory:env', simplifyPr: 'factory:simplify', reviewPr: 'factory:review', depsPr: 'factory:deps', epic: 'type:epic', blocker: 'factory:blocker', securityPr: 'factory:security', draft: 'factory:draft', grooming: 'factory:grooming', reviewing: 'factory:reviewing' },
     groom: { maxPerTick: 5, principlesFile: 'principles.example.md' },
     selector: { enabled: false, maxCandidates: 100 },
     environment: { enabled: true, maxPrsPerPass: 3 },
@@ -67,9 +69,11 @@ function stateFor(maxConcurrentJobs: number, dir = mkdtempSync(resolve(tmpdir(),
   return { state: new FactoryState(config(maxConcurrentJobs), new Telemetry(dir), dir), dir };
 }
 
-function openPrs(n: number) {
-  return Array.from({ length: n }, (_, i) => ({ url: `https://github.com/o/r/pull/${i + 1}`, title: `pr ${i + 1}` }));
+function openPrs(n: number, author = 'factory-bot') {
+  return Array.from({ length: n }, (_, i) => ({ url: `https://github.com/o/r/pull/${i + 1}`, title: `pr ${i + 1}`, author: { login: author } }));
 }
+
+const bare = (prs: { url: string; title: string }[]) => prs.map(({ url, title }) => ({ url, title }));
 
 function run(issueNumber: number, over: Partial<CurrentRun> = {}): CurrentRun {
   return {
@@ -99,7 +103,7 @@ describe('capacity', () => {
     listPrsByLabel.mockResolvedValue(openPrs(1));
     const { state } = stateFor(2);
     const capacity = await state.capacity(() => {});
-    expect(capacity).toMatchObject({ limit: 2, slots: 1, openPrs: openPrs(1), inFlight: [] });
+    expect(capacity).toMatchObject({ limit: 2, slots: 1, openPrs: bare(openPrs(1)), inFlight: [] });
   });
 
   it('is used up once open PRs reach the limit', async () => {
@@ -112,6 +116,22 @@ describe('capacity', () => {
     listPrsByLabel.mockResolvedValue(openPrs(3));
     const { state } = stateFor(2);
     expect((await state.capacity(() => {})).slots).toBe(0);
+  });
+
+  it('counts only the PRs this runner opened, not another runner\'s under the same label', async () => {
+    const theirs = openPrs(3, 'someone-else').map((pr, i) => ({ ...pr, url: `https://github.com/o/r/pull/${i + 10}` }));
+    listPrsByLabel.mockResolvedValue([...openPrs(1), ...theirs]);
+    const { state } = stateFor(3);
+    const capacity = await state.capacity(() => {});
+    expect(capacity.openPrs).toEqual(bare(openPrs(1)));
+    expect(capacity.slots).toBe(2);
+  });
+
+  it('counts every PR when it cannot tell who this runner is', async () => {
+    ghLogin.mockRejectedValueOnce(new Error('HTTP 403'));
+    listPrsByLabel.mockResolvedValue([...openPrs(1), ...openPrs(1, 'someone-else')]);
+    const { state } = stateFor(3);
+    expect((await state.capacity(() => {})).slots).toBe(1);
   });
 
   it('counts in-flight pipelines against the limit alongside open PRs', async () => {

@@ -6,6 +6,7 @@ import { promisify } from 'node:util';
 import type { ReviewPr } from './review.ts';
 import type { DepsPr } from './deps.ts';
 import type { AdvisoryReport, CodeScanningAlert, DependabotAlert, Severity } from './security.ts';
+import { distrustMarkers } from './groom.ts';
 
 const execFileAsync = promisify(execFile);
 
@@ -49,7 +50,7 @@ export interface IssueData {
   body: string;
   url: string;
   labels: { name: string }[];
-  comments: { body: string }[];
+  comments: { author: { login: string } | null; body: string }[];
   assignees: { login: string }[];
 }
 
@@ -61,9 +62,31 @@ export interface IssueData {
  */
 const ALL_OPEN_ISSUES = 10_000;
 
+let trusted: Promise<Set<string>> | undefined;
+
+/**
+ * Who may write a factory marker: this runner's own account, and every member
+ * of the org that owns the repo. Membership is read with the runner's token, so
+ * private members count; a token that cannot see them trusts only itself.
+ */
+function trustedAuthors(repo: string): Promise<Set<string>> {
+  return (trusted ??= (async () => {
+    const owner = repo.split('/')[0]!;
+    const members = await gh(['api', '--paginate', `orgs/${owner}/members`, '--jq', '.[].login'])
+      .then((out) => out.split('\n').filter(Boolean), () => []);
+    return new Set([await ghLogin(), ...members]);
+  })());
+}
+
+/** `ghJson` for items carrying comments, with markers only from the trusted left standing. */
+async function ghJsonWithComments<T extends { comments: { author?: { login: string } | null; body: string }[] }>(repo: string, args: string[]): Promise<T[]> {
+  const [items, who] = await Promise.all([ghJson<T[]>(args), trustedAuthors(repo)]);
+  return items.map((i) => ({ ...i, comments: distrustMarkers(i.comments ?? [], who) }));
+}
+
 /** Every open issue, which is the set grooming, picking and blocked verdicts all read. */
 export async function listOpenIssues(repo: string): Promise<IssueData[]> {
-  return ghJson<IssueData[]>([
+  return ghJsonWithComments<IssueData>(repo, [
     'issue', 'list', '-R', repo, '--state', 'open',
     '--limit', String(ALL_OPEN_ISSUES), '--json', 'number,title,body,url,labels,comments,assignees',
   ]);
@@ -86,7 +109,7 @@ export async function referenceState(repo: string, number: number): Promise<'ope
 
 /** Open issues carrying a label — the in-progress label, for reconciliation. */
 export async function listIssuesByLabel(repo: string, label: string, limit = 100): Promise<IssueData[]> {
-  return ghJson<IssueData[]>([
+  return ghJsonWithComments<IssueData>(repo, [
     'issue', 'list', '-R', repo, '--state', 'open', '--label', label,
     '--limit', String(limit), '--json', 'number,title,body,url,labels,comments,assignees',
   ]);
@@ -109,16 +132,17 @@ export interface LabelHistory {
  * The label history of each issue named, fifty to a GraphQL call. A number
  * GitHub cannot resolve as an issue — a pull request, a deleted issue — is
  * left out, and so is every number in a batch whose call failed outright:
- * what a caller cannot see, it holds rather than acts on.
+ * what a caller cannot see, it holds rather than acts on. With `pullRequest`,
+ * the same for pull requests, and an issue is what is left out.
  */
-export async function labelHistory(repo: string, issues: number[]): Promise<Map<number, LabelHistory>> {
+export async function labelHistory(repo: string, issues: number[], kind: 'issue' | 'pullRequest' = 'issue'): Promise<Map<number, LabelHistory>> {
   const [owner, name] = repo.split('/');
   const unique = [...new Set(issues)];
   const history = new Map<number, LabelHistory>();
   for (let i = 0; i < unique.length; i += 50) {
     const batch = unique.slice(i, i + 50);
     const fields = batch.map((n) =>
-      `i${n}: issue(number: ${n}) { state labels(first: 50) { nodes { name } } timelineItems(itemTypes: [LABELED_EVENT], last: 100) { nodes { ... on LabeledEvent { createdAt label { name } } } } }`);
+      `i${n}: ${kind}(number: ${n}) { state labels(first: 50) { nodes { name } } timelineItems(itemTypes: [LABELED_EVENT], last: 100) { nodes { ... on LabeledEvent { createdAt label { name } } } } }`);
     const query = `query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { ${fields.join(' ')} } }`;
     // GitHub answers what it can resolve and errors on the rest, and gh then
     // exits non-zero with the partial answer on stdout.
@@ -158,12 +182,20 @@ export interface PrData {
   headRefName: string;
   additions: number;
   deletions: number;
+  author: { login: string };
 }
 
-const PR_FIELDS = 'number,url,title,state,isDraft,createdAt,mergedAt,closedAt,body,reviews,comments,headRefName,additions,deletions';
+const PR_FIELDS = 'number,url,title,state,isDraft,createdAt,mergedAt,closedAt,body,reviews,comments,headRefName,additions,deletions,author';
+
+let login: Promise<string> | undefined;
+
+/** The account this runner acts as on GitHub, and so the author of every PR it opens. */
+export function ghLogin(): Promise<string> {
+  return (login ??= ghJson<{ login: string }>(['api', 'user']).then((u) => u.login));
+}
 
 export async function listPrsByLabel(repo: string, label: string, state: 'open' | 'closed' | 'merged' | 'all', limit = 50): Promise<PrData[]> {
-  return ghJson<PrData[]>([
+  return ghJsonWithComments<PrData>(repo, [
     'pr', 'list', '-R', repo, '--label', label, '--state', state,
     '--limit', String(limit), '--json', PR_FIELDS,
   ]);
@@ -171,11 +203,11 @@ export async function listPrsByLabel(repo: string, label: string, state: 'open' 
 
 /** Every open PR, whoever opened it, with its labels. */
 export async function listOpenPrs(repo: string): Promise<(PrData & { labels: { name: string }[] })[]> {
-  return ghJson(['pr', 'list', '-R', repo, '--state', 'open', '--limit', '100', '--json', `${PR_FIELDS},labels`]);
+  return ghJsonWithComments(repo, ['pr', 'list', '-R', repo, '--state', 'open', '--limit', '100', '--json', `${PR_FIELDS},labels`]);
 }
 
 export async function findPrByBranch(repo: string, branch: string): Promise<PrData | null> {
-  const prs = await ghJson<PrData[]>([
+  const prs = await ghJsonWithComments<PrData>(repo, [
     'pr', 'list', '-R', repo, '--head', branch, '--state', 'all',
     '--limit', '1', '--json', PR_FIELDS,
   ]);
@@ -189,7 +221,8 @@ export async function createPr(repo: string, branch: string, title: string, body
 }
 
 export async function viewPr(repo: string, prUrl: string): Promise<PrData> {
-  return ghJson<PrData>(['pr', 'view', prUrl, '-R', repo, '--json', PR_FIELDS]);
+  const [pr, who] = await Promise.all([ghJson<PrData>(['pr', 'view', prUrl, '-R', repo, '--json', PR_FIELDS]), trustedAuthors(repo)]);
+  return { ...pr, comments: distrustMarkers(pr.comments, who) };
 }
 
 /**
@@ -294,6 +327,12 @@ export async function prChecks(repo: string, prUrl: string): Promise<PrCheck[]> 
   }
 }
 
+/** The status checks a branch's rulesets require before anything merges into it. */
+export async function requiredChecks(repo: string, branch: string): Promise<string[]> {
+  return ghJson<string[]>(['api', `repos/${repo}/rules/branches/${branch}`, '--jq',
+    '[.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context]']);
+}
+
 /**
  * Approve the workflow runs a commit is held on. GitHub holds a fork PR's runs
  * (`action_required`) until a maintainer approves them — a first-time
@@ -349,16 +388,17 @@ const REVIEW_PR_FIELDS = 'number,url,title,state,isDraft,body,author,headRefOid,
  */
 export async function listPrsForReview(repo: string, state: 'open' | 'closed', limit: number): Promise<ReviewPr[]> {
   const recent = state === 'closed' ? ['--search', 'is:unmerged sort:updated-desc'] : [];
-  return ghJson<ReviewPr[]>(['pr', 'list', '-R', repo, '--state', state, ...recent, '--limit', String(limit), '--json', REVIEW_PR_FIELDS]);
+  return ghJsonWithComments<ReviewPr>(repo, ['pr', 'list', '-R', repo, '--state', state, ...recent, '--limit', String(limit), '--json', REVIEW_PR_FIELDS]);
 }
 
 export async function viewPrForReview(repo: string, prUrl: string): Promise<ReviewPr & { files: { path: string }[] }> {
-  return ghJson(['pr', 'view', prUrl, '-R', repo, '--json', `${REVIEW_PR_FIELDS},files`]);
+  const [pr, who] = await Promise.all([ghJson<ReviewPr & { files: { path: string }[] }>(['pr', 'view', prUrl, '-R', repo, '--json', `${REVIEW_PR_FIELDS},files`]), trustedAuthors(repo)]);
+  return { ...pr, comments: distrustMarkers(pr.comments, who) };
 }
 
 /** Dependabot's open PRs: the dependency phase's candidates. */
 export async function listDependabotPrs(repo: string): Promise<DepsPr[]> {
-  return ghJson<DepsPr[]>(['pr', 'list', '-R', repo, '--author', 'app/dependabot', '--state', 'open', '--limit', '50',
+  return ghJsonWithComments<DepsPr>(repo, ['pr', 'list', '-R', repo, '--author', 'app/dependabot', '--state', 'open', '--limit', '50',
     '--json', 'number,url,title,isDraft,headRefName,headRefOid,files,comments']);
 }
 

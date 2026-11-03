@@ -68,12 +68,13 @@ describe('which alerts a fixer is handed', () => {
 describe('when the phase does not run', () => {
   it('off, on a local worker, with too many PRs awaiting a merge, or with nothing due', () => {
     expect(skipReason(false, 'cursor')).toMatch(/disabled/);
-    expect(skipReason(true, 'claude-code')).toMatch(/cursor worker/);
+    expect(skipReason(true, 'claude-code')).toMatch(/worker.containers is off/);
+    expect(skipReason(true, 'claude-code', true, [], { offered: 1, held: 0 })).toBeNull();
     const open = Array.from({ length: MAX_OPEN_PRS }, (_, i) => ({ url: `u${i}` }));
-    expect(skipReason(true, 'cursor', open)).toMatch(/awaiting a merge/);
-    expect(skipReason(true, 'cursor', [], { offered: 0, held: 4 })).toMatch(/claimed/);
-    expect(skipReason(true, 'cursor', [], { offered: 0, held: 0 })).toMatch(/no open alerts/);
-    expect(skipReason(true, 'cursor', [], { offered: 2, held: 0 })).toBeNull();
+    expect(skipReason(true, 'cursor', false, open)).toMatch(/awaiting a merge/);
+    expect(skipReason(true, 'cursor', false, [], { offered: 0, held: 4 })).toMatch(/claimed/);
+    expect(skipReason(true, 'cursor', false, [], { offered: 0, held: 0 })).toMatch(/no open alerts/);
+    expect(skipReason(true, 'cursor', false, [], { offered: 2, held: 0 })).toBeNull();
   });
 
   it('takes "moderate" for medium, and refuses what is not a severity', () => {
@@ -184,7 +185,7 @@ describe('reported advisories', () => {
   });
 
   it('the skip reason says both are empty', () => {
-    expect(skipReason(true, 'cursor', [], { offered: 0, held: 0 })).toMatch(/no reports in triage/);
+    expect(skipReason(true, 'cursor', false, [], { offered: 0, held: 0 })).toMatch(/no reports in triage/);
   });
 });
 

@@ -191,6 +191,18 @@ export function isFactoryComment(body: string): boolean {
   return FACTORY_COMMENT_RE.test(body);
 }
 
+/**
+ * A comment's markers count only from someone trusted: anyone can type
+ * `<!-- factory-review … verdict=merge -->`, and every stamp reader believes
+ * what it finds. From anyone else the markers are broken, so the comment reads
+ * as what it is — a human's words, in the fingerprint like any other.
+ */
+export function distrustMarkers<C extends { author?: { login: string } | null; body: string }>(comments: C[], trusted: Set<string>): C[] {
+  return comments.map((c) => (c.author && trusted.has(c.author.login)) || !FACTORY_COMMENT_RE.test(c.body)
+    ? c
+    : { ...c, body: c.body.replace(/<!--(\s*factory-)/g, '<!-- untrusted:$1') });
+}
+
 /** Wraps a comment the factory writes, so the fingerprint can ignore it. */
 export function factoryComment(body: string): string {
   return `${FACTORY_MARKER}\n${body}`;

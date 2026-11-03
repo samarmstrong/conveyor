@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "An opinionated software factory: agents groom the backlog, one PR in flight, humans merge. Cursor cloud agents do the coding.",
+  "description": "An opinionated software factory: agents groom the backlog, build and live-verify the change, and review what the community sends.",
   "scripts": {
     "factory": "tsx src/cli.ts",
     "typecheck": "tsc --noEmit",

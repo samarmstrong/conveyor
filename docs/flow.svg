@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-24 0 1148 460" width="1148" role="img" aria-label="Conveyor pipeline: issue, groom, implement, CI loop, merge; alongside every tick: environment, review, deps, security, simplify">
+  <style>
+    text { font-family: ui-sans-serif, -apple-system, "SF Pro Text", Inter, "Segoe UI", system-ui, sans-serif; }
+    .node rect { fill: #232321; stroke: #2f2f2c; stroke-width: 1.5; }
+    .node.main rect { stroke: #3987e5; }
+    .node.human rect { stroke: #d95926; }
+    .node.side rect { stroke-dasharray: 4 4; }
+    .t { fill: #fff; font-weight: 600; font-size: 15px; }
+    .d { fill: #8d8c84; font-size: 12px; }
+    .note { fill: #8d8c84; font-size: 12px; }
+    .edge { fill: none; stroke: #3a3a37; stroke-width: 2; }
+    .loop { stroke-dasharray: 3 5; }
+    .dot { fill: #3987e5; }
+    @media (prefers-reduced-motion: reduce) { .dots { display: none; } }
+  </style>
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#4a4a46"/></marker>
+  </defs>
+  <rect x="-24" y="0" width="1148" height="460" rx="16" fill="#111110"/>
+  <path class="edge" d="M150,120 L215,120" marker-end="url(#arr)"/>
+  <path class="edge" d="M375,120 L440,120" marker-end="url(#arr)"/>
+  <path class="edge" d="M600,120 L665,120" marker-end="url(#arr)"/>
+  <path class="edge" d="M825,120 L890,120" marker-end="url(#arr)"/>
+  <path class="edge loop" d="M745,152 C745,215 520,215 520,152" marker-end="url(#arr)"/>
+  <text class="note" x="632" y="230" text-anchor="middle">red check or conflict → same agent, same branch</text>
+  <path class="edge loop" d="M295,88 C295,35 75,35 75,88" marker-end="url(#arr)"/>
+  <text class="note" x="185" y="32" text-anchor="middle">needs-work: a reply re-grooms it</text>
+  <g class="dots">
+  <circle r="6" class="dot" opacity="0">
+    <animateMotion dur="9s" begin="0s" repeatCount="indefinite" calcMode="spline" path="M75,120 L745,120 L745,152 C745,215 520,215 520,152 L520,120 L985,120" keyPoints="0.0000;0.1504;0.3043;0.4581;0.6821;0.8359;1.0000;1.0000" keyTimes="0.0000;0.1222;0.2444;0.3667;0.4889;0.6111;0.7333;1.0000" keySplines="0.42 0 0.58 1;0.42 0 0.58 1;0.42 0 0.58 1;0.42 0 0.58 1;0.42 0 0.58 1;0.42 0 0.58 1;0.42 0 0.58 1"/>
+    <animate attributeName="opacity" dur="9s" begin="0s" repeatCount="indefinite" values="0;1;1;0;0" keyTimes="0.0000;0.0333;0.6944;0.7333;1.0000"/>
+    <animate attributeName="fill" dur="9s" begin="0s" repeatCount="indefinite" calcMode="discrete" values="#3987e5;#d95926;#3987e5" keyTimes="0.0000;0.3667;0.6111"/>
+  </circle>
+  <circle r="6" class="dot" opacity="0">
+    <animateMotion dur="9s" begin="3s" repeatCount="indefinite" calcMode="spline" path="M75,120 L985,120" keyPoints="0.0000;0.2418;0.4890;0.7363;1.0000;1.0000" keyTimes="0.0000;0.1222;0.2444;0.3667;0.4889;1.0000" keySplines="0.42 0 0.58 1;0.42 0 0.58 1;0.42 0 0.58 1;0.42 0 0.58 1;0.42 0 0.58 1"/>
+    <animate attributeName="opacity" dur="9s" begin="3s" repeatCount="indefinite" values="0;1;1;0;0" keyTimes="0.0000;0.0333;0.4500;0.4889;1.0000"/>
+  </circle>
+  <circle r="6" class="dot" opacity="0">
+    <animateMotion dur="9s" begin="6s" repeatCount="indefinite" calcMode="spline" path="M75,120 L985,120" keyPoints="0.0000;0.2418;0.4890;0.7363;1.0000;1.0000" keyTimes="0.0000;0.1222;0.2444;0.3667;0.4889;1.0000" keySplines="0.42 0 0.58 1;0.42 0 0.58 1;0.42 0 0.58 1;0.42 0 0.58 1;0.42 0 0.58 1"/>
+    <animate attributeName="opacity" dur="9s" begin="6s" repeatCount="indefinite" values="0;1;1;0;0" keyTimes="0.0000;0.0333;0.4500;0.4889;1.0000"/>
+  </circle>
+  </g>
+  <g class="node"><rect x="0" y="88" width="150" height="64" rx="10"/><text class="t" x="18" y="116">Issue / epic</text><text class="d" x="18" y="136">filed by anyone</text></g>
+  <g class="node main"><rect x="215" y="88" width="160" height="64" rx="10"/><text class="t" x="233" y="116">Groom</text><text class="d" x="233" y="136">judged on principles</text></g>
+  <g class="node main"><rect x="440" y="88" width="160" height="64" rx="10"/><text class="t" x="458" y="116">Implement</text><text class="d" x="458" y="136">built + tested live</text></g>
+  <g class="node main"><rect x="665" y="88" width="160" height="64" rx="10"/><text class="t" x="683" y="116">CI loop</text><text class="d" x="683" y="136">until green</text></g>
+  <g class="node human"><rect x="890" y="88" width="190" height="64" rx="10"/><text class="t" x="908" y="116">Merge</text><text class="d" x="908" y="136">a person merges it</text></g>
+  <text class="note" x="0" y="292" letter-spacing="1.2">ALSO EVERY TICK</text>
+  <g class="node side"><rect x="0" y="306" width="200" height="64" rx="10"/><text class="t" x="18" y="334">Environment</text><text class="d" x="18" y="354">fixes the agents' sandbox</text></g>
+  <g class="node side"><rect x="220" y="306" width="200" height="64" rx="10"/><text class="t" x="238" y="334">Review</text><text class="d" x="238" y="354">finishes community PRs</text></g>
+  <g class="node side"><rect x="440" y="306" width="200" height="64" rx="10"/><text class="t" x="458" y="334">Deps</text><text class="d" x="458" y="354">one batch of bumps</text></g>
+  <g class="node side"><rect x="660" y="306" width="200" height="64" rx="10"/><text class="t" x="678" y="334">Security</text><text class="d" x="678" y="354">alerts + advisories</text></g>
+  <g class="node side"><rect x="880" y="306" width="200" height="64" rx="10"/><text class="t" x="898" y="334">Simplify</text><text class="d" x="898" y="354">removes code (optional)</text></g>
+  <rect x="0" y="412" width="12" height="12" rx="3" fill="#3987e5"/><text class="note" x="20" y="422" style="fill:#c3c2b7;font-size:13px">work moving through a tick</text>
+  <rect x="220" y="412" width="12" height="12" rx="3" fill="#d95926"/><text class="note" x="240" y="422" style="fill:#c3c2b7;font-size:13px">red CI, handed back to its agent</text>
+</svg>

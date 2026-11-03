@@ -133,6 +133,14 @@ describe('local run budget', () => {
   });
 });
 
+describe('local sessions', () => {
+  it('runs four claude-code sessions at once unless set, and refuses what is not a count', () => {
+    expect(loadConfig(configDir({})).worker.localMaxSessions).toBe(4);
+    expect(loadConfig(configDir({ localMaxSessions: 2 })).worker.localMaxSessions).toBe(2);
+    expect(() => loadConfig(configDir({ localMaxSessions: 0 }))).toThrow(/localMaxSessions/);
+  });
+});
+
 describe('usage pause', () => {
   it('defaults to 90%, takes null for never, and refuses what is not a percentage', () => {
     expect(loadConfig(configDir({})).worker.pauseAtUsagePercent).toBe(90);

@@ -35,17 +35,17 @@ import { RunBudgetExceeded } from './types.ts';
 import { CursorWorker } from './worker.ts';
 import { ClaudeCodeWorker } from './claudeCodeWorker.ts';
 import { GitHubIssueSource } from './workSource.ts';
-import { FactoryState } from './state.ts';
+import { FactoryState, ownPrs } from './state.ts';
 import { Telemetry } from './telemetry.ts';
 import { filterAssigned, filterClaimed, filterDrafts, filterEpics, parseSelection, type Selection } from './selector.ts';
-import { BOOT_CHECK_PROMPT, depsPrompt, environmentPrompt, fixChecksPrompt, resolveConflictsPrompt, groomEpicPrompt, groomPrompt, implementPrompt, trackEpicPrompt, reviewPrompt, securityPrompt, selectPrompt, simplifyPrompt } from './prompts.ts';
+import { BOOT_CHECK_PROMPT, depsPrompt, environmentPrompt, fixChecksPrompt, forkFixChecksPrompt, missingChecksPrompt, resolveConflictsPrompt, groomEpicPrompt, groomPrompt, implementPrompt, trackEpicPrompt, reviewPrompt, securityPrompt, selectPrompt, simplifyPrompt } from './prompts.ts';
 import { factoryComment, isFactoryComment, groomState, isBlocker, isEpic, isGroomed, needsGroom, queueOrder, openChildren, openIssues, parseGroomReply, settlesDirection, stampExtrasFor, unaccountedBlockers, verdict, type GroomLabels, type OpenIssues } from './groom.ts';
-import { type PrCheck, addPrLabels, approveHeldRuns, awaitPrChecks, closePr, closePrQuietly, commentOnIssue, commentOnPr, createIssue, createPr, defaultBranchHead, ensureLabel, findPrByBranch, annotateAdvisory, dismissCodeScanningAlert, listAcceptedReports, listAdvisoryReports, listAllIssuesByLabel, listCodeScanningAlerts, listDependabotAlerts, listDependabotPrs, listPrsByLabel, listPrsForReview, markPrReady, mergePr, prChecks, prMergeable, reopenPr, userId, viewPr, viewPrForReview, collaboratorPermission } from './github.ts';
+import { type LabelHistory, type PrCheck, addPrLabels, labelHistory, removeIssueLabels, approveHeldRuns, awaitPrChecks, closePr, closePrQuietly, commentOnIssue, commentOnPr, createIssue, createPr, defaultBranchHead, ensureLabel, findPrByBranch, annotateAdvisory, dismissCodeScanningAlert, listAcceptedReports, listAdvisoryReports, listAllIssuesByLabel, listCodeScanningAlerts, listDependabotAlerts, listDependabotPrs, listPrsByLabel, listPrsForReview, markPrReady, mergePr, prChecks, prMergeable, reopenPr, requiredChecks, userId, viewPr, viewPrForReview, collaboratorPermission } from './github.ts';
 import { ENV_AGENT_MARK, environmentChangedAt, filedIssueBody, parseEnvReport, recentVerdicts, skipReason, unreadFactoryPrs, withOpenedThisTick, workerSkipReason, type UnreadPrs } from './environment.ts';
 import { declinedSimplifications, recentlyMergedFactoryPrs, shrinks, skipReason as simplifySkipReason } from './simplify.ts';
 import { carried, depsQueue, depsStamp, droppedReasons, skipReason as depsSkipReason, upgradeIssue, upgradeKey, upgradeKeyOf, type DepsPr } from './deps.ts';
 import { alertKey, fixedReports, keysIn, offeredLine, openReports, parseFixReply, securityQueue, securityStamp, skipReason as securitySkipReason, type FixReply, type OfferedAlert, type SecurityAlert } from './security.ts';
-import { closingRefs, coAuthorTrailer, isBot, latestReview, mayMergeGithub, parseReviewReply, reviewComment, failedReviews, reviewFailedMarker, reviewQueue, reviewStamp, sameCommit, skipReason as reviewSkipReason, supersedesBody, touchesGithub, type ReviewOutcome, type ReviewPr, type ReviewReply } from './review.ts';
+import { closingRefs, coAuthorTrailer, isBot, latestReview, mayMergeGithub, parseReviewReply, reviewComment, failedReviews, reviewClaimed, reviewFailedMarker, reviewQueue, reviewStamp, sameCommit, skipReason as reviewSkipReason, supersedesBody, touchesGithub, type ReviewOutcome, type ReviewPr, type ReviewReply } from './review.ts';
 
 export function log(msg: string): void {
   console.log(`[${new Date().toISOString()}] ${msg}`);
@@ -99,6 +99,8 @@ export async function buildWorker(config: FactoryConfig): Promise<CodingWorker> 
         workRoot: resolve(projectRoot, config.telemetryDir, 'workspaces'),
         ghToken: githubTokenForAgents(),
         pauseAtUsagePercent: config.worker.pauseAtUsagePercent ?? null,
+        maxSessions: config.worker.localMaxSessions ?? 4,
+        containers: config.worker.containers === true,
       });
       const version = await worker.check();
       log(`claude-code worker: ${version}; agents ${githubTokenForAgents() ? 'push with GH_TOKEN' : "push with this machine's own git/gh login"}`);
@@ -195,6 +197,12 @@ export async function runGroomPhase(
  */
 export function groomClaimMs(config: FactoryConfig): number {
   return 2 * Math.max(config.worker.maxRunMinutes, config.worker.localMaxRunMinutes ?? 0) * 60_000;
+}
+
+/** How long a review claim holds: a review is a run, a wait for CI, and
+ *  perhaps a fix round and another wait. */
+export function reviewClaimMs(config: FactoryConfig): number {
+  return 3 * Math.max(config.worker.maxRunMinutes, config.worker.localMaxRunMinutes ?? 0) * 60_000;
 }
 
 /** The groom prompt for this issue: direction for an epic, one PR for anything else. */
@@ -642,7 +650,7 @@ function factoryPrLabels(config: FactoryConfig): string[] {
  * waiting on an answer they asked for.
  */
 export async function reviewInputs(config: FactoryConfig): Promise<{ skip: string | null; open: ReviewPr[]; reopen: ReviewPr[]; merge: ReviewPr[] }> {
-  const gate = reviewSkipReason(config.review.enabled, config.worker.kind);
+  const gate = reviewSkipReason(config.review.enabled, config.worker.kind, config.worker.containers);
   if (gate) return { skip: gate, open: [], reopen: [], merge: [] };
   const repo = repoSlug(config);
   // Every open PR, since the queue is oldest first; the closed ones only as far
@@ -667,7 +675,7 @@ export async function runReviewPhase(ctx: FactoryContext, worker: CodingWorker, 
   const { config } = ctx;
   let picks: { pr: ReviewPr; reopened: boolean }[];
   if (opts.only !== undefined) {
-    const gate = reviewSkipReason(true, config.worker.kind);
+    const gate = reviewSkipReason(true, config.worker.kind, config.worker.containers);
     if (gate) {
       log(`review: skipped — ${gate}.`);
       return [];
@@ -688,16 +696,31 @@ export async function runReviewPhase(ctx: FactoryContext, worker: CodingWorker, 
     for (const pr of merge) {
       await retryMerge(config, pr).catch((err: Error) => log(`review: merge retry of #${pr.number} failed: ${err.message}`));
     }
-    picks = [...reopen.map((pr) => ({ pr, reopened: true })), ...open.map((pr) => ({ pr, reopened: false }))].slice(0, config.review.maxPerTick);
+    const due = [...reopen.map((pr) => ({ pr, reopened: true })), ...open.map((pr) => ({ pr, reopened: false }))];
+    // A PR another run is reviewing is left to it, as a groom's issue is.
+    const history = due.length ? await labelHistory(repoSlug(config), due.map((p) => p.pr.number), 'pullRequest') : new Map<number, LabelHistory>();
+    const claimed = (n: number) => reviewClaimed(history.get(n), config.labels.reviewing, reviewClaimMs(config), Date.now());
+    const held = due.filter((p) => claimed(p.pr.number));
+    if (held.length > 0) log(`review: not reviewing ${held.map((p) => `#${p.pr.number}`).join(' ')}: being reviewed by another run, or unreadable just now`);
+    picks = due.filter((p) => !claimed(p.pr.number)).slice(0, config.review.maxPerTick);
     if (picks.length === 0) return [];
   }
 
   log(`review: ${picks.length} PR(s) from outside the factory: ${picks.map((p) => `#${p.pr.number}${p.reopened ? ' (author replied to a close)' : ''}`).join(' ')}`);
   const principles = loadPrinciples(config);
-  const records = await Promise.all(picks.map((p) => reviewOne(ctx, worker, p.pr, p.reopened, principles).catch((err: Error) => {
-    log(`review of #${p.pr.number} failed: ${err.message}`);
-    return null;
-  })));
+  const repo = repoSlug(config);
+  await ensureLabel(repo, config.labels.reviewing, 'C5DEF5', 'Being reviewed by the software factory right now').catch((err: Error) => log(`could not ensure the ${config.labels.reviewing} label: ${err.message}`));
+  const records = await Promise.all(picks.map(async (p) => {
+    await addPrLabels(repo, p.pr.url, [config.labels.reviewing]).catch((err: Error) => log(`review of #${p.pr.number}: could not claim it — ${err.message}`));
+    try {
+      return await reviewOne(ctx, worker, p.pr, p.reopened, principles);
+    } catch (err) {
+      log(`review of #${p.pr.number} failed: ${(err as Error).message}`);
+      return null;
+    } finally {
+      await removeIssueLabels(repo, p.pr.number, [config.labels.reviewing]).catch(() => {});
+    }
+  }));
   // No stamp, so the PR is due again; the marker is how a later tick knows
   // this one fails, and sends it to the back (review.ts). One marker per PR as
   // it stands, and none when every review failed: that was the machine (a
@@ -819,68 +842,72 @@ async function reviewOne(ctx: FactoryContext, worker: CodingWorker, pr: ReviewPr
   // No credentials: this agent runs code nobody here wrote. A fork PR cannot be
   // checked out by Cursor or pushed to, so its agent starts on the default
   // branch, and a session branch it commits to becomes the replacement PR.
+  // It verifies against a fresh instance of the app, on a machine of its own.
   const handle = await worker.start(reviewPrompt({ ...pr, authorMayChangeGithub }, principles), {
-    ...(pr.isCrossRepository ? { autoCreatePR: true } : { prUrl: pr.url }),
+    ...(pr.isCrossRepository ? { autoCreatePR: true, pushOnly: true } : { prUrl: pr.url }),
     withholdCredentials: true,
+    container: true,
     name: `factory-review: #${pr.number} ${pr.title}`.slice(0, 100),
     ...(model ? { model } : {}),
   });
 
-  const record = async (over: Partial<ReviewRecord> & { verdict: ReviewRecord['verdict']; outcome: ReviewRecord['outcome'] }): Promise<ReviewRecord> => {
-    const full: ReviewRecord = {
-      type: 'review',
-      prUrl: pr.url,
-      prNumber: pr.number,
-      author: pr.author.login,
-      ...(reopened ? { reopened } : {}),
-      worker: config.worker.kind,
-      model: model ?? config.worker.model,
-      agentId: handle.agentId,
-      startedAt,
-      finishedAt: new Date().toISOString(),
-      usage: (await worker.usage(handle.agentId)) ?? null,
-      durationMs: Date.now() - Date.parse(startedAt),
-      ...over,
+  try {
+    const record = async (over: Partial<ReviewRecord> & { verdict: ReviewRecord['verdict']; outcome: ReviewRecord['outcome'] }): Promise<ReviewRecord> => {
+      const full: ReviewRecord = {
+        type: 'review',
+        prUrl: pr.url,
+        prNumber: pr.number,
+        author: pr.author.login,
+        ...(reopened ? { reopened } : {}),
+        worker: config.worker.kind,
+        model: model ?? config.worker.model,
+        agentId: handle.agentId,
+        startedAt,
+        finishedAt: new Date().toISOString(),
+        usage: (await worker.usage(handle.agentId)) ?? null,
+        durationMs: Date.now() - Date.parse(startedAt),
+        ...over,
+      };
+      ctx.telemetry.append(full);
+      return full;
     };
-    ctx.telemetry.append(full);
-    return full;
-  };
 
-  // A review that reached no verdict leaves no stamp, so the next tick tries again.
-  const result = await worker.awaitResult(handle).catch((err: Error) => err);
-  if (result instanceof Error || result.status !== 'FINISHED') {
-    const reason = result instanceof Error ? result.message : `run ended with status ${result.status}: ${result.resultText.slice(0, 300) || worker.opaqueRunNote(handle)}`;
-    log(`review of #${pr.number}: ${reason}`);
-    return record({ verdict: null, outcome: 'failed', reason });
-  }
-  // Labelled at once, like an implementer's PR, so no queue takes it for someone else's.
-  const replacement = pr.isCrossRepository ? await replacementPr(config, pr, result) : null;
-  if (replacement) {
-    await ensureLabel(repo, config.labels.reviewPr, '5319E7', 'Replacement for an outside PR: its commits plus the factory review\'s fixes');
-    await addPrLabels(repo, replacement, [config.labels.reviewPr]);
-  }
-  const reply = parseReviewReply(result.resultText);
-  if (!reply) {
-    log(`review of #${pr.number}: reply had no VERDICT line:\n${result.resultText.slice(0, 500)}`);
-    if (replacement) await closePr(repo, replacement, factoryComment(`🏭 The review of ${pr.url} reached no verdict, so this replacement is closed.`)).catch(() => {});
-    return record({ verdict: null, outcome: 'failed', reason: 'no VERDICT line' });
-  }
+    // A review that reached no verdict leaves no stamp, so the next tick tries again.
+    const result = await worker.awaitResult(handle).catch((err: Error) => err);
+    if (result instanceof Error || result.status !== 'FINISHED') {
+      const reason = result instanceof Error ? result.message : `run ended with status ${result.status}: ${result.resultText.slice(0, 300) || worker.opaqueRunNote(handle)}`;
+      log(`review of #${pr.number}: ${reason}`);
+      return record({ verdict: null, outcome: 'failed', reason });
+    }
+    const replacement = pr.isCrossRepository ? await replacementPr(config, pr, result) : null;
+    if (replacement) await labelReplacement(config, replacement);
+    const reply = parseReviewReply(result.resultText);
+    if (!reply) {
+      log(`review of #${pr.number}: reply had no VERDICT line:\n${result.resultText.slice(0, 500)}`);
+      if (replacement) await closePr(repo, replacement, factoryComment(`🏭 The review of ${pr.url} reached no verdict, so this replacement is closed.`)).catch(() => {});
+      return record({ verdict: null, outcome: 'failed', reason: 'no VERDICT line' });
+    }
 
-  const act = await actOnReview(config, worker, handle, pr, reply, replacement, authorMayChangeGithub).catch((err: Error) => err);
-  if (act instanceof Error) {
-    log(`review of #${pr.number}: could not act on "${reply.verdict}": ${act.message}`);
-    return record({ verdict: reply.verdict, outcome: 'failed', reason: act.message.slice(0, 500), ...(replacement ? { replacementUrl: replacement } : {}) });
+    const act = await actOnReview(config, worker, handle, pr, reply, replacement, authorMayChangeGithub).catch((err: Error) => err);
+    if (act instanceof Error) {
+      log(`review of #${pr.number}: could not act on "${reply.verdict}": ${act.message}`);
+      return record({ verdict: reply.verdict, outcome: 'failed', reason: act.message.slice(0, 500), ...(replacement ? { replacementUrl: replacement } : {}) });
+    }
+    // Stamped against the PR as it stands now, so a push or a reply after this
+    // comment is what brings it back. An unstamped note means "look again".
+    const now = await viewPrForReview(repo, pr.url);
+    const pending = { mergePending: act.mergePending === true, ...(act.mergePending && act.replacement ? { replacement: act.replacement } : {}), ...(act.again ? { again: act.again } : {}) };
+    const body = reviewComment(act.outcome, reply.report, act.note, pending);
+    // Unstamped, it is reviewed again next tick — counted, like a failed review.
+    await commentOnPr(repo, pr.url, factoryComment(`${act.stamped ? reviewStamp(now, act.outcome, pending) : reviewFailedMarker(pr)}\n${body}`));
+    if (act.outcome === 'closed' || act.outcome === 'superseded') await closePrQuietly(repo, pr.url);
+    const via = act.replacementUrl ?? replacement;
+    log(`review of #${pr.number}: agent answered ${reply.verdict}; ${act.outcome}${act.reason ? ` (${act.reason})` : ''}${via ? ` via ${via}` : ''} — ${pr.url}`);
+    return record({ verdict: reply.verdict, outcome: act.outcome, ...(act.reason ? { reason: act.reason } : {}), ...(act.ci ?? {}), ...(via ? { replacementUrl: via } : {}) });
+  } finally {
+    // Follow-ups for red checks are over; its machine goes.
+    await worker.done?.(handle);
   }
-  // Stamped against the PR as it stands now, so a push or a reply after this
-  // comment is what brings it back. An unstamped note means "look again".
-  const now = await viewPrForReview(repo, pr.url);
-  const pending = { mergePending: act.mergePending === true, ...(act.mergePending && act.replacement ? { replacement: act.replacement } : {}), ...(act.again ? { again: act.again } : {}) };
-  const body = reviewComment(act.outcome, reply.report, act.note, pending);
-  // Unstamped, it is reviewed again next tick — counted, like a failed review.
-  await commentOnPr(repo, pr.url, factoryComment(`${act.stamped ? reviewStamp(now, act.outcome, pending) : reviewFailedMarker(pr)}\n${body}`));
-  if (act.outcome === 'closed' || act.outcome === 'superseded') await closePrQuietly(repo, pr.url);
-  log(`review of #${pr.number}: agent answered ${reply.verdict}; ${act.outcome}${act.reason ? ` (${act.reason})` : ''}${replacement ? ` via ${replacement}` : ''} — ${pr.url}`);
-  return record({ verdict: reply.verdict, outcome: act.outcome, ...(act.reason ? { reason: act.reason } : {}), ...(act.ci ?? {}), ...(replacement ? { replacementUrl: replacement } : {}) });
 }
 
 /**
@@ -906,8 +933,9 @@ async function replacementPr(config: FactoryConfig, pr: ReviewPr, result: RunRes
 /**
  * `mergePending`: the agent answered merge, and only something mechanical held it back — the merge is retried each tick (review.ts).
  * `again`: the default branch head a red review saw; the PR is reviewed again once it moves.
+ * `replacementUrl`: a replacement opened after the verdict, when a fork PR's red checks were fixed on one.
  */
-type ReviewAct = { outcome: ReviewOutcome; stamped: boolean; mergePending?: boolean; replacement?: number; again?: string; note?: string; reason?: string; ci?: { fixRounds: number; checks: NonNullable<RunRecord['checks']> } };
+type ReviewAct = { outcome: ReviewOutcome; stamped: boolean; mergePending?: boolean; replacement?: number; replacementUrl?: string; again?: string; note?: string; reason?: string; ci?: { fixRounds: number; checks: NonNullable<RunRecord['checks']> } };
 
 /**
  * What the factory does with a review's verdict. Close and leave are the
@@ -950,7 +978,12 @@ async function actOnReview(
   }
   if (sameCommit(sha, before.headRefOid)) {
     await discard('the review merged the PR as it stands, without this.');
-    return mergeVerified(config, worker, handle, pr.url, before, authorMayChangeGithub);
+    if (!pr.isCrossRepository) return mergeVerified(config, worker, handle, pr.url, before, authorMayChangeGithub);
+    // A red check is not handed back to be fixed in place: nothing here can
+    // push to a fork. On Oct 28 #3342's went back three times in four
+    // minutes, to an agent with nowhere to put a fix, and stayed red.
+    const asIs = await mergeVerified(config, worker, handle, pr.url, before, authorMayChangeGithub, { fixRounds: 0 });
+    return asIs.reason === 'checks red' ? ((await fixForkOnReplacement(config, worker, handle, pr, authorMayChangeGithub)) ?? asIs) : asIs;
   }
   if (!replacement) return pr.isCrossRepository ? fixesNotPushed(sha) : headMoved(sha, before.headRefOid);
 
@@ -959,8 +992,63 @@ async function actOnReview(
     await discard(`its head is ${rep.headRefOid.slice(0, 12)}, not ${sha.slice(0, 12)}, the commit the review verified.`);
     return headMoved(sha, rep.headRefOid);
   }
+  return mergeReplacement(config, worker, handle, pr, replacement, rep, authorMayChangeGithub);
+}
+
+/**
+ * A fork PR the review would merge as it stands, whose checks came back red.
+ * The failures go back to the reviewer once, to fix as it would a PR that
+ * needed fixes: on its session branch, on top of the author's commits, which
+ * opens as a replacement and merges under the same rules, its own red checks
+ * handed back as any of the factory's PRs are. Null when no replacement came
+ * of it — the failure was not the PR's, or the fix run failed — and the PR is
+ * left red, to be reviewed again when the default branch moves.
+ */
+async function fixForkOnReplacement(
+  config: FactoryConfig,
+  worker: CodingWorker,
+  handle: RunHandle,
+  pr: ReviewPr,
+  authorMayChangeGithub: boolean,
+): Promise<ReviewAct | null> {
+  const repo = repoSlug(config);
+  const failed = redChecks(await prChecks(repo, pr.url));
+  if (!failed) return null;
+  log(`${pr.url}: ${failed.length} failing check(s) — ${failed.map((c) => c.name).join(', ')}; handing them back to the reviewer to fix on a replacement`);
+  const result = await worker.continueRun(handle, forkFixChecksPrompt(pr.url, pr.number, failed)).then((h) => worker.awaitResult(h)).catch((err: Error) => err);
+  if (result instanceof Error || result.status !== 'FINISHED') {
+    log(`${pr.url}: fix run ${result instanceof Error ? `failed — ${result.message}` : `ended with status ${result.status}`}; leaving the PR as it stands`);
+    return null;
+  }
+  const replacement = await replacementPr(config, pr, result);
+  if (!replacement) {
+    log(`${pr.url}: the fix run pushed no replacement; leaving the PR as it stands`);
+    return null;
+  }
+  await labelReplacement(config, replacement);
+  const merged = await mergeReplacement(config, worker, handle, pr, replacement, await viewPrForReview(repo, replacement), authorMayChangeGithub);
+  return { ...merged, replacementUrl: replacement, ...(merged.ci ? { ci: { ...merged.ci, fixRounds: merged.ci.fixRounds + 1 } } : {}) };
+}
+
+/** Labelled at once, like an implementer's PR, so no queue takes it for someone else's. */
+async function labelReplacement(config: FactoryConfig, replacement: string): Promise<void> {
+  const repo = repoSlug(config);
+  await ensureLabel(repo, config.labels.reviewPr, '5319E7', 'Replacement for an outside PR: its commits plus the factory review\'s fixes');
+  await addPrLabels(repo, replacement, [config.labels.reviewPr]);
+}
+
+/** Merges a fork review's replacement in place of the PR, crediting its author. */
+async function mergeReplacement(
+  config: FactoryConfig,
+  worker: CodingWorker,
+  handle: RunHandle,
+  pr: ReviewPr,
+  replacement: string,
+  rep: ReviewPr & { files: { path: string }[] },
+  authorMayChangeGithub: boolean,
+): Promise<ReviewAct> {
   const trailer = coAuthorTrailer(pr.author, await userId(pr.author.login));
-  const merged = await mergeVerified(config, worker, handle, replacement, rep, authorMayChangeGithub, supersedesBody(pr, trailer));
+  const merged = await mergeVerified(config, worker, handle, replacement, rep, authorMayChangeGithub, { body: supersedesBody(pr, trailer) });
   if (merged.outcome !== 'merged') {
     // The fixes are on the replacement, so the pending merge is of that PR:
     // the stamp names it, and the retry each tick merges it and closes this one.
@@ -1006,7 +1094,7 @@ async function mergeVerified(
   target: string,
   before: ReviewPr & { files: { path: string }[] },
   authorMayChangeGithub: boolean,
-  body?: string,
+  opts: { body?: string; fixRounds?: number } = {},
 ): Promise<ReviewAct> {
   const repo = repoSlug(config);
   const github = (paths: string[]): ReviewAct => ({
@@ -1023,7 +1111,7 @@ async function mergeVerified(
   // the workflows that run are the repo's own.
   const approved = before.isCrossRepository ? await approveHeldRuns(repo, before.headRefOid) : 0;
   if (approved > 0) log(`${target}: approved ${approved} workflow run(s) held for a maintainer`);
-  const ci = await greenChecks(config, worker, handle, target, { expectChecks: approved > 0 });
+  const ci = await greenChecks(config, worker, handle, target, { expectChecks: approved > 0, ...(opts.fixRounds === undefined ? {} : { fixRounds: opts.fixRounds }) });
   const after = await viewPrForReview(repo, target);
   // Only the reviewer's own fix round may move the head; anything else is a
   // push nobody verified.
@@ -1037,7 +1125,7 @@ async function mergeVerified(
   if (ci.checks === 'unsettled') return { outcome: 'left', stamped: true, mergePending: true, reason: 'checks unsettled', note: `The factory will merge it, but CI had not finished within ${CHECKS_WAIT_MS / 60_000} minutes.`, ci };
 
   try {
-    await mergePr(repo, target, after.headRefOid, body);
+    await mergePr(repo, target, after.headRefOid, opts.body);
   } catch (err) {
     const msg = (err as Error).message.slice(0, 500);
     return { outcome: 'left', stamped: true, mergePending: true, reason: `merge refused: ${msg}`, note: `The factory will merge it, but GitHub refused this time: ${msg}`, ci };
@@ -1050,11 +1138,11 @@ async function mergeVerified(
  * tick, the dry run, and `factory status` agree.
  */
 export async function depsInputs(config: FactoryConfig): Promise<{ skip: string | null; offered: DepsPr[] }> {
-  const gate = depsSkipReason(config.deps.enabled, config.worker.kind);
+  const gate = depsSkipReason(config.deps.enabled, config.worker.kind, config.worker.containers);
   if (gate) return { skip: gate, offered: [] };
   const repo = repoSlug(config);
   const [open, batches] = await Promise.all([listDependabotPrs(repo), listPrsByLabel(repo, config.labels.depsPr, 'open')]);
-  const skip = depsSkipReason(true, config.worker.kind, batches);
+  const skip = depsSkipReason(true, config.worker.kind, config.worker.containers, batches);
   if (skip) return { skip, offered: [] };
   const offered = depsQueue(open);
   return { skip: offered.length === 0 ? 'no Dependabot PR is new or changed since the last batch' : null, offered };
@@ -1079,81 +1167,86 @@ export async function runDepsPhase(ctx: FactoryContext, worker: CodingWorker): P
 
   log(`deps: batching ${offered.length} Dependabot PR(s): ${offered.map((p) => `#${p.number}`).join(' ')}`);
   const startedAt = new Date().toISOString();
-  // No credentials: it installs releases nobody here has read.
-  const handle = await worker.start(depsPrompt(offered.map((p) => p.url)), { autoCreatePR: true, withholdCredentials: true, name: 'factory-deps' });
+  // No credentials, and a machine of its own: it installs releases nobody here has read.
+  const handle = await worker.start(depsPrompt(offered.map((p) => p.url)), { autoCreatePR: true, withholdCredentials: true, container: true, name: 'factory-deps' });
+  try {
 
-  const record = async (over: Partial<DepsRecord> & { outcome: DepsRecord['outcome'] }): Promise<DepsRecord> => {
-    const full: DepsRecord = {
-      type: 'deps',
-      offered: offered.map((p) => p.url),
-      carried: [],
-      prUrl: null,
-      worker: config.worker.kind,
-      model: config.worker.model,
-      agentId: handle.agentId,
-      startedAt,
-      finishedAt: new Date().toISOString(),
-      usage: (await worker.usage(handle.agentId)) ?? null,
-      durationMs: Date.now() - Date.parse(startedAt),
-      ...over,
+    const record = async (over: Partial<DepsRecord> & { outcome: DepsRecord['outcome'] }): Promise<DepsRecord> => {
+      const full: DepsRecord = {
+        type: 'deps',
+        offered: offered.map((p) => p.url),
+        carried: [],
+        prUrl: null,
+        worker: config.worker.kind,
+        model: config.worker.model,
+        agentId: handle.agentId,
+        startedAt,
+        finishedAt: new Date().toISOString(),
+        usage: (await worker.usage(handle.agentId)) ?? null,
+        durationMs: Date.now() - Date.parse(startedAt),
+        ...over,
+      };
+      ctx.telemetry.append(full);
+      return full;
     };
-    ctx.telemetry.append(full);
-    return full;
-  };
-  // Stamped at the head the batch was offered, so a rebase since brings it back.
-  const conclude = async (prs: DepsPr[], body: string, close: boolean) => {
-    for (const p of prs) {
-      try {
-        await commentOnPr(repo, p.url, factoryComment(`${depsStamp(p)}\n${body}`));
-        if (close) await closePrQuietly(repo, p.url);
-      } catch (err) {
-        log(`deps: could not conclude on ${p.url}: ${(err as Error).message}`);
+    // Stamped at the head the batch was offered, so a rebase since brings it back.
+    const conclude = async (prs: DepsPr[], body: string, close: boolean) => {
+      for (const p of prs) {
+        try {
+          await commentOnPr(repo, p.url, factoryComment(`${depsStamp(p)}\n${body}`));
+          if (close) await closePrQuietly(repo, p.url);
+        } catch (err) {
+          log(`deps: could not conclude on ${p.url}: ${(err as Error).message}`);
+        }
       }
+    };
+
+    // A batch that reached no conclusion stamps nothing, so the next tick tries again.
+    const result = await worker.awaitResult(handle).catch((err: Error) => err);
+    if (result instanceof Error || result.status !== 'FINISHED') {
+      const reason = result instanceof Error ? result.message : `run ended with status ${result.status}: ${result.resultText.slice(0, 300) || worker.opaqueRunNote(handle)}`;
+      log(`deps: batch failed — ${reason}`);
+      return record({ outcome: 'failed', reason });
     }
-  };
 
-  // A batch that reached no conclusion stamps nothing, so the next tick tries again.
-  const result = await worker.awaitResult(handle).catch((err: Error) => err);
-  if (result instanceof Error || result.status !== 'FINISHED') {
-    const reason = result instanceof Error ? result.message : `run ended with status ${result.status}: ${result.resultText.slice(0, 300) || worker.opaqueRunNote(handle)}`;
-    log(`deps: batch failed — ${reason}`);
-    return record({ outcome: 'failed', reason });
+    const prUrl = await openedPr(config, result);
+    if (!prUrl) {
+      log(`deps: the agent carried none of them. Its report:\n${result.resultText.trim() || '_(no report)_'}`);
+      await handDropsToIssues(config, { url: null, text: result.resultText }, offered, conclude);
+      return record({ outcome: 'no-pr' });
+    }
+    // Labelled at once, so the review phase never takes it for someone else's.
+    await ensureLabel(repo, config.labels.depsPr, '0366D6', 'Dependabot PRs batched by the software factory, lockfile regenerated');
+    await addPrLabels(repo, prUrl, [config.labels.depsPr]);
+
+    // Dependabot has no write access, and a batch never carries an Actions bump (deps.ts).
+    const act = await mergeVerified(config, worker, handle, prUrl, await viewPrForReview(repo, prUrl), false).catch((err: Error): ReviewAct =>
+      ({ outcome: 'left', stamped: true, reason: err.message.slice(0, 500), note: `The factory could not merge it: ${err.message.slice(0, 500)}` }));
+    const numbers = carried((await viewPr(repo, prUrl)).body, offered.map((p) => p.number));
+    const took = offered.filter((p) => numbers.includes(p.number));
+    const dropped = offered.filter((p) => !numbers.includes(p.number));
+    const merged = act.outcome === 'merged';
+
+    if (!merged) {
+      await commentOnPr(repo, prUrl, factoryComment(`🏭 **Factory dependency batch — left for a human.** ${act.note ?? ''}`.trim())).catch(() => {});
+    }
+    await conclude(took, merged
+      ? `🏭 **Factory dependency batch — merged.** This bump landed in ${prUrl}, with the lockfile regenerated from it, on green CI; closing this one.`
+      : `🏭 **Factory dependency batch.** This bump is carried in ${prUrl}, which the factory could not merge and has left for a human.`, merged);
+    const issues = dropped.length ? await handDropsToIssues(config, { url: prUrl, text: (await viewPr(repo, prUrl)).body }, dropped, conclude) : [];
+
+    log(`deps: ${prUrl} carries ${took.length} of ${offered.length}; ${merged ? 'merged' : `left (${act.reason})`}${dropped.length ? `; dropped ${dropped.map((p, i) => `#${p.number} → ${issues[i] ?? 'left open'}`).join(', ')}` : ''}`);
+    return record({
+      outcome: merged ? 'merged' : 'left',
+      prUrl,
+      carried: took.map((p) => p.url),
+      ...(act.reason ? { reason: act.reason } : {}),
+      ...(act.ci ?? {}),
+    });
+  } finally {
+    // Fix rounds for red checks are over; its machine goes.
+    await worker.done?.(handle);
   }
-
-  const prUrl = await openedPr(config, result);
-  if (!prUrl) {
-    log(`deps: the agent carried none of them. Its report:\n${result.resultText.trim() || '_(no report)_'}`);
-    await handDropsToIssues(config, { url: null, text: result.resultText }, offered, conclude);
-    return record({ outcome: 'no-pr' });
-  }
-  // Labelled at once, so the review phase never takes it for someone else's.
-  await ensureLabel(repo, config.labels.depsPr, '0366D6', 'Dependabot PRs batched by the software factory, lockfile regenerated');
-  await addPrLabels(repo, prUrl, [config.labels.depsPr]);
-
-  // Dependabot has no write access, and a batch never carries an Actions bump (deps.ts).
-  const act = await mergeVerified(config, worker, handle, prUrl, await viewPrForReview(repo, prUrl), false).catch((err: Error): ReviewAct =>
-    ({ outcome: 'left', stamped: true, reason: err.message.slice(0, 500), note: `The factory could not merge it: ${err.message.slice(0, 500)}` }));
-  const numbers = carried((await viewPr(repo, prUrl)).body, offered.map((p) => p.number));
-  const took = offered.filter((p) => numbers.includes(p.number));
-  const dropped = offered.filter((p) => !numbers.includes(p.number));
-  const merged = act.outcome === 'merged';
-
-  if (!merged) {
-    await commentOnPr(repo, prUrl, factoryComment(`🏭 **Factory dependency batch — left for a human.** ${act.note ?? ''}`.trim())).catch(() => {});
-  }
-  await conclude(took, merged
-    ? `🏭 **Factory dependency batch — merged.** This bump landed in ${prUrl}, with the lockfile regenerated from it, on green CI; closing this one.`
-    : `🏭 **Factory dependency batch.** This bump is carried in ${prUrl}, which the factory could not merge and has left for a human.`, merged);
-  const issues = dropped.length ? await handDropsToIssues(config, { url: prUrl, text: (await viewPr(repo, prUrl)).body }, dropped, conclude) : [];
-
-  log(`deps: ${prUrl} carries ${took.length} of ${offered.length}; ${merged ? 'merged' : `left (${act.reason})`}${dropped.length ? `; dropped ${dropped.map((p, i) => `#${p.number} → ${issues[i] ?? 'left open'}`).join(', ')}` : ''}`);
-  return record({
-    outcome: merged ? 'merged' : 'left',
-    prUrl,
-    carried: took.map((p) => p.url),
-    ...(act.reason ? { reason: act.reason } : {}),
-    ...(act.ci ?? {}),
-  });
 }
 
 /**
@@ -1216,7 +1309,7 @@ async function handDropsToIssues(
  */
 export async function securityInputs(config: FactoryConfig): Promise<{ skip: string | null; offered: OfferedAlert[]; openPrs: string[] }> {
   const { enabled, minSeverity } = config.security;
-  const gate = securitySkipReason(enabled, config.worker.kind);
+  const gate = securitySkipReason(enabled, config.worker.kind, config.worker.containers);
   if (gate) return { skip: gate, offered: [], openPrs: [] };
   const repo = repoSlug(config);
   const unreadable: string[] = [];
@@ -1235,7 +1328,7 @@ export async function securityInputs(config: FactoryConfig): Promise<{ skip: str
   const open = prs.filter((p) => p.state === 'OPEN');
   const { offered, held } = securityQueue([...dependabot, ...codeScanning, ...advisories], prs, minSeverity);
   return {
-    skip: securitySkipReason(true, config.worker.kind, open, { offered: offered.length, held }),
+    skip: securitySkipReason(true, config.worker.kind, config.worker.containers, open, { offered: offered.length, held }),
     offered,
     openPrs: open.map((p) => p.url),
   };
@@ -1307,7 +1400,7 @@ async function annotateReports(repo: string, offered: OfferedAlert[], reply: Fix
  * the agent, so it runs even on a pass the fixer sits out.
  */
 export async function closeFixedReports(config: FactoryConfig, opts: { dryRun: boolean }): Promise<string[]> {
-  if (securitySkipReason(config.security.enabled, config.worker.kind)) return [];
+  if (securitySkipReason(config.security.enabled, config.worker.kind, config.worker.containers)) return [];
   const repo = repoSlug(config);
   const [accepted, prs] = await Promise.all([
     listAcceptedReports(repo).catch((err: Error) => {
@@ -1357,83 +1450,88 @@ export async function runSecurityPhase(ctx: FactoryContext, worker: CodingWorker
   const reports = keys.filter(isReport).length;
   log(`security: handing ${keys.length - reports} open alert(s) at ${config.security.minSeverity} or above and ${reports} reported advisor${reports === 1 ? 'y' : 'ies'} to a fixer`);
   const startedAt = new Date().toISOString();
-  // No credentials: upgrading a dependency runs a release nobody here has read.
-  const handle = await worker.start(securityPromptFor(config, inputs), { autoCreatePR: true, withholdCredentials: true, name: 'factory-security' });
+  // No credentials, and a machine of its own: upgrading a dependency runs a release nobody here has read.
+  const handle = await worker.start(securityPromptFor(config, inputs), { autoCreatePR: true, withholdCredentials: true, container: true, name: 'factory-security' });
+  try {
 
-  const record = async (over: Partial<SecurityRecord> & { outcome: SecurityRecord['outcome'] }): Promise<SecurityRecord> => {
-    const full: SecurityRecord = {
-      type: 'security',
-      offered: keys,
-      fixed: [],
-      dismissed: [],
-      prUrl: null,
-      worker: config.worker.kind,
-      model: config.worker.model,
-      agentId: handle.agentId,
-      startedAt,
-      finishedAt: new Date().toISOString(),
-      usage: (await worker.usage(handle.agentId)) ?? null,
-      durationMs: Date.now() - Date.parse(startedAt),
-      ...over,
+    const record = async (over: Partial<SecurityRecord> & { outcome: SecurityRecord['outcome'] }): Promise<SecurityRecord> => {
+      const full: SecurityRecord = {
+        type: 'security',
+        offered: keys,
+        fixed: [],
+        dismissed: [],
+        prUrl: null,
+        worker: config.worker.kind,
+        model: config.worker.model,
+        agentId: handle.agentId,
+        startedAt,
+        finishedAt: new Date().toISOString(),
+        usage: (await worker.usage(handle.agentId)) ?? null,
+        durationMs: Date.now() - Date.parse(startedAt),
+        ...over,
+      };
+      ctx.telemetry.append(full);
+      return full;
     };
-    ctx.telemetry.append(full);
-    return full;
-  };
 
-  const result = await worker.awaitResult(handle).catch((err: Error) => err);
-  if (result instanceof Error || result.status !== 'FINISHED') {
-    const reason = result instanceof Error ? result.message : `run ended with status ${result.status}: ${result.resultText.slice(0, 300) || worker.opaqueRunNote(handle)}`;
-    log(`security: fix failed — ${reason}`);
-    return record({ outcome: 'failed', failureReason: reason });
-  }
-
-  const reply = parseFixReply(result.resultText, keys);
-  const dismissed: string[] = [];
-  for (const { key, reason } of reply.dismiss.filter((d) => !isReport(d.key))) {
-    try {
-      await dismissCodeScanningAlert(repo, Number(key.split('#')[1]), `Factory security agent: ${reason}`);
-      dismissed.push(key);
-      log(`security: dismissed ${key} as a false positive — ${reason}`);
-    } catch (err) {
-      log(`security: could not dismiss ${key}: ${(err as Error).message}`);
+    const result = await worker.awaitResult(handle).catch((err: Error) => err);
+    if (result instanceof Error || result.status !== 'FINISHED') {
+      const reason = result instanceof Error ? result.message : `run ended with status ${result.status}: ${result.resultText.slice(0, 300) || worker.opaqueRunNote(handle)}`;
+      log(`security: fix failed — ${reason}`);
+      return record({ outcome: 'failed', failureReason: reason });
     }
-  }
 
-  const prUrl = await openedPr(config, result);
-  if (!prUrl) {
-    // The agent's word on the reports stands without a PR: a closed or
-    // re-rated report is a pass's worth of judgment, and this is where it lands.
-    const reports = await annotateReports(repo, offered, reply, [], null);
-    log(`security: no PR. The agent's report:\n${result.resultText.trim() || '_(no report)_'}`);
-    return record({ outcome: 'no-pr', dismissed: [...dismissed, ...reports.closed], rerated: reports.rerated });
+    const reply = parseFixReply(result.resultText, keys);
+    const dismissed: string[] = [];
+    for (const { key, reason } of reply.dismiss.filter((d) => !isReport(d.key))) {
+      try {
+        await dismissCodeScanningAlert(repo, Number(key.split('#')[1]), `Factory security agent: ${reason}`);
+        dismissed.push(key);
+        log(`security: dismissed ${key} as a false positive — ${reason}`);
+      } catch (err) {
+        log(`security: could not dismiss ${key}: ${(err as Error).message}`);
+      }
+    }
+
+    const prUrl = await openedPr(config, result);
+    if (!prUrl) {
+      // The agent's word on the reports stands without a PR: a closed or
+      // re-rated report is a pass's worth of judgment, and this is where it lands.
+      const reports = await annotateReports(repo, offered, reply, [], null);
+      log(`security: no PR. The agent's report:\n${result.resultText.trim() || '_(no report)_'}`);
+      return record({ outcome: 'no-pr', dismissed: [...dismissed, ...reports.closed], rerated: reports.rerated });
+    }
+    // Labelled and claimed before the CI wait: an unlabelled PR is one the review
+    // phase would take for someone else's, and an unclaimed alert is one the
+    // next pass would fix again.
+    await ensureLabel(repo, config.labels.securityPr, 'D93F0B', 'Fixes open security alerts; opened by the software factory');
+    await addPrLabels(repo, prUrl, [config.labels.securityPr]);
+    // An agent that forgot its ALERTS line still named them in its PR, most likely.
+    const rejected = reply.dismiss.map((d) => d.key);
+    const fixed = reply.fixed.length > 0
+      ? reply.fixed
+      : keysIn((await viewPr(repo, prUrl)).body).filter((k, i, all) => keys.includes(k) && !rejected.includes(k) && all.indexOf(k) === i);
+    const url = new Map(offered.map((o) => [alertKey(o.alert), o.alert.url]));
+    if (fixed.length > 0) {
+      const alerts = fixed.filter((k) => !isReport(k)).length;
+      const reports = fixed.length - alerts;
+      const then = [
+        alerts > 0 ? `GitHub closes ${alerts === 1 ? 'the alert' : 'each alert'} once this reaches the default branch; one still open a day after the merge is offered to the factory again.` : null,
+        reports > 0 ? `${reports === 1 ? 'The report is' : 'The reports are'} accepted as ${reports === 1 ? 'a draft advisory' : 'draft advisories'} naming this PR; the factory closes ${reports === 1 ? 'it' : 'them'} on its first pass after this merges.` : null,
+      ].filter(Boolean).join(' ');
+      await commentOnPr(repo, prUrl, factoryComment(`${securityStamp(fixed)}\n🏭 **Factory security fix** for ${fixed.map((k) => `[${k}](${url.get(k)})`).join(', ')}. ${then}`));
+    } else {
+      log(`security: ${prUrl} names none of the alerts it was handed; nothing is claimed, so the next pass is offered them again`);
+    }
+    const reportsWritten = await annotateReports(repo, offered, reply, fixed, prUrl);
+    dismissed.push(...reportsWritten.closed);
+    const ci = await greenChecks(config, worker, handle, prUrl);
+    log(`security: ${prUrl} fixes ${fixed.length} of ${offered.length} alert(s) (checks ${ci.checks}); it awaits a human${dismissed.length ? `; dismissed ${dismissed.join(' ')}` : ''}${reportsWritten.rerated.length ? `; re-rated ${reportsWritten.rerated.join(' ')}` : ''}.`);
+    return record({ outcome: 'pr-opened', prUrl, fixed, dismissed, rerated: reportsWritten.rerated, ...ci });
+  } finally {
+    // Fix rounds for red checks are over; its machine goes.
+    await worker.done?.(handle);
   }
-  // Labelled and claimed before the CI wait: an unlabelled PR is one the review
-  // phase would take for someone else's, and an unclaimed alert is one the
-  // next pass would fix again.
-  await ensureLabel(repo, config.labels.securityPr, 'D93F0B', 'Fixes open security alerts; opened by the software factory');
-  await addPrLabels(repo, prUrl, [config.labels.securityPr]);
-  // An agent that forgot its ALERTS line still named them in its PR, most likely.
-  const rejected = reply.dismiss.map((d) => d.key);
-  const fixed = reply.fixed.length > 0
-    ? reply.fixed
-    : keysIn((await viewPr(repo, prUrl)).body).filter((k, i, all) => keys.includes(k) && !rejected.includes(k) && all.indexOf(k) === i);
-  const url = new Map(offered.map((o) => [alertKey(o.alert), o.alert.url]));
-  if (fixed.length > 0) {
-    const alerts = fixed.filter((k) => !isReport(k)).length;
-    const reports = fixed.length - alerts;
-    const then = [
-      alerts > 0 ? `GitHub closes ${alerts === 1 ? 'the alert' : 'each alert'} once this reaches the default branch; one still open a day after the merge is offered to the factory again.` : null,
-      reports > 0 ? `${reports === 1 ? 'The report is' : 'The reports are'} accepted as ${reports === 1 ? 'a draft advisory' : 'draft advisories'} naming this PR; the factory closes ${reports === 1 ? 'it' : 'them'} on its first pass after this merges.` : null,
-    ].filter(Boolean).join(' ');
-    await commentOnPr(repo, prUrl, factoryComment(`${securityStamp(fixed)}\n🏭 **Factory security fix** for ${fixed.map((k) => `[${k}](${url.get(k)})`).join(', ')}. ${then}`));
-  } else {
-    log(`security: ${prUrl} names none of the alerts it was handed; nothing is claimed, so the next pass is offered them again`);
-  }
-  const reportsWritten = await annotateReports(repo, offered, reply, fixed, prUrl);
-  dismissed.push(...reportsWritten.closed);
-  const ci = await greenChecks(config, worker, handle, prUrl);
-  log(`security: ${prUrl} fixes ${fixed.length} of ${offered.length} alert(s) (checks ${ci.checks}); it awaits a human${dismissed.length ? `; dismissed ${dismissed.join(' ')}` : ''}${reportsWritten.rerated.length ? `; re-rated ${reportsWritten.rerated.join(' ')}` : ''}.`);
-  return record({ outcome: 'pr-opened', prUrl, fixed, dismissed, rerated: reportsWritten.rerated, ...ci });
 }
 
 export async function tick(opts: { dryRun: boolean }): Promise<void> {
@@ -1857,6 +1955,7 @@ const FIX_ROUNDS = 3;
 const MAX_HANDBACKS = 3;
 const HANDBACK_NOTE = 'Handed the failing checks back to the agent that opened this';
 const CONFLICT_NOTE = 'Handed the merge conflicts back to the agent that opened this';
+const MISSING_NOTE = 'Handed the missing required checks back to the agent that opened this';
 
 /**
  * Whether a PR's checks are red and settled: something failed and nothing is
@@ -1867,6 +1966,20 @@ export function redChecks(checks: PrCheck[]): PrCheck[] | null {
   if (checks.some((c) => c.bucket === 'pending')) return null;
   const failed = checks.filter((c) => c.bucket === 'fail');
   return failed.length > 0 ? failed : null;
+}
+
+/**
+ * The checks the base branch requires that never reported on a PR, once
+ * nothing is still running. GitHub blocks the merge on them as on a red one,
+ * but nothing shows red: on Oct 23 an agent's merge from main dropped a
+ * required job from the workflow, and the PR sat green and blocked for days.
+ * Null when there is nothing to hand back.
+ */
+export function missingChecks(checks: PrCheck[], required: string[]): string[] | null {
+  if (checks.some((c) => c.bucket === 'pending')) return null;
+  const reported = new Set(checks.map((c) => c.name));
+  const missing = required.filter((name) => !reported.has(name));
+  return missing.length > 0 ? missing : null;
 }
 
 /** How many ticks have already handed this PR back for one reason, from its own comments. */
@@ -1898,16 +2011,32 @@ async function handBackStuckPrs(ctx: FactoryContext, worker: CodingWorker): Prom
   // Every label the factory opens PRs under: the review phase's replacements
   // and the dependency batches included. A replacement that conflicted sat for
   // a day (#1997) because no phase owned it once its first merge was refused.
-  const open = (await Promise.all(factoryPrLabels(config).map((label) => listPrsByLabel(repo, label, 'open')))).flat();
+  // Only this runner's: another runner's PR is its own agents' to fix.
+  const labels = factoryPrLabels(config);
+  const byLabel = await Promise.all(labels.map((label) => listPrsByLabel(repo, label, 'open')));
+  const open = await ownPrs(byLabel.flat(), log);
+  // These carry code nobody here wrote — an outside PR's, new package
+  // releases — so a fresh agent on one gets a machine of its own, as the
+  // agent that opened it had.
+  const outsideLabels = [config.labels.reviewPr, config.labels.depsPr, config.labels.securityPr];
+  const outside = new Set(byLabel.flatMap((prs, i) => (outsideLabels.includes(labels[i]!) ? prs.map((p) => p.url) : [])));
+  const required = new Map<string, Promise<string[]>>();
   for (const pr of open) {
     try {
       const { mergeable, baseRefName } = await prMergeable(repo, pr.url);
       const stuck = mergeable === 'CONFLICTING'
         ? { note: CONFLICT_NOTE, what: `merge conflicts with ${baseRefName}`, prompt: resolveConflictsPrompt(pr.url, baseRefName) }
         : await (async () => {
-          const failed = redChecks(await prChecks(repo, pr.url));
-          const names = failed?.map((c) => c.name).join(', ');
-          return failed ? { note: HANDBACK_NOTE, what: `failing check(s) ${names}`, prompt: fixChecksPrompt(pr.url, failed) } : null;
+          const checks = await prChecks(repo, pr.url);
+          const failed = redChecks(checks);
+          if (failed) {
+            return { note: HANDBACK_NOTE, what: `failing check(s) ${failed.map((c) => c.name).join(', ')}`, prompt: fixChecksPrompt(pr.url, failed) };
+          }
+          if (!required.has(baseRefName)) required.set(baseRefName, requiredChecks(repo, baseRefName));
+          const missing = missingChecks(checks, await required.get(baseRefName)!);
+          return missing
+            ? { note: MISSING_NOTE, what: `required check(s) ${missing.join(', ')} never reported`, prompt: missingChecksPrompt(pr.url, baseRefName, missing) }
+            : null;
         })();
       if (!stuck) continue;
       const sent = handbacksSent(pr.comments, stuck.note);
@@ -1922,14 +2051,14 @@ async function handBackStuckPrs(ctx: FactoryContext, worker: CodingWorker): Prom
         // review's replacement, a dependency batch), or the run that did is
         // gone. A fresh agent on the PR's own branch, with no credentials,
         // fixes it instead — the work is in the PR, not in the lost context.
-        : await worker.start(stuck.prompt, { prUrl: pr.url, withholdCredentials: true, name: `factory-handback: #${pr.number}`.slice(0, 100) });
+        : await worker.start(stuck.prompt, { prUrl: pr.url, withholdCredentials: true, ...(outside.has(pr.url) ? { container: true } : {}), name: `factory-handback: #${pr.number}`.slice(0, 100) });
       await commentOnPr(repo, pr.url, factoryComment(`🏭 ${stuck.note} (${sent + 1} of ${MAX_HANDBACKS}): ${stuck.what}.`));
       log(`${pr.url}: handed ${stuck.what} back to ${agent ? 'its agent' : 'a fresh agent on its branch'}`);
       if (worker.runsEndWithProcess) {
         running.push(worker.awaitResult(handle).then(
           (r) => log(`${pr.url}: handback ended ${r.status}`),
           (err: Error) => log(`${pr.url}: handback failed — ${err.message}`),
-        ));
+        ).finally(() => worker.done?.(handle)));
       }
     } catch (err) {
       log(`${pr.url}: could not hand it back — ${(err as Error).message}`);
@@ -1952,13 +2081,13 @@ async function greenChecks(
   worker: CodingWorker,
   handle: RunHandle,
   prUrl: string,
-  opts: { expectChecks?: boolean } = {},
+  opts: { expectChecks?: boolean; fixRounds?: number } = {},
 ): Promise<{ fixRounds: number; checks: NonNullable<RunRecord['checks']> }> {
   const repo = repoSlug(config);
   const poll = { maxWaitMs: CHECKS_WAIT_MS, pollMs: config.worker.pollIntervalSeconds * 1000, graceMs: CHECKS_GRACE_MS, log };
   let fixRounds = 0;
   let { failed, settled } = await awaitPrChecks(repo, prUrl, { ...poll, expectChecks: opts.expectChecks === true });
-  while (failed.length > 0 && fixRounds < FIX_ROUNDS) {
+  while (failed.length > 0 && fixRounds < (opts.fixRounds ?? FIX_ROUNDS)) {
     fixRounds += 1;
     log(`${prUrl}: ${failed.length} failing check(s) — ${failed.map((c) => c.name).join(', ')}; handing them back to the implementer (round ${fixRounds})`);
     try {

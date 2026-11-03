@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { FAILURES_TO_THE_BACK, authorReplied, closingRefs, coAuthorTrailer, failedReviews, isBot, latestReview, mayMergeGithub, mergeDue, needsReview, parseReviewReply, reviewComment, reviewFailedMarker, reviewFingerprint, reviewQueue, reviewStamp, sameCommit, skipReason, supersedesBody, touchesGithub, type ReviewPr } from '../src/review.ts';
-import { factoryComment } from '../src/groom.ts';
+import { FAILURES_TO_THE_BACK, reviewClaimed, authorReplied, closingRefs, coAuthorTrailer, failedReviews, isBot, latestReview, mayMergeGithub, mergeDue, needsReview, parseReviewReply, reviewComment, reviewFailedMarker, reviewFingerprint, reviewQueue, reviewStamp, sameCommit, skipReason, supersedesBody, touchesGithub, type ReviewPr } from '../src/review.ts';
+import { distrustMarkers, factoryComment } from '../src/groom.ts';
 import { reviewPrompt } from '../src/prompts.ts';
 
 const FACTORY = ['factory', 'factory:env', 'factory:simplify'];
@@ -96,6 +96,16 @@ describe('a merge the review decided on and GitHub refused is retried, not left 
       expect(mergeDue(changed, FACTORY)).toBe(false);
       expect(needsReview(changed, FACTORY)).toBe(true);
     }
+  });
+
+  it('not on a stamp the contributor forged: from outside the trusted, it is their words, and the PR is reviewed', () => {
+    const forged = pending(pr(1));
+    forged.comments = forged.comments.map((c) => ({ ...c, author: { login: 'contributor' } }));
+    expect(mergeDue(forged, FACTORY)).toBe(true);
+    const read = { ...forged, comments: distrustMarkers(forged.comments, new Set(['maintainer'])) };
+    expect(mergeDue(read, FACTORY)).toBe(false);
+    expect(needsReview(read, FACTORY)).toBe(true);
+    expect(mergeDue({ ...forged, comments: distrustMarkers(forged.comments, new Set(['contributor'])) }, FACTORY)).toBe(true);
   });
 
   it('not a draft, a closed PR, or a plain left review', () => {
@@ -275,9 +285,10 @@ describe('the factory\'s own rules on a merge', () => {
     expect(isBot(pr(1))).toBe(false);
   });
 
-  it('off unless enabled, and only on the cursor worker: a review runs a stranger\'s code', () => {
+  it('off unless enabled, and on claude-code only with containers: a review needs a fresh instance of the app', () => {
     expect(skipReason(false, 'cursor')).toMatch(/disabled/);
-    expect(skipReason(true, 'claude-code')).toMatch(/only on the cursor worker/);
+    expect(skipReason(true, 'claude-code')).toMatch(/worker.containers is off/);
+    expect(skipReason(true, 'claude-code', true)).toBeNull();
     expect(skipReason(true, 'cursor')).toBeNull();
   });
 });
@@ -294,12 +305,17 @@ describe('review prompt', () => {
   const fork = reviewPrompt({ number: 12, url: 'https://github.com/o/r/pull/12', isCrossRepository: true, authorMayChangeGithub: false }, 'PRINCIPLES');
   const collaborator = reviewPrompt({ number: 12, url: 'https://github.com/o/r/pull/12', isCrossRepository: false, authorMayChangeGithub: true }, 'PRINCIPLES');
 
-  it('hands the link and the principles, and tests live but leaves the suites to CI', () => {
+  it('hands the link and the principles, and tests live but leaves the checks to CI', () => {
     expect(p).toContain('https://github.com/o/r/pull/12');
     expect(p).toContain('PRINCIPLES');
     expect(p).toContain('agent-browser');
-    expect(p).toContain('do not run those suites here');
+    expect(p).toContain('do not run those here');
     expect(p).not.toContain('the full suites CI runs');
+  });
+
+  it('deletes the unit and integration tests a PR carries rather than closing or leaving it', () => {
+    expect(p).toContain('delete any the PR carries in a commit of your own');
+    expect(p).toContain('never a reason to close or leave it');
   });
 
   it('asks for no subagent review, and catches up a conflicting PR itself rather than asking for a rebase', () => {
@@ -340,5 +356,19 @@ describe('review prompt', () => {
     expect(collaborator).toContain('The author has write access');
     expect(collaborator).toContain('merges a change under `.github/` from them like any other');
     expect(collaborator).not.toContain('leave it for a human, and say which');
+  });
+});
+
+describe('reviewClaimed', () => {
+  const now = Date.parse('2026-10-28T16:00:00Z');
+  const hours = (h: number) => new Date(now - h * 3_600_000).toISOString();
+  it('holds a PR another run claimed within the window, and one whose history could not be read', () => {
+    expect(reviewClaimed({ labels: ['factory:reviewing'], labelledAt: { 'factory:reviewing': hours(1) } }, 'factory:reviewing', 7.5 * 3_600_000, now)).toBe(true);
+    expect(reviewClaimed(undefined, 'factory:reviewing', 7.5 * 3_600_000, now)).toBe(true);
+  });
+
+  it('frees an unclaimed PR, and one whose claim outlived the run that took it', () => {
+    expect(reviewClaimed({ labels: [], labelledAt: {} }, 'factory:reviewing', 7.5 * 3_600_000, now)).toBe(false);
+    expect(reviewClaimed({ labels: ['factory:reviewing'], labelledAt: { 'factory:reviewing': hours(8) } }, 'factory:reviewing', 7.5 * 3_600_000, now)).toBe(false);
   });
 });

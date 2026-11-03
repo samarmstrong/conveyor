@@ -355,13 +355,15 @@ export function parseFixReply(text: string, offered: string[]): FixReply {
 export function skipReason(
   enabled: boolean,
   workerKind: string,
+  containers = false,
   openPrs: { url: string }[] = [],
   queue: { offered: number; held: number } = { offered: 1, held: 0 },
 ): string | null {
   if (!enabled) return 'security phase is disabled in factory.config.json';
   // Upgrading a dependency installs its new release, which runs code nobody
-  // here has read — the dependency batch's rule. Cursor's VM is thrown away.
-  if (workerKind !== 'cursor') return `security fixes run only on the cursor worker (worker.kind is ${workerKind}): upgrading a dependency runs its new release's code, and a local agent would run it on this machine`;
+  // here has read — the dependency batch's rule. Cursor's VM is thrown away,
+  // and so is a claude-code agent's container (`worker.containers`).
+  if (workerKind !== 'cursor' && !containers) return `security fixes on the ${workerKind} worker run in containers of their own, and worker.containers is off in factory.config.json: upgrading a dependency runs its new release's code, and a local agent would run it on this machine`;
   if (openPrs.length >= MAX_OPEN_PRS) return `${openPrs.length} security PRs are awaiting a merge (${openPrs.map((p) => p.url).join(', ')})`;
   if (queue.offered === 0) return queue.held > 0 ? `every open alert at the threshold and every report in triage is claimed by a factory PR (${queue.held})` : 'no open alerts at the threshold and no reports in triage';
   return null;
