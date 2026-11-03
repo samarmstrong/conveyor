@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { branchNameFor, headroomWait, hitUsageLimit, lostLogin, machineNote, modelArgs, parseResultJson, parseUsage, prUrlIn, retrying, sumUsage, usageFrom } from '../src/claudeCodeWorker.ts';
+import { branchNameFor, Gate, headroomWait, hitUsageLimit, lostLogin, machineNote, modelArgs, parseResultJson, parseUsage, prUrlIn, retrying, sumUsage, usageFrom } from '../src/claudeCodeWorker.ts';
 
 describe('modelArgs', () => {
   it('passes nothing when the config leaves the model to the runtime', () => {
@@ -34,6 +34,7 @@ describe('hitUsageLimit', () => {
 describe('lostLogin', () => {
   it('recognises a run that found no login', () => {
     expect(lostLogin('Not logged in · Please run /login')).toBe(true);
+    expect(lostLogin('OAuth token has expired. Please obtain a new token or refresh your existing token.')).toBe(true);
     expect(lostLogin('the login form test failed')).toBe(false);
   });
 });
@@ -176,6 +177,22 @@ describe('machineNote', () => {
     }
   });
 
+  it('tells a fork review its branch is pushed only as the task says, and the factory opens the PR', () => {
+    const note = machineNote({ repoUrl: 'https://github.com/o/r', ref: 'abc', branch: 'factory/review-1-abcdef12', pushOnly: true });
+    expect(note).toContain('factory/review-1-abcdef12');
+    expect(note).toContain('do not run `gh pr create`');
+    expect(note).not.toContain('The PR must exist');
+  });
+
+  it('tells an agent in a container the machine and its stack are its own, and what of the boot failed', () => {
+    const booted = machineNote({ repoUrl: 'https://github.com/o/r', ref: 'abc', branch: null, container: { boot: [] } });
+    expect(booted).toContain('container of your own');
+    expect(booted).toContain('already run its install and start');
+    expect(booted).not.toContain('factory-slot');
+    const failed = machineNote({ repoUrl: 'https://github.com/o/r', ref: 'abc', branch: null, container: { boot: ["the environment's `start` exited 1; its output is in ~/factory-start.log"] } });
+    expect(failed).toContain('~/factory-start.log');
+  });
+
   it('tells a read-only agent to change nothing', () => {
     const note = machineNote({ repoUrl: 'https://github.com/o/r', ref: null, branch: null });
     expect(note).toContain('pushes nothing');
@@ -205,5 +222,33 @@ describe('retrying', () => {
     await vi.runAllTimersAsync();
     await settled;
     expect(dead).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe('Gate', () => {
+  it('lets size holders in at once and the rest in order, each as a holder leaves', async () => {
+    const gate = new Gate(2);
+    const order: string[] = [];
+    await gate.enter();
+    expect(gate.tryEnter()).toBe(true);
+    expect(gate.tryEnter()).toBe(false);
+    const c = gate.enter().then(() => order.push('c'));
+    const d = gate.enter().then(() => order.push('d'));
+    expect(gate.waiting).toBe(2);
+
+    gate.leave();
+    await c;
+    expect(order).toEqual(['c']);
+    // The place passed to c: none is free for a newcomer to jump the queue.
+    expect(gate.tryEnter()).toBe(false);
+
+    gate.leave();
+    await d;
+    expect(order).toEqual(['c', 'd']);
+    gate.leave();
+    gate.leave();
+    expect(gate.tryEnter()).toBe(true);
+    expect(gate.tryEnter()).toBe(true);
+    expect(gate.tryEnter()).toBe(false);
   });
 });

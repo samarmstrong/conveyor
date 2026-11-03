@@ -20,8 +20,8 @@
 //     is not charged to the run's budget.
 //
 // This is not a sandbox. Implementers run code the factory wrote, which is the
-// same trust as before. Untrusted phases (reviews, deps, security) stay off this
-// worker.
+// same trust as before. Deps and security stay off this worker; a review runs
+// in a container of its own (container.ts).
 
 import { execFile } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';

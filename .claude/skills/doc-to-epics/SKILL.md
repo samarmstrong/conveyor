@@ -7,7 +7,7 @@ description: Turn a product or design document into factory inputs on the target
 
 The factory consumes **direction**, not documents. A direction is a capability that
 should become true and why. An epic is one direction, filed as an issue with the repo's
-epic label; the groomer (see `README.md`, *Epics: where direction comes from*) settles its
+epic label; the groomer (see `docs/how-it-works.md`, *Epics: where direction comes from*) settles its
 decisions against the code and writes the children. A revision of a document is a **reply
 on the epics it changes**, never a new epic and never a re-filed one.
 
@@ -35,7 +35,7 @@ It drafts first and posts only on confirmation; posting is outward-facing.
 
 ## Steps
 
-1. **Load the standard.** Read the principles file and the README's epic section. The
+1. **Load the standard.** Read the principles file and the epic section of `docs/how-it-works.md`. The
    groomer judges epics against these; the drafts should already speak their language:
    what becomes possible, decisions with defaults and reversal costs, where it pulls
    against which principle, what only a human may decide.

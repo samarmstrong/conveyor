@@ -24,7 +24,8 @@
     "blocker": "factory:blocker",
     "securityPr": "factory:security",
     "draft": "factory:draft",
-    "grooming": "factory:grooming"
+    "grooming": "factory:grooming",
+    "reviewing": "factory:reviewing"
   },
   "groom": {
     "maxPerTick": 5,

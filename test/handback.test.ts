@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { handbacksSent, redChecks } from '../src/controller.ts';
+import { handbacksSent, missingChecks, redChecks } from '../src/controller.ts';
 import { resolveConflictsPrompt } from '../src/prompts.ts';
 import { factoryComment } from '../src/groom.ts';
 import type { PrCheck } from '../src/github.ts';
@@ -11,6 +11,14 @@ describe('handing red PRs back', () => {
     expect(redChecks([check('lint', 'pass'), check('tests', 'fail')])?.map((c) => c.name)).toEqual(['tests']);
     expect(redChecks([check('tests', 'fail'), check('build', 'pending')])).toBeNull();
     expect(redChecks([check('tests', 'pass'), check('e2e', 'skipping')])).toBeNull();
+  });
+
+  it('hands back required checks that never reported, once nothing is still running', () => {
+    const required = ['lint', 'Helm Install Schema'];
+    expect(missingChecks([check('lint', 'pass'), check('tests', 'pass')], required)).toEqual(['Helm Install Schema']);
+    expect(missingChecks([check('lint', 'pending')], required)).toBeNull();
+    expect(missingChecks([check('lint', 'pass'), check('Helm Install Schema', 'skipping')], required)).toBeNull();
+    expect(missingChecks([check('lint', 'pass')], [])).toBeNull();
   });
 
   it('counts the ticks that already handed a PR back, from its own comments', () => {

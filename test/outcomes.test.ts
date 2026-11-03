@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { leakedClaims, pastGrace, spentVerdicts, unheldClaims, unrecordedOutcomes, withSource, type SourcedPr } from '../src/outcomes.ts';
+import { leakedClaims, pastGrace, spentVerdicts, unclaimedAnswers, unheldClaims, unrecordedOutcomes, withSource, type SourcedPr } from '../src/outcomes.ts';
 import type { LabelHistory, PrData } from '../src/github.ts';
 
 const url = (n: number) => `https://github.com/o/r/pull/${n}`;
@@ -9,7 +9,7 @@ function pr(n: number, state: PrData['state'], over: Partial<PrData> = {}): PrDa
     number: n, url: url(n), title: `pr ${n}`, state, isDraft: false, createdAt: '2026-01-01T00:00:00Z',
     mergedAt: state === 'MERGED' ? '2026-01-02T00:00:00Z' : null,
     closedAt: state === 'OPEN' ? null : '2026-01-02T00:00:00Z',
-    body: '', reviews: [], comments: [], headRefName: `b${n}`, additions: 1, deletions: 1, ...over,
+    body: '', reviews: [], comments: [], headRefName: `b${n}`, additions: 1, deletions: 1, author: { login: 'factory-bot' }, ...over,
   };
 }
 
@@ -39,6 +39,14 @@ describe('unrecordedOutcomes', () => {
   it('names a PR once even if GitHub lists it under two labels', () => {
     const rows = unrecordedOutcomes([...withSource([pr(1, 'MERGED')], 'implementer'), ...withSource([pr(1, 'MERGED')], 'simplify')], new Set());
     expect(rows).toHaveLength(1);
+  });
+});
+
+describe('unclaimedAnswers', () => {
+  it('names each issue an open PR answers that carries no claim, once', () => {
+    const prs = [{ body: 'Closes #1' }, { body: 'Closes #2' }, { body: 'Part of #2' }, { body: 'no link' }];
+    expect(unclaimedAnswers(prs, [{ number: 1 }])).toEqual([2]);
+    expect(unclaimedAnswers(prs, [{ number: 1 }, { number: 2 }])).toEqual([]);
   });
 });
 

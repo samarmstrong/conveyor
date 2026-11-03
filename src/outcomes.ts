@@ -126,6 +126,18 @@ export function unheldClaims(
 }
 
 /**
+ * Issues an open factory PR answers that carry no claim, whichever runner
+ * opened the PR. Picks skip only claimed issues, so one of these is built
+ * again: on Oct 26 another runner's open PR closed a groomed issue whose
+ * claim was gone, and the next tick here would have taken it.
+ */
+export function unclaimedAnswers(openPrs: { body: string }[], claimed: { number: number }[]): number[] {
+  const have = new Set(claimed.map((i) => i.number));
+  const answered = openPrs.map((pr) => linkedIssueNumber(pr.body)).filter((n): n is number => n !== null);
+  return [...new Set(answered)].filter((n) => !have.has(n));
+}
+
+/**
  * Of the claims nothing here holds, the ones nothing anywhere does. A claim
  * whose factory PR has closed since it was made is leaked: the pipeline that
  * made it got as far as its PR, and that PR is settled. Any other is leaked

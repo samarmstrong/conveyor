@@ -341,11 +341,22 @@ export function coAuthorTrailer(author: { login: string; name?: string }, userId
   return `Co-authored-by: ${author.name?.trim() || author.login} <${userId}+${author.login}@users.noreply.github.com>`;
 }
 
+/**
+ * Whether another run is reviewing this PR now: its claim label went on within
+ * `claimMs`. A PR whose history could not be read is held too, as a groom's
+ * issue is; an older claim is one whose run died holding it.
+ */
+export function reviewClaimed(history: { labels: string[]; labelledAt: Record<string, string> } | undefined, label: string, claimMs: number, now: number): boolean {
+  if (!history) return true;
+  return history.labels.includes(label) && now - Date.parse(history.labelledAt[label] ?? '') < claimMs;
+}
+
 /** Why the review phase is not running at all, or null if it may. */
-export function skipReason(enabled: boolean, workerKind: string): string | null {
+export function skipReason(enabled: boolean, workerKind: string, containers = false): string | null {
   if (!enabled) return 'review phase is disabled in factory.config.json';
-  // A review runs a stranger's code. Cursor's agents do that on a VM that is
-  // thrown away; claude-code's would do it on the machine running the tick.
-  if (workerKind !== 'cursor') return `reviews of outside PRs run only on the cursor worker (worker.kind is ${workerKind}): they execute the PR's code, and a local agent would execute it on this machine`;
+  // A review verifies a PR against a fresh instance of the app. Cursor's agents
+  // each have a VM for it; claude-code's need `worker.containers`, or they
+  // would queue behind the implementers for the one live stack on this machine.
+  if (workerKind !== 'cursor' && !containers) return `reviews of outside PRs on the ${workerKind} worker run in containers of their own, and worker.containers is off in factory.config.json`;
   return null;
 }

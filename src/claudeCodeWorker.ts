@@ -24,21 +24,32 @@
 // The machine itself is shared by every session the worker runs, and stands in
 // for the VM Cursor gives each agent: what a run starts is removed when it
 // ends, and the repo's live stack is run by one agent at a time. That lives in
-// localMachine.ts.
+// localMachine.ts. A run that needs a fresh instance of the app instead (a
+// review) gets a Docker container of its own, built from the target repo's
+// Cursor environment: container.ts.
+//
+// The machine runs only so many sessions at once (`maxSessions`), every phase's
+// together; the rest queue for a turn. On Oct 29 2026 eleven at once made `ls`
+// take four minutes, and runs that would have landed were cut off at the
+// budget. A run whose budget does run out gets one short last turn to publish
+// what it has, rather than leaving a finished change in a clone nobody reads.
 //
 // A subscription is metered in a five-hour window and a weekly one, shared
 // with whoever else uses the login. Every run waits for headroom before it
 // starts, and a run the limit cuts off mid-turn waits for the reset and
 // resumes its own session, so hitting the limit costs time, not the run.
 
-import { spawn, type ChildProcess } from 'node:child_process';
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 import { promisify } from 'node:util';
 
+import {
+  bootEnvironment, ensureImage, execArgs, execIn, homeOf, parseEnvironment, removeContainer, startContainer, sweepContainers,
+  type CursorEnvironment,
+} from './container.ts';
 import {
   findDocker, forgetSession, installBin, machinePaths, recordSession, releaseSlot, resetWait, sessionEnv, sweepDeadSessions, teardown, waitedMs,
   type MachinePaths,
@@ -72,6 +83,11 @@ const LOGIN_RESUME_NOTE = 'Your previous turn could not start because the login 
  *  the live stack test" with a finished fix that was never pushed. */
 const MAX_NO_PR_RESUMES = 1;
 const NO_PR_RESUME_NOTE = 'Your turn ended without a pull request. This session ends when your turn does, so nothing you were waiting for (a background command, a test run, a server) is still going, and nobody will answer a question. If the work is done or nearly so, finish it now: verify in the foreground, commit, push, open the PR, and end with its URL. If you concluded the issue should not be built as scoped, say so again in a few lines and stop.';
+/** The last turn a run gets when its budget runs out, and what it is told.
+ *  On Oct 29 2026 #3405's change was built and checked against the live API
+ *  when the budget cut it off retrying screenshots. */
+const WRAP_UP_MINUTES = 15;
+const WRAP_UP_NOTE = `Your time budget has run out, and this is your last turn: about ${WRAP_UP_MINUTES} minutes. Stop verifying. Anything you had running (servers, browsers, test runs) was stopped and the live slot released. Commit what you have and publish it as your task says: push, open the PR if your task opens one, and end as your task asks you to end. Say in the PR what you did not get to verify. If the work is not worth publishing as it stands, say why in a few lines and stop.`;
 /** Waits before each clone retry. On Oct 19 four grooms' clones failed in the
  *  same second (`RPC failed; curl 56`): GitHub dropped the connections, and a
  *  moment later would have served them. Each wait is jittered so clones that
@@ -101,6 +117,40 @@ export async function retrying<T>(
   }
 }
 
+/**
+ * At most `size` holders at once; the rest wait their turn in order. A turn
+ * that ends hands its place straight to the next in line.
+ */
+export class Gate {
+  private held = 0;
+  private readonly queue: (() => void)[] = [];
+
+  constructor(readonly size: number) {}
+
+  /** How many are in the queue. */
+  get waiting(): number {
+    return this.queue.length;
+  }
+
+  /** Takes a place if one is free now. */
+  tryEnter(): boolean {
+    if (this.held >= this.size) return false;
+    this.held++;
+    return true;
+  }
+
+  enter(): Promise<void> {
+    if (this.tryEnter()) return Promise.resolve();
+    return new Promise((res) => this.queue.push(res));
+  }
+
+  leave(): void {
+    const next = this.queue.shift();
+    if (next) next();
+    else this.held--;
+  }
+}
+
 export interface ClaudeCodeWorkerOptions {
   /** The `claude` executable. launchd and CI rarely have ~/.local/bin on PATH. */
   bin: string;
@@ -123,6 +173,10 @@ export interface ClaudeCodeWorkerOptions {
   /** Reads the subscription's usage; null when it cannot be read. Injectable
    *  for tests. */
   readUsage?: () => Promise<SubscriptionUsage | null>;
+  /** Whether a run started with `container` may have one (container.ts). */
+  containers?: boolean;
+  /** Sessions that run at once; the rest queue. Default: no limit. */
+  maxSessions?: number;
   log?: (msg: string) => void;
 }
 
@@ -155,7 +209,12 @@ interface Run {
   loginResumes: number;
   /** How many times it ended with no PR and was asked to finish. */
   noPrResumes: number;
+  /** Whether this is the last turn a run gets after its budget ran out. */
+  wrappedUp: boolean;
 }
+
+/** What a run hands the turn that resumes it. */
+type Carried = Pick<Run, 'priorMs' | 'limitResumes' | 'loginResumes' | 'noPrResumes' | 'wrappedUp'>;
 
 /** One agent: a clone and every run made in it. */
 interface Session {
@@ -168,6 +227,10 @@ interface Session {
   prUrl: string | null;
   /** The model this session runs, follow-ups included. */
   model: ModelSpec | null;
+  /** Whether a turn that ends with no PR is asked to finish one. */
+  expectsPr: boolean;
+  /** Where the session runs when it has a container of its own; null on this machine. */
+  container: { name: string; user: string; boot: string[] } | null;
   usage: TokenUsage[];
 }
 
@@ -265,9 +328,10 @@ export function hitUsageLimit(text: string): boolean {
   return /hit your (?:session |weekly |usage )?limit|usage limit reached/i.test(text);
 }
 
-/** Whether a failed run ended because Claude Code found no usable login. */
+/** Whether a failed run ended because Claude Code found no usable login: none
+ *  at all, or, in a container, the login's token handed in having expired. */
 export function lostLogin(text: string): boolean {
-  return /not logged in/i.test(text);
+  return /not logged in|oauth token has expired|please run \/login/i.test(text);
 }
 
 /**
@@ -370,15 +434,26 @@ export function branchNameFor(name: string | undefined, sessionId: string): stri
  * environment Cursor's agents got for free. Appended to the system prompt,
  * never to the factory's prompts, which stay worker-agnostic.
  */
-export function machineNote(opts: { repoUrl: string; ref: string | null; branch: string | null; prUrl?: string | null }): string {
-  return `${task(opts)}\n\n${SHARED_MACHINE}`;
+export function machineNote(opts: NoteOpts & { container?: { boot: string[] } | null }): string {
+  return `${task(opts)}\n\n${opts.container ? ownMachine(opts.container.boot) : SHARED_MACHINE}`;
 }
+
+type NoteOpts = { repoUrl: string; ref: string | null; branch: string | null; prUrl?: string | null; pushOnly?: boolean };
 
 /** The counterpart of an agent having a VM to itself. Said to every session:
  *  a groom may run the app to answer a question too. */
 const SHARED_MACHINE = 'This machine is shared with other agents working on this repo at the same time. Before you start the repo\'s own stack or a dev server (anything that takes the container names or ports its config fixes), run `factory-slot take`; it may wait, and tells you when to run it again. While you hold the slot, the stack is yours to run as shipped, with no override files or remapped ports. Run `factory-slot release` when your live checks are done: it stops the containers and servers you started, and the next agent is waiting for it. A throwaway container or server on a name and port of your own needs no slot. When your turn ends, everything you started is removed and the slot is released, so there is nothing to clean up and nothing will be left running for later.';
 
-function task(opts: { repoUrl: string; ref: string | null; branch: string | null; prUrl?: string | null }): string {
+/** What a session in a container of its own is told instead: the machine and
+ *  the app on it are its alone, as on a Cursor VM. */
+export function ownMachine(boot: string[]): string {
+  const booted = boot.length === 0
+    ? "The repo's environment has already run its install and start on it, as a cloud agent's machine does when it boots, so whatever its start brings up is running."
+    : `The repo's environment ran its install and start on it, as a cloud agent's machine does when it boots, but ${boot.join(', and ')}. Fix what you need of that yourself.`;
+  return `This machine is a fresh container of your own, with Docker inside it, and nothing else runs here: the repo's stack, its container names and its ports are yours to run as shipped. ${booted} It is removed when the factory is done with you, so leave nothing on it you need: what is not pushed is lost.`;
+}
+
+function task(opts: NoteOpts): string {
   // -p mode: the turn is the session. A test left running in the background
   // dies with it, and an agent that stops to wait for one loses its work.
   const foreground = 'This session ends when your turn ends: run every check in the foreground and wait for it, never stop to wait for something still running.';
@@ -388,6 +463,9 @@ function task(opts: { repoUrl: string; ref: string | null; branch: string | null
   const where = `You are working in a local clone of ${opts.repoUrl}${opts.ref ? ` checked out at ${opts.ref}` : ''}.`;
   if (!opts.branch) {
     return `${where} Read and run what you need, but this session makes no changes to the repository and pushes nothing. Put your report in your final message; it is read by a program, so end with the lines it asks for.`;
+  }
+  if (opts.pushOnly) {
+    return `${where} You are on branch \`${opts.branch}\`. Commit and push to it only as your task says; \`gh\` and \`git push\` are already authenticated. The factory opens any pull request from what you push, so do not run \`gh pr create\`. ${foreground}`;
   }
   return `${where} You are on branch \`${opts.branch}\`; stay on it. Commit your work there, push it to origin, and open the pull request with \`gh pr create\` — \`gh\` and \`git push\` are already authenticated. The PR must exist before you finish, and your final message must include its URL. Do not merge it. ${foreground}`;
 }
@@ -403,12 +481,19 @@ export class ClaudeCodeWorker implements CodingWorker {
   private usageUnreadableLogged = false;
   private readonly machine: MachinePaths;
   private readonly docker: string | null;
+  private claudeVersion: string | null = null;
+  /** The sessions this machine runs at once: a clone or container being set
+   *  up, or a turn in progress. Between turns a session holds no place. */
+  private readonly turns: Gate;
+  /** Read once per worker, at the pinned commit; with the image built from it. */
+  private containerSetup: Promise<{ env: CursorEnvironment; image: string }> | null = null;
 
   constructor(private readonly opts: ClaudeCodeWorkerOptions) {
     const m = opts.repoUrl.match(/github\.com[/:]([^/]+)\/([^/.]+)/);
     if (!m) throw new Error(`ClaudeCodeWorker: cannot read owner/repo from ${opts.repoUrl}`);
     this.owner = m[1]!;
     this.repoName = m[2]!;
+    this.turns = new Gate(opts.maxSessions ?? Infinity);
     mkdirSync(opts.workRoot, { recursive: true });
     this.sweepWorkspaces();
     this.machine = machinePaths(opts.machineRoot ?? resolve(opts.workRoot, '..', 'machine'));
@@ -416,7 +501,14 @@ export class ClaudeCodeWorker implements CodingWorker {
     installBin(this.machine, this.docker);
     // A tick that dies must not leave implementers running headless on the
     // machine with nobody to read their result.
-    const killAll = () => { for (const run of this.runs.values()) run.child.kill('SIGTERM'); };
+    const killAll = () => {
+      for (const run of this.runs.values()) run.child.kill('SIGTERM');
+      for (const session of this.sessions.values()) {
+        if (session.container && this.docker) {
+          try { execFileSync(this.docker, ['rm', '-f', '-v', session.container.name], { stdio: 'ignore' }); } catch { /* already gone */ }
+        }
+      }
+    };
     process.once('exit', killAll);
     for (const sig of ['SIGINT', 'SIGTERM'] as const) {
       process.once(sig, () => { killAll(); process.exit(sig === 'SIGINT' ? 130 : 143); });
@@ -435,8 +527,13 @@ export class ClaudeCodeWorker implements CodingWorker {
    *  that died left on the machine. */
   async check(): Promise<string> {
     await sweepDeadSessions(this.machine, this.docker, (msg) => this.log(msg));
+    if (this.docker) {
+      const swept = await sweepContainers(this.docker);
+      if (swept > 0) this.log(`removed ${swept} container(s) left by ticks that died`);
+    }
     try {
       const { stdout } = await execFileAsync(this.opts.bin, ['--version']);
+      this.claudeVersion = stdout.trim().split(/\s+/)[0] ?? null;
       return stdout.trim();
     } catch (err) {
       throw new Error(
@@ -480,7 +577,8 @@ export class ClaudeCodeWorker implements CodingWorker {
    */
   private async endTurn(sessionId: string): Promise<number> {
     const session = this.sessions.get(sessionId);
-    if (!session) return 0;
+    // A container is the session's alone, and it outlives the turn for follow-ups.
+    if (!session || session.container) return 0;
     const waited = waitedMs(this.machine, sessionId);
     const left = await teardown(this.ref(sessionId, session), this.docker).catch(() => ({ processes: 0, containers: 0 }));
     if (releaseSlot(this.machine, sessionId)) this.log(`claude session ${sessionId} ended holding the live slot; released it`);
@@ -489,58 +587,123 @@ export class ClaudeCodeWorker implements CodingWorker {
     return waited;
   }
 
-  private async git(args: string[], cwd?: string): Promise<string> {
+  private async git(args: string[], cwd?: string, container?: { name: string; user: string }): Promise<string> {
+    if (container) return execIn(this.docker!, container.name, container.user, cwd ?? null, ['git', ...args], { env: this.childEnv() });
     const { stdout } = await execFileAsync('git', args, { cwd, env: this.childEnv(), maxBuffer: 16 * 1024 * 1024 });
     return stdout.trim();
   }
 
   /** Clone at the pinned commit and, for a run that is expected to open a PR,
-   *  put the agent on a branch of its own. */
+   *  put the agent on a branch of its own. With `container`, all of it happens
+   *  in a fresh container, whose environment then boots. */
   private async prepareWorkspace(sessionId: string, opts: StartOptions): Promise<Session> {
-    const workspace = resolve(this.opts.workRoot, sessionId);
+    const container = opts.container ? await this.startSessionContainer(sessionId) : null;
+    const workspace = container ? `${homeOf(container.user)}/${this.repoName}` : resolve(this.opts.workRoot, sessionId);
+    const git = (args: string[], cwd?: string) => this.git(args, cwd, container ?? undefined);
     // The helper reads GH_TOKEN from the environment at push time, so the
-    // token is never written to disk.
-    const credential = this.opts.ghToken
-      ? ['-c', 'credential.helper=!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f']
-      : [];
-    await retrying(
-      () => this.git(['clone', '--quiet', ...credential, this.opts.repoUrl, workspace]),
-      CLONE_RETRY_DELAYS_MS,
-      (err, delayMs) => {
-        this.log(`clone for session ${sessionId} failed (${(err as Error).message.trim().split('\n').pop()}); retrying in ${Math.round(delayMs / 1000)}s`);
-        rmSync(workspace, { recursive: true, force: true });
-      },
-    );
-    if (this.opts.ghToken) {
-      await this.git(['config', 'credential.helper', '!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'], workspace);
+    // token is never written to disk. A container always has one.
+    const helper = '!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f';
+    const credential = this.opts.ghToken || container ? ['-c', `credential.helper=${helper}`] : [];
+    try {
+      await retrying(
+        () => git(['clone', '--quiet', ...credential, this.opts.repoUrl, workspace]),
+        CLONE_RETRY_DELAYS_MS,
+        async (err, delayMs) => {
+          this.log(`clone for session ${sessionId} failed (${(err as Error).message.trim().split('\n').pop()}); retrying in ${Math.round(delayMs / 1000)}s`);
+          if (container) await execIn(this.docker!, container.name, container.user, null, ['rm', '-rf', workspace]).catch(() => {});
+          else rmSync(workspace, { recursive: true, force: true });
+        },
+      );
+      if (credential.length > 0) await git(['config', 'credential.helper', helper], workspace);
+      // An existing PR's branch, for a handback; otherwise the pinned commit.
+      const prBranch = opts.prUrl ? await this.prBranch(opts.prUrl) : null;
+      if (prBranch) {
+        await git(['checkout', '--quiet', '-B', prBranch, `origin/${prBranch}`], workspace);
+      } else if (this.opts.startingRef) {
+        await git(['checkout', '--quiet', '--detach', this.opts.startingRef], workspace);
+      }
+      // Commits need an author; a CI runner has none configured.
+      const hasIdentity = await git(['config', 'user.email'], workspace).catch(() => '');
+      if (!hasIdentity) {
+        await git(['config', 'user.name', 'conveyor'], workspace);
+        await git(['config', 'user.email', 'conveyor@users.noreply.github.com'], workspace);
+      }
+      let branch: string | null = prBranch;
+      if (!branch && opts.autoCreatePR) {
+        branch = branchNameFor(opts.name, sessionId);
+        await git(['checkout', '--quiet', '-b', branch], workspace);
+      }
+      let boot: string[] = [];
+      if (container) {
+        this.log(`session ${sessionId}: booting the environment in container ${container.name}`);
+        boot = await bootEnvironment(this.docker!, container.name, (await this.containerSetup!).env, workspace, this.childEnv());
+        if (boot.length > 0) this.log(`session ${sessionId}: ${boot.join('; ')}`);
+      }
+      const session: Session = {
+        workspace,
+        name: opts.name,
+        branch,
+        prUrl: prBranch ? opts.prUrl! : null,
+        model: opts.model ?? this.opts.model,
+        expectsPr: branch !== null && !prBranch && !opts.pushOnly,
+        container: container ? { ...container, boot } : null,
+        usage: [],
+      };
+      this.sessions.set(sessionId, session);
+      return session;
+    } catch (err) {
+      if (container) await removeContainer(this.docker!, container.name);
+      throw err;
     }
-    // An existing PR's branch, for a handback; otherwise the pinned commit.
-    const prBranch = opts.prUrl ? await this.prBranch(opts.prUrl) : null;
-    if (prBranch) {
-      await this.git(['checkout', '--quiet', '-B', prBranch, `origin/${prBranch}`], workspace);
-    } else if (this.opts.startingRef) {
-      await this.git(['checkout', '--quiet', '--detach', this.opts.startingRef], workspace);
+  }
+
+  /**
+   * A container for one session, from the image the target repo's Cursor
+   * environment describes at the pinned commit. Its `gh` and `git push` use
+   * GH_TOKEN, or this machine's own `gh` login when that is unset.
+   */
+  private async startSessionContainer(sessionId: string): Promise<{ name: string; user: string }> {
+    if (!this.opts.containers || !this.docker) {
+      throw new Error(`ClaudeCodeWorker: this run needs a container of its own, and ${this.docker ? 'worker.containers is off' : 'this machine has no docker'}`);
     }
-    // Commits need an author; a CI runner has none configured.
-    const hasIdentity = await this.git(['config', 'user.email'], workspace).catch(() => '');
-    if (!hasIdentity) {
-      await this.git(['config', 'user.name', 'conveyor'], workspace);
-      await this.git(['config', 'user.email', 'conveyor@users.noreply.github.com'], workspace);
+    this.containerSetup ??= this.setUpContainers().catch((err: Error) => {
+      this.containerSetup = null;
+      throw err;
+    });
+    const { env, image } = await this.containerSetup;
+    const name = await startContainer(this.docker, image, sessionId, process.pid, ['GH_TOKEN'], { ...this.childEnv(), GH_TOKEN: await this.containerGhToken() });
+    this.log(`session ${sessionId}: started container ${name} from ${image}`);
+    return { name, user: env.user };
+  }
+
+  /** The target repo's Cursor environment at the pinned commit, and its image. */
+  private async setUpContainers(): Promise<{ env: CursorEnvironment; image: string }> {
+    const ref = this.opts.startingRef ? `?ref=${this.opts.startingRef}` : '';
+    const read = async (path: string) => (await execFileAsync('gh', ['api', '-H', 'Accept: application/vnd.github.raw', `repos/${this.repo}/contents/${path}${ref}`], { env: this.childEnv(), maxBuffer: 16 * 1024 * 1024 })).stdout;
+    let env: CursorEnvironment = { dockerfile: null, user: 'ubuntu', install: null, start: null };
+    try {
+      env = parseEnvironment(await read('.cursor/environment.json'));
+    } catch (err) {
+      this.log(`no Cursor environment read from ${this.repo} (${(err as Error).message.trim().split('\n').pop()}); containers run plain Ubuntu`);
     }
-    let branch: string | null = prBranch;
-    if (!branch && opts.autoCreatePR) {
-      branch = branchNameFor(opts.name, sessionId);
-      await this.git(['checkout', '--quiet', '-b', branch], workspace);
-    }
-    const session: Session = { workspace, name: opts.name, branch, prUrl: prBranch ? opts.prUrl! : null, model: opts.model ?? this.opts.model, usage: [] };
-    this.sessions.set(sessionId, session);
-    return session;
+    const dockerfile = env.dockerfile ? await read(env.dockerfile) : null;
+    const logFile = resolve(this.machine.root, 'image-build.log');
+    this.log(`containers: building or reusing the image for ${env.dockerfile ?? 'plain Ubuntu'} (log: ${logFile})`);
+    const image = await ensureImage(this.docker!, dockerfile, env.user, this.claudeVersion ?? 'latest', logFile);
+    this.log(`containers: image ${image}`);
+    return { env, image };
+  }
+
+  private async containerGhToken(): Promise<string> {
+    if (this.opts.ghToken) return this.opts.ghToken;
+    const { stdout } = await execFileAsync('gh', ['auth', 'token']);
+    return stdout.trim();
   }
 
   /**
    * The branch of a PR this worker may work on: one in the target repo itself.
-   * A fork's branch is a stranger's code, which this worker would run on the
-   * tick's own machine; reviews of those run on the cursor worker.
+   * A fork's branch cannot be pushed to: a fork PR's review starts on a session
+   * branch of its own instead (autoCreatePR), as on Cursor.
    */
   private async prBranch(prUrl: string): Promise<string> {
     const { stdout } = await execFileAsync('gh', ['pr', 'view', prUrl, '--json', 'headRefName,isCrossRepository'], { env: this.childEnv() });
@@ -596,7 +759,26 @@ export class ClaudeCodeWorker implements CodingWorker {
     }
   }
 
-  private launch(sessionId: string, session: Session, prompt: string, resume: boolean, carried?: Pick<Run, 'priorMs' | 'limitResumes' | 'loginResumes' | 'noPrResumes'>): RunHandle {
+  /** Waits for a place among the sessions this machine runs at once. */
+  private async enterTurn(name: string): Promise<void> {
+    if (this.turns.tryEnter()) return;
+    this.log(`${this.turns.size} claude sessions running, the machine's limit${this.turns.waiting ? `, and ${this.turns.waiting} waiting` : ''}; ${name} waits for one to end`);
+    return this.turns.enter();
+  }
+
+  /** `entered`: the caller already holds the session's place. */
+  private async launch(sessionId: string, session: Session, prompt: string, resume: boolean, carried?: Carried, entered = false): Promise<RunHandle> {
+    if (!entered) await this.enterTurn(session.name ?? sessionId);
+    try {
+      return await this.spawnTurn(sessionId, session, prompt, resume, carried);
+    } catch (err) {
+      this.turns.leave();
+      throw err;
+    }
+  }
+
+  /** Starts the turn; its place is given up when the process ends. */
+  private async spawnTurn(sessionId: string, session: Session, prompt: string, resume: boolean, carried?: Carried): Promise<RunHandle> {
     // The agent gets the MCP servers the target repo declares and no others:
     // not this machine's, whose owner's connectors are not the factory's to
     // hand out. The counterpart of Cursor's agents having only what the repo's
@@ -606,18 +788,31 @@ export class ClaudeCodeWorker implements CodingWorker {
       '-p',
       '--output-format', 'json',
       '--dangerously-skip-permissions',
-      '--strict-mcp-config', ...(existsSync(repoMcp) ? ['--mcp-config', repoMcp] : []),
+      '--strict-mcp-config', ...(!session.container && existsSync(repoMcp) ? ['--mcp-config', repoMcp] : []),
       resume ? '--resume' : '--session-id', sessionId,
-      '--append-system-prompt', machineNote({ repoUrl: this.opts.repoUrl, ref: this.opts.startingRef, branch: session.branch, prUrl: session.prUrl }),
+      '--append-system-prompt', machineNote({ repoUrl: this.opts.repoUrl, ref: this.opts.startingRef, branch: session.branch, prUrl: session.prUrl, pushOnly: !session.expectsPr, container: session.container }),
       ...modelArgs(session.model),
     ];
-    recordSession(this.machine, this.ref(sessionId, session), process.pid);
-    resetWait(this.machine, sessionId);
-    const child = spawn(this.opts.bin, args, {
-      cwd: session.workspace,
-      env: this.childEnv(sessionId),
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
+    let child: ChildProcess;
+    if (session.container) {
+      // The login is handed in fresh each run: a container cannot refresh it,
+      // and a run cut off by its expiry is resumed with the next one.
+      const token = process.env['CLAUDE_CODE_OAUTH_TOKEN'] ?? (await subscriptionToken());
+      if (!token) throw new Error('ClaudeCodeWorker: no Claude Code login to hand a container (set CLAUDE_CODE_OAUTH_TOKEN from `claude setup-token`)');
+      const { name, user } = session.container;
+      child = spawn(this.docker!, execArgs(name, user, session.workspace, ['CLAUDE_CODE_OAUTH_TOKEN'], ['claude', ...args], true), {
+        env: { ...process.env, CLAUDE_CODE_OAUTH_TOKEN: token },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } else {
+      recordSession(this.machine, this.ref(sessionId, session), process.pid);
+      resetWait(this.machine, sessionId);
+      child = spawn(this.opts.bin, args, {
+        cwd: session.workspace,
+        env: this.childEnv(sessionId),
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    }
     const run: Run = {
       sessionId,
       child,
@@ -628,11 +823,13 @@ export class ClaudeCodeWorker implements CodingWorker {
       limitResumes: carried?.limitResumes ?? 0,
       loginResumes: carried?.loginResumes ?? 0,
       noPrResumes: carried?.noPrResumes ?? 0,
+      wrappedUp: carried?.wrappedUp ?? false,
       exited: new Promise((res) => {
         child.once('error', (err) => { run.stderr.push(String(err.message)); res({ code: null, signal: null }); });
         child.once('close', (code, signal) => res({ code, signal }));
       }),
     };
+    void run.exited.then(() => this.turns.leave());
     child.stdout!.setEncoding('utf8').on('data', (d: string) => run.stdout.push(d));
     child.stderr!.setEncoding('utf8').on('data', (d: string) => run.stderr.push(d));
     // The prompt goes on stdin: no argv length limit, no shell quoting.
@@ -641,7 +838,7 @@ export class ClaudeCodeWorker implements CodingWorker {
 
     const runId = randomUUID();
     this.runs.set(runId, run);
-    this.log(`${resume ? 'follow-up on' : 'launched'} claude session ${sessionId} (pid ${child.pid ?? '?'}) in ${session.workspace}`);
+    this.log(`${resume ? 'follow-up on' : 'launched'} claude session ${sessionId} (pid ${child.pid ?? '?'}) in ${session.container ? `${session.container.name}:` : ''}${session.workspace}`);
     return { agentId: sessionId, runId };
   }
 
@@ -650,8 +847,16 @@ export class ClaudeCodeWorker implements CodingWorker {
     if (opts.startingRef) throw new Error('ClaudeCodeWorker starts every agent from the tick\'s pinned commit');
     await this.awaitHeadroom();
     const sessionId = randomUUID();
-    const session = await this.prepareWorkspace(sessionId, opts);
-    return this.launch(sessionId, session, prompt, false);
+    // Setting up takes its place too: a review container boots the whole app.
+    await this.enterTurn(opts.name ?? sessionId);
+    let session: Session;
+    try {
+      session = await this.prepareWorkspace(sessionId, opts);
+    } catch (err) {
+      this.turns.leave();
+      throw err;
+    }
+    return this.launch(sessionId, session, prompt, false, undefined, true);
   }
 
   async continueRun(handle: RunHandle, instruction: string): Promise<RunHandle> {
@@ -685,7 +890,18 @@ export class ClaudeCodeWorker implements CodingWorker {
 
     if (outcome === 'budget') {
       await this.cancel(handle);
-      throw new RunBudgetExceeded(handle.runId, this.opts.maxRunMinutes);
+      // A run that publishes code gets a last turn to publish what it has; its
+      // budget is that turn's length, and a turn with no PR is not asked again.
+      if (!session.branch || run.wrappedUp) throw new RunBudgetExceeded(handle.runId, this.opts.maxRunMinutes);
+      this.log(`claude session ${handle.agentId} ran out of its ${this.opts.maxRunMinutes}-minute budget; giving it ${WRAP_UP_MINUTES} minutes to publish what it has`);
+      const next = await this.launch(handle.agentId, session, WRAP_UP_NOTE, true, {
+        priorMs: (this.opts.maxRunMinutes - WRAP_UP_MINUTES) * 60_000,
+        limitResumes: run.limitResumes,
+        loginResumes: run.loginResumes,
+        noPrResumes: MAX_NO_PR_RESUMES,
+        wrappedUp: true,
+      });
+      return this.awaitResult(next);
     }
     const workedMs = Date.now() - run.startedAt - (await this.endTurn(handle.agentId));
 
@@ -704,24 +920,23 @@ export class ClaudeCodeWorker implements CodingWorker {
     }
     if (!succeeded && !outcome.signal && hitUsageLimit(resultText) && run.limitResumes < MAX_LIMIT_RESUMES) {
       this.log(`claude session ${handle.agentId} was cut off by the usage limit; resuming it once the limit resets`);
-      const carried = { priorMs: run.priorMs + workedMs, limitResumes: run.limitResumes + 1, loginResumes: run.loginResumes, noPrResumes: run.noPrResumes };
+      const carried = { priorMs: run.priorMs + workedMs, limitResumes: run.limitResumes + 1, loginResumes: run.loginResumes, noPrResumes: run.noPrResumes, wrappedUp: run.wrappedUp };
       await this.awaitHeadroom(true);
-      const next = this.launch(handle.agentId, session, LIMIT_RESUME_NOTE, true, carried);
+      const next = await this.launch(handle.agentId, session, LIMIT_RESUME_NOTE, true, carried);
       return this.awaitResult(next);
     }
     if (!succeeded && !outcome.signal && lostLogin(resultText) && run.loginResumes < MAX_LOGIN_RESUMES) {
       this.log(`claude session ${handle.agentId} found no login (a token refresh race); resuming it in ${LOGIN_RETRY_MS / 1000}s`);
-      const carried = { priorMs: run.priorMs + workedMs, limitResumes: run.limitResumes, loginResumes: run.loginResumes + 1, noPrResumes: run.noPrResumes };
+      const carried = { priorMs: run.priorMs + workedMs, limitResumes: run.limitResumes, loginResumes: run.loginResumes + 1, noPrResumes: run.noPrResumes, wrappedUp: run.wrappedUp };
       await sleep(LOGIN_RETRY_MS);
-      const next = this.launch(handle.agentId, session, LOGIN_RESUME_NOTE, true, carried);
+      const next = await this.launch(handle.agentId, session, LOGIN_RESUME_NOTE, true, carried);
       return this.awaitResult(next);
     }
 
-    const expectsPr = session.branch !== null && session.prUrl === null;
-    if (succeeded && expectsPr && !prUrlIn(resultText, this.opts.repoUrl) && run.noPrResumes < MAX_NO_PR_RESUMES && !(await this.branchHasPr(session.branch!))) {
+    if (succeeded && session.expectsPr && !prUrlIn(resultText, this.opts.repoUrl) && run.noPrResumes < MAX_NO_PR_RESUMES && !(await this.branchHasPr(session.branch!))) {
       this.log(`claude session ${handle.agentId} ended its turn with no PR; asking it once to finish`);
-      const carried = { priorMs: run.priorMs + workedMs, limitResumes: run.limitResumes, loginResumes: run.loginResumes, noPrResumes: run.noPrResumes + 1 };
-      const next = this.launch(handle.agentId, session, NO_PR_RESUME_NOTE, true, carried);
+      const carried = { priorMs: run.priorMs + workedMs, limitResumes: run.limitResumes, loginResumes: run.loginResumes, noPrResumes: run.noPrResumes + 1, wrappedUp: run.wrappedUp };
+      const next = await this.launch(handle.agentId, session, NO_PR_RESUME_NOTE, true, carried);
       return this.awaitResult(next);
     }
 
@@ -729,15 +944,24 @@ export class ClaudeCodeWorker implements CodingWorker {
     // read-only session stays detached at the pinned commit.
     let branch: string | undefined;
     if (session.branch) {
-      const head = await this.git(['rev-parse', '--abbrev-ref', 'HEAD'], session.workspace).catch(() => 'HEAD');
+      const head = await this.git(['rev-parse', '--abbrev-ref', 'HEAD'], session.workspace, session.container ?? undefined).catch(() => 'HEAD');
       branch = head === 'HEAD' ? session.branch : head;
+      // A push-only branch the agent never pushed is no branch at all: the
+      // factory would try to open a PR from it.
+      if (!session.expectsPr && !session.prUrl) {
+        const pushed = await this.git(['ls-remote', '--heads', 'origin', branch], session.workspace, session.container ?? undefined).catch(() => '');
+        if (!pushed) branch = undefined;
+      }
     }
 
     return {
       status: succeeded ? 'FINISHED' : outcome.signal ? 'CANCELLED' : 'ERROR',
       resultText,
       branch,
-      prUrl: prUrlIn(resultText, this.opts.repoUrl),
+      // Only an agent told to open a PR names it at the end. Any other links
+      // are PRs it read: a fork review that linked a duplicate had that PR
+      // taken for its replacement. A push-only branch's PR is found by branch.
+      prUrl: session.expectsPr || session.prUrl ? prUrlIn(resultText, this.opts.repoUrl) : undefined,
       durationMs: json?.duration_ms ?? Date.now() - run.startedAt,
     };
   }
@@ -753,17 +977,36 @@ export class ClaudeCodeWorker implements CodingWorker {
       return;
     }
     if (run.child.exitCode !== null || run.child.signalCode !== null) return;
-    // SIGINT ends the turn and lets Claude write its result; SIGKILL if it does not.
-    run.child.kill('SIGINT');
+    // SIGINT ends the turn and lets Claude write its result; SIGKILL if it does
+    // not. `docker exec` passes no signal on, so in a container it is sent there.
+    const container = this.sessions.get(handle.agentId)?.container;
+    const signal = (sig: 'INT' | 'KILL') => container
+      ? void execIn(this.docker!, container.name, container.user, null, ['pkill', `-${sig}`, '-x', 'claude']).catch(() => {})
+      : run.child.kill(`SIG${sig}`);
+    signal('INT');
     const grace = new Promise<void>((res) => setTimeout(res, KILL_GRACE_MS));
     await Promise.race([run.exited.then(() => undefined), grace]);
-    if (run.child.exitCode === null && run.child.signalCode === null) run.child.kill('SIGKILL');
+    if (run.child.exitCode === null && run.child.signalCode === null) {
+      signal('KILL');
+      if (container) run.child.kill('SIGKILL');
+    }
     await this.endTurn(handle.agentId);
   }
 
+  async done(handle: RunHandle): Promise<void> {
+    const container = this.sessions.get(handle.agentId)?.container;
+    if (!container) return;
+    await removeContainer(this.docker!, container.name);
+    this.sessions.delete(handle.agentId);
+    this.log(`removed container ${container.name} of claude session ${handle.agentId}`);
+  }
+
   opaqueRunNote(handle: RunHandle): string {
-    const ws = this.sessions.get(handle.agentId)?.workspace ?? '<workspace gone>';
-    return `Claude Code printed no result; read the transcript with \`claude --resume ${handle.agentId}\` from ${ws}`;
+    const session = this.sessions.get(handle.agentId);
+    if (session?.container) {
+      return `Claude Code printed no result; read the transcript with \`docker exec -it -u ${session.container.user} -w ${session.workspace} ${session.container.name} claude --resume ${handle.agentId}\` while the container lasts`;
+    }
+    return `Claude Code printed no result; read the transcript with \`claude --resume ${handle.agentId}\` from ${session?.workspace ?? '<workspace gone>'}`;
   }
 
   /** For logs and tests. */

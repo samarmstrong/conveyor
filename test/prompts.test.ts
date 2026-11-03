@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { environmentPrompt, fixChecksPrompt, groomEpicPrompt, groomPrompt, implementPrompt, selectPrompt, simplifyPrompt, trackEpicPrompt } from '../src/prompts.ts';
+import { environmentPrompt, fixChecksPrompt, forkFixChecksPrompt, groomEpicPrompt, groomPrompt, implementPrompt, selectPrompt, simplifyPrompt, trackEpicPrompt } from '../src/prompts.ts';
 import type { Task } from '../src/types.ts';
 
 const task: Task = {
@@ -96,14 +96,14 @@ describe('verification is the agent\'s call and always reported', () => {
     }
   });
 
-  // The implementer compares its screen with the design itself: one sentence,
-  // no independent judge, no region-by-region procedure.
-  it('implementer compares its screen with the design it was pointed at and lists what differs', () => {
+  // The implementer compares its screen with an image its issue carries: one
+  // sentence, no independent judge. The repo's own boards are no longer a target.
+  it('implementer compares its screen with an image in the issue, not with a board in the repo', () => {
     const p = implementPrompt(task);
-    expect(p).toContain('same width and state as your screen');
+    expect(p).toContain('shows the screen it wants as an image');
     expect(p).toContain('"it lines up" is not a finding');
+    expect(p).not.toMatch(/board in the repo/);
     expect(p).not.toMatch(/subagent that has not seen/);
-    expect(p).not.toMatch(/region by region/);
   });
 });
 
@@ -145,24 +145,22 @@ describe('epics', () => {
     expect(p).toMatch(/which decisions changed and which stand/);
   });
 
-  // Drift from the design accumulates between children, not inside one, so the
-  // epic's re-review is where the design is compared with the running app.
-  it('compares the design with the running app on a re-review before the next slice or done', () => {
-    expect(p).toContain('When the epic changes what a screen renders');
-    expect(p).toContain('before you write the next slice or call the epic done');
-    expect(p).toContain('open the design and the running app at the same state and width');
-    expect(p).toMatch(/Done means the screens match the design as far as the record meant them to/);
+  // The team keeps a design system, not screens to match, so no epic review
+  // compares the running app with a mockup.
+  it('never measures the screens against a design board', () => {
+    for (const q of [p, trackEpicPrompt(epic, 'principles', { maxRunMinutes: 90 })]) {
+      expect(q).not.toContain('open the design and the running app');
+      expect(q).not.toMatch(/screens match the design/);
+    }
   });
 
   // The factory's own bookkeeping brings a settled epic back once a slice
   // lands; that review tracks the record instead of settling it again.
-  it('a tracking re-review starts from the record, compares the touched screens, and writes the next slice', () => {
+  it('a tracking re-review starts from the record and writes the next slice', () => {
     const t = trackEpicPrompt(epic, 'principles', { maxRunMinutes: 90 });
     expect(t).toContain(epic.url);
     expect(t).toContain('it does not settle the direction again');
     expect(t).toContain('read their pull requests rather than the whole codebase again');
-    expect(t).toContain('for the screens the children since the record touched');
-    expect(t).toContain('Before you call the epic done, compare every screen it covers');
     expect(t).toContain('CLOSE: #<issue number>');
     expect(t).toContain('ratchets');
     expect(t).toContain('```child');
@@ -208,7 +206,7 @@ describe('simplification', () => {
 
   it('states the line-count rule and names the ways agents cheat it', () => {
     expect(p).toContain('remove more lines than it adds');
-    expect(p).toContain('no test asserting a deleted thing is gone');
+    expect(p).toContain('no helper to replace three plain lines');
     expect(p).toContain('about 90 minutes');
   });
 
@@ -260,9 +258,9 @@ describe('environment agent judges against CI and sees its own history', () => {
 // CI is the repo's own verdict. The factory relays a red check to the agent
 // that wrote the code rather than to a human, and the agent judges whose it is.
 describe('red checks go back to the implementer', () => {
-  it('working rules leave the full suites to CI, which hands a red check back', () => {
+  it('working rules ask for no unit or integration tests and leave the checks to CI, which hands a red check back', () => {
     const p = implementPrompt(task);
-    expect(p).toContain('the tests that cover what you changed');
+    expect(p).toContain('Do not write unit or integration tests');
     expect(p).toContain('hands a red check back to you');
   });
 
@@ -271,6 +269,17 @@ describe('red checks go back to the implementer', () => {
       { name: 'Unit Tests - Backend', link: 'https://github.com/o/r/actions/runs/1/job/2' },
     ]);
     expect(p).toBe('Fix the failing CI checks on https://github.com/o/r/pull/959:\n\n- Unit Tests - Backend: https://github.com/o/r/actions/runs/1/job/2');
+  });
+
+  // Nothing here pushes to a fork: its fix goes on the reviewer's session branch.
+  it('fork fix prompt sends the fix to the session branch, not the fork', () => {
+    const p = forkFixChecksPrompt('https://github.com/o/r/pull/959', 959, [
+      { name: 'Unit Tests - Backend', link: 'https://github.com/o/r/actions/runs/1/job/2' },
+    ]);
+    expect(p).toContain('- Unit Tests - Backend: https://github.com/o/r/actions/runs/1/job/2');
+    expect(p).toContain('git fetch origin pull/959/head && git checkout -B <the branch you started on> FETCH_HEAD');
+    expect(p).toContain('git push -u origin HEAD');
+    expect(p).toContain('push nothing');
   });
 });
 

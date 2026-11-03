@@ -10,9 +10,9 @@ import { resolve } from 'node:path';
 import type { CurrentRun } from './types.ts';
 import type { FactoryConfig } from './config.ts';
 import { repoSlug } from './config.ts';
-import { addIssueLabels, addPrLabels, closePr, commentOnIssue, commentOnPr, ensureLabel, labelHistory, linkedIssueNumber, listIssuesByLabel, listOpenPrs, listPrsByLabel, markPrReady, prMergeable, referenceState, removeIssueLabels, type PrData } from './github.ts';
+import { addIssueLabels, addPrLabels, closePr, commentOnIssue, commentOnPr, ensureLabel, ghLogin, labelHistory, linkedIssueNumber, listIssuesByLabel, listOpenPrs, listPrsByLabel, markPrReady, prMergeable, referenceState, removeIssueLabels, type PrData } from './github.ts';
 import { factoryComment } from './groom.ts';
-import { leakedClaims, orphanedPrs, pastGrace, phaseOrphans, spentVerdicts, unheldClaims, unrecordedOutcomes, withSource, type OrphanPhase } from './outcomes.ts';
+import { leakedClaims, orphanedPrs, pastGrace, phaseOrphans, spentVerdicts, unclaimedAnswers, unheldClaims, unrecordedOutcomes, withSource, type OrphanPhase } from './outcomes.ts';
 import { keysIn, securityStamp } from './security.ts';
 import type { Telemetry } from './telemetry.ts';
 
@@ -25,6 +25,24 @@ export function processAlive(pid: number): boolean {
     // EPERM: it exists, it is just not ours to signal.
     return (err as NodeJS.ErrnoException).code === 'EPERM';
   }
+}
+
+/**
+ * The PRs this runner opened, out of every PR carrying a factory label. Other
+ * people run their own factories on the same repo under the same labels; their
+ * PRs wait on them, not on us. From Oct 23 two other runners' open PRs held
+ * every slot here for three days. Unknown who we are, every PR counts.
+ */
+export async function ownPrs<T extends { author: { login: string }; url: string }>(prs: T[], log: (msg: string) => void): Promise<T[]> {
+  const me = await ghLogin().catch((err: Error) => {
+    log(`could not tell which PRs are this runner's (${err.message}); counting every one`);
+    return null;
+  });
+  if (me === null) return prs;
+  const own = prs.filter((pr) => pr.author.login === me);
+  const others = prs.filter((pr) => pr.author.login !== me);
+  if (others.length > 0) log(`not ours, so not counted: ${others.map((pr) => `${pr.url} (${pr.author.login})`).join(' ')}`);
+  return own;
 }
 
 export interface Capacity {
@@ -142,6 +160,12 @@ export class FactoryState {
     }
     const held = unheld.filter((n) => !leaked.includes(n));
     if (held.length) log(`holding ${held.map((n) => `#${n}`).join(' ')}: claimed with no PR yet, perhaps by a pipeline on another runner; released at ${this.config.staleRunHours}h`);
+    for (const issue of unclaimedAnswers(openPrs, claimed)) {
+      if ((await referenceState(this.repo, issue)) !== 'open') continue;
+      await addIssueLabels(this.repo, issue, [labels.issueInProgress])
+        .then(() => log(`claimed #${issue}: an open factory PR answers it, so it is not built again`))
+        .catch((err: Error) => log(`could not claim #${issue}: ${err.message}`));
+    }
 
     for (const { issue, prUrl } of spentVerdicts(closedPrs, history, labels)) {
       try {
@@ -251,7 +275,7 @@ export class FactoryState {
    */
   async capacity(log: (msg: string) => void): Promise<Capacity> {
     const limit = this.config.maxConcurrentJobs;
-    const openPrs = (await listPrsByLabel(this.repo, this.config.labels.factoryPr, 'open')).map((pr) => ({
+    const openPrs = (await ownPrs(await listPrsByLabel(this.repo, this.config.labels.factoryPr, 'open'), log)).map((pr) => ({
       url: pr.url,
       title: pr.title,
     }));

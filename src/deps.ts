@@ -143,11 +143,12 @@ Dependabot proposed ${pr.url} ("${pr.title}"). The factory's dependency batch${b
 }
 
 /** Why the dependency phase is not running at all, or null if it may. */
-export function skipReason(enabled: boolean, workerKind: string, openBatches: { url: string }[] = []): string | null {
+export function skipReason(enabled: boolean, workerKind: string, containers = false, openBatches: { url: string }[] = []): string | null {
   if (!enabled) return 'dependency phase is disabled in factory.config.json';
   // New releases of third-party packages are code nobody here wrote, and
-  // resolving and building them runs it. Cursor's VM is thrown away.
-  if (workerKind !== 'cursor') return `dependency batches run only on the cursor worker (worker.kind is ${workerKind}): installing new package versions runs their code, and a local agent would run it on this machine`;
+  // resolving and building them runs it. Cursor's VM is thrown away, and so is
+  // a claude-code agent's container (`worker.containers`); this machine is not.
+  if (workerKind !== 'cursor' && !containers) return `dependency batches on the ${workerKind} worker run in containers of their own, and worker.containers is off in factory.config.json: installing new package versions runs their code, and a local agent would run it on this machine`;
   if (openBatches.length > 0) return `a dependency batch is still open (${openBatches.map((p) => p.url).join(', ')})`;
   return null;
 }

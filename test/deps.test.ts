@@ -54,13 +54,14 @@ describe('what the batch carried', () => {
 
 describe('skipReason', () => {
   it('runs when enabled on the cursor worker with no batch open', () => {
-    expect(skipReason(true, 'cursor', [])).toBeNull();
+    expect(skipReason(true, 'cursor', false, [])).toBeNull();
   });
 
-  it('off unless asked for, cursor only, and one batch at a time', () => {
+  it('off unless asked for, in a VM or container only, and one batch at a time', () => {
     expect(skipReason(false, 'cursor')).toMatch(/disabled/);
-    expect(skipReason(true, 'claude-code')).toMatch(/cursor worker/);
-    expect(skipReason(true, 'cursor', [{ url: 'https://github.com/o/r/pull/5' }])).toContain('/pull/5');
+    expect(skipReason(true, 'claude-code')).toMatch(/worker.containers is off/);
+    expect(skipReason(true, 'claude-code', true, [])).toBeNull();
+    expect(skipReason(true, 'cursor', false, [{ url: 'https://github.com/o/r/pull/5' }])).toContain('/pull/5');
   });
 });
 
