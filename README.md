@@ -15,6 +15,34 @@ which says what that project is and what is worth building for it.
 
 <p align="center"><img src="docs/flow.svg" alt="Issues are groomed, implemented, and looped through CI until green, then merged by a person; environment, review, deps, security and simplify run alongside every tick." width="100%"></p>
 
+## Why another factory
+
+I built this because I didn't like the software factories I found. Most of them
+split the work into stages that each hand down a single thing: one agent writes the code,
+another reviews it, another analyses it for security, another tests it. It appears to be
+rigorous, but every handoff loses the context of the agent that actually wrote the
+change, and the agents downstream are often judging rather than fixing. I find this a regression
+compared to the way humans pilot agents, i.e. in a more continuous manner.
+
+You can think of this factory as resembling DevOps rather than like a QA department.
+The agent that writes the change also runs it. It starts the app, exercises the change
+through the real entry point, and fixes what doesn't work while it still has the code
+in its head. When CI goes red, the failures go back to that same agent, not to a reviewer.
+The agents aren't judges either. The review agent fixes an outside PR and
+merges it (rather than kicking back), and the security agent writes the fix.
+
+A few other opinions follow from that:
+
+- **Running it is the proof.** A live test of the actual behavior beats a spec or a
+  suite of tests the agent wrote to agree with itself. The factory doesn't keep unit
+  or integration tests at all.
+- **Trust the agent.** The prompts are short. An implementer gets the issue and,
+  more or less, "build this". It doesn't get a procedure. Models keep getting better
+  at deciding how to do the work, and a long prompt mostly gets in the way.
+- **Opinionated, not configurable.** There are knobs for cost and throughput, but not
+  for turning these opinions off. If you want a separate QA stage, this isn't the
+  factory for you.
+
 ## What it does
 
 - **Grooms the backlog.** Each issue is judged against `principles.md` before
