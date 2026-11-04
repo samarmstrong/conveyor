@@ -928,6 +928,13 @@ Two options; both just invoke the idempotent tick.
 
 **Local (launchd, macOS):** copy `contrib/com.example.conveyor.plist` to
 `~/Library/LaunchAgents/`, adjust paths, then `launchctl load` it.
+Each local tick first runs `contrib/update.sh`, which fast-forwards the checkout to the
+newest commit on the default branch whose CI passed, so every machine running the
+factory runs the same factory without anyone pulling. A checkout on another branch is
+left alone; one with commits of its own, or uncommitted changes in the way, keeps
+running what it has and raises an alert (logged, and handed to `contrib/alert.sh` if
+the deployment provides one). A change that needs a human on each machine (a plist, a
+new `.env` key) still needs saying.
 
 **GitHub Actions:** enable `.github/workflows/factory.yml` in your fork (daily
 cron + manual dispatch). Requires `FACTORY_GH_TOKEN` (a PAT with `repo` scope on

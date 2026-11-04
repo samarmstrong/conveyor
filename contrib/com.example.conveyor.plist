@@ -8,7 +8,7 @@
   <array>
     <string>/bin/zsh</string>
     <string>-lc</string>
-    <string>cd /path/to/conveyor &amp;&amp; npm run factory -- run >> telemetry/tick.log 2>&amp;1</string>
+    <string>cd /path/to/conveyor &amp;&amp; contrib/update.sh; npm run factory -- run >> telemetry/tick.log 2>&amp;1</string>
   </array>
   <key>StartCalendarInterval</key>
   <dict>
