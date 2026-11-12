@@ -19,17 +19,19 @@ concurrency:
   group: factory
   cancel-in-progress: false
 
-# The tick appends to the record on the `telemetry` branch; without this the
-# default GITHUB_TOKEN is read-only and the persist step fails after the work
-# is done. Main is never pushed to: the org ruleset requires a PR there, and
-# nothing the tick decides depends on the record anyway (see outcomes.ts).
-permissions:
-  contents: write
+# Read-only by default; the `tick` job asks for what it needs below.
+permissions: {}
 
 jobs:
   tick:
     runs-on: ubuntu-latest
     timeout-minutes: 350
+    # The tick appends to the record on the `telemetry` branch; without this the
+    # default GITHUB_TOKEN is read-only and the persist step fails after the work
+    # is done. Main is never pushed to: the org ruleset requires a PR there, and
+    # nothing the tick decides depends on the record anyway (see outcomes.ts).
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

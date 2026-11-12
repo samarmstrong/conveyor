@@ -217,7 +217,16 @@ export function loadConfig(root: string = projectRoot): FactoryConfig {
   }
   config.worker.agentEnv ??= [];
   config.worker.localMaxRunMinutes ??= config.worker.maxRunMinutes + 60;
-  config.worker.localMaxSessions ??= 4;
+  // One session at a time is what a laptop can carry beside its owner; a host
+  // sized for the factory asks
+  // for more through FACTORY_MAX_SESSIONS, the way FACTORY_MAX_JOBS does for jobs.
+  config.worker.localMaxSessions ??= 1;
+  const maxSessions = process.env['FACTORY_MAX_SESSIONS']?.trim();
+  if (maxSessions) {
+    const n = Number(maxSessions);
+    if (!Number.isInteger(n) || n < 1) throw new Error(`FACTORY_MAX_SESSIONS must be a positive integer, got ${JSON.stringify(maxSessions)}`);
+    config.worker.localMaxSessions = n;
+  }
   if (!Number.isInteger(config.worker.localMaxSessions) || config.worker.localMaxSessions < 1) {
     throw new Error(`worker.localMaxSessions must be a positive integer, got ${JSON.stringify(config.worker.localMaxSessions)}`);
   }

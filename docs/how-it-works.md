@@ -105,8 +105,8 @@ reconcile with GitHub: record the verdict on every factory PR that has closed, r
    and answers merge; the factory waits for CI on that
    commit, hands a red check back once, and squash-merges it
 → DEPENDENCY agent, alongside too (deps.enabled; on claude-code, only with worker.containers):
-   every open Dependabot PR not yet batched at its current head, except Actions bumps
-   under .github/, is carried onto one
+   every open Dependabot PR not yet batched at its current head, Actions bumps included,
+   is carried onto one
    branch with whatever the repo installs from regenerated, as one PR labelled
    factory:deps. CI runs once, on the versions that ship; the factory merges it on green
    under the review phase's rules and closes the Dependabot PRs it carried. One open at a time
@@ -703,8 +703,9 @@ why, and that includes one that turns CI red in the agent's one fix round.
 **The merge is the review phase's.** The factory merges the batch under exactly the rules
 in [Reviewing outside PRs](#reviewing-outside-prs): CI green after at most one fix round,
 `--match-head-commit`, no admin bypass, `.github/` only from an author with write access.
-That last rule is why Actions bumps are never offered to a batch — Dependabot has none —
-and they stay open for a human. Once it merges,
+The batch's author is the runner, which has write access, so Actions bumps ride in it like
+any other bump; the agent reads what an action's new version changed against how the
+workflows use it. Once it merges,
 the factory closes each Dependabot PR on a `Supersedes` line with a link, and comments on
 the ones it left. A batch it could not merge stays open for a human, and no new batch
 starts until it is gone.
@@ -844,7 +845,8 @@ to. Everything else — prompts, phases, labels, telemetry — is the same eithe
   later tick's handback is a fresh session on the PR's own branch (never a fork's). A run
   gets `worker.localMaxRunMinutes` (default `maxRunMinutes` + 60), since sessions share one
   machine; the groomer still sizes against `maxRunMinutes`. At most
-  `worker.localMaxSessions` sessions (default 4) run at once, every phase's together,
+  `worker.localMaxSessions` sessions (default 1, so a laptop stays usable beside a run;
+  `FACTORY_MAX_SESSIONS=<n>` raises it for one tick on a host sized for more) run at once, every phase's together,
   and the rest queue; time in the queue is not charged to a budget. A run that pushes
   code and runs out of budget is interrupted and resumed for one last 15-minute turn to
   commit, push, and open its PR with what it has, saying what it did not verify. Auth is
@@ -896,7 +898,9 @@ is Claude Code's estimate of what the run would have cost on the API, not a bill
 `worker.kind` for one tick; in Actions, the manual dispatch has a `worker` input that does
 the same. That is the move when the Cursor account is out of usage: nothing else changes.
 `FACTORY_MAX_JOBS=<n>` overrides `maxConcurrentJobs` the same way, for a local tick that
-spends the machine's subscription rather than the Cursor budget the committed value is sized for.
+spends the machine's subscription rather than the Cursor budget the committed value is sized for,
+and `FACTORY_MAX_SESSIONS=<n>` overrides `worker.localMaxSessions` for a host that can carry
+more than one Claude Code session at once.
 
 **Switching models.** `worker.models` holds alternatives to `worker.model` by name, and
 `FACTORY_MODEL=<name>` runs one of them for one tick; the manual dispatch's `model` input

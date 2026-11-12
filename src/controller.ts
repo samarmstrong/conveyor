@@ -99,7 +99,7 @@ export async function buildWorker(config: FactoryConfig): Promise<CodingWorker> 
         workRoot: resolve(projectRoot, config.telemetryDir, 'workspaces'),
         ghToken: githubTokenForAgents(),
         pauseAtUsagePercent: config.worker.pauseAtUsagePercent ?? null,
-        maxSessions: config.worker.localMaxSessions ?? 4,
+        maxSessions: config.worker.localMaxSessions ?? 1,
         containers: config.worker.containers === true,
       });
       const version = await worker.check();
@@ -1219,8 +1219,9 @@ export async function runDepsPhase(ctx: FactoryContext, worker: CodingWorker): P
     await ensureLabel(repo, config.labels.depsPr, '0366D6', 'Dependabot PRs batched by the software factory, lockfile regenerated');
     await addPrLabels(repo, prUrl, [config.labels.depsPr]);
 
-    // Dependabot has no write access, and a batch never carries an Actions bump (deps.ts).
-    const act = await mergeVerified(config, worker, handle, prUrl, await viewPrForReview(repo, prUrl), false).catch((err: Error): ReviewAct =>
+    // The batch is the runner's own PR, and the runner has write access, so an
+    // Actions bump it carries meets the `.github/` rule (deps.ts).
+    const act = await mergeVerified(config, worker, handle, prUrl, await viewPrForReview(repo, prUrl), true).catch((err: Error): ReviewAct =>
       ({ outcome: 'left', stamped: true, reason: err.message.slice(0, 500), note: `The factory could not merge it: ${err.message.slice(0, 500)}` }));
     const numbers = carried((await viewPr(repo, prUrl)).body, offered.map((p) => p.number));
     const took = offered.filter((p) => numbers.includes(p.number));
