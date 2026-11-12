@@ -50,6 +50,7 @@ import {
   bootEnvironment, ensureImage, execArgs, execIn, homeOf, parseEnvironment, removeContainer, startContainer, sweepContainers,
   type CursorEnvironment,
 } from './container.ts';
+import { ghCommitIdentity } from './github.ts';
 import {
   findDocker, forgetSession, installBin, machinePaths, recordSession, releaseSlot, resetWait, sessionEnv, sweepDeadSessions, teardown, waitedMs,
   type MachinePaths,
@@ -622,11 +623,12 @@ export class ClaudeCodeWorker implements CodingWorker {
       } else if (this.opts.startingRef) {
         await git(['checkout', '--quiet', '--detach', this.opts.startingRef], workspace);
       }
-      // Commits need an author; a CI runner has none configured.
+      // Commits need an author; a CI runner or a fresh VM has none configured.
       const hasIdentity = await git(['config', 'user.email'], workspace).catch(() => '');
       if (!hasIdentity) {
-        await git(['config', 'user.name', 'conveyor'], workspace);
-        await git(['config', 'user.email', 'conveyor@users.noreply.github.com'], workspace);
+        const me = await ghCommitIdentity();
+        await git(['config', 'user.name', me.name], workspace);
+        await git(['config', 'user.email', me.email], workspace);
       }
       let branch: string | null = prBranch;
       if (!branch && opts.autoCreatePR) {

@@ -24,9 +24,9 @@ describe('which Dependabot PRs a batch is offered', () => {
     expect(depsQueue([pr(3), pr(1), pr(2)]).map((p) => p.number)).toEqual([1, 2, 3]);
   });
 
-  it('not drafts, and not an Actions bump: the factory does not merge changes under .github/', () => {
+  it('not drafts; an Actions bump is offered like any other', () => {
     const actions = pr(2, { files: [{ path: '.github/workflows/ci.yml' }] });
-    expect(depsQueue([pr(1, { isDraft: true }), actions, pr(3)]).map((p) => p.number)).toEqual([3]);
+    expect(depsQueue([pr(1, { isDraft: true }), actions, pr(3)]).map((p) => p.number)).toEqual([2, 3]);
   });
 
   it('not one a batch concluded on, until its head moves', () => {
