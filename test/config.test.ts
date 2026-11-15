@@ -77,6 +77,27 @@ describe('model override', () => {
   });
 });
 
+describe('FACTORY_MAX_SESSIONS', () => {
+  const withMaxSessions = (value: string | undefined, fn: () => void) => {
+    const prev = process.env['FACTORY_MAX_SESSIONS'];
+    if (value === undefined) delete process.env['FACTORY_MAX_SESSIONS']; else process.env['FACTORY_MAX_SESSIONS'] = value;
+    try { fn(); } finally {
+      if (prev === undefined) delete process.env['FACTORY_MAX_SESSIONS']; else process.env['FACTORY_MAX_SESSIONS'] = prev;
+    }
+  };
+
+  it('overrides worker.localMaxSessions, and an empty one leaves it as configured', () => {
+    withMaxSessions('4', () => expect(loadConfig(configDir({ localMaxSessions: 2 })).worker.localMaxSessions).toBe(4));
+    withMaxSessions('', () => expect(loadConfig(configDir({ localMaxSessions: 2 })).worker.localMaxSessions).toBe(2));
+    withMaxSessions('', () => expect(loadConfig(configDir({})).worker.localMaxSessions).toBe(1));
+  });
+
+  it('refuses anything but a positive integer', () => {
+    withMaxSessions('0', () => expect(() => loadConfig(configDir({}))).toThrow(/positive integer/));
+    withMaxSessions('many', () => expect(() => loadConfig(configDir({}))).toThrow(/positive integer/));
+  });
+});
+
 describe('FACTORY_MAX_JOBS', () => {
   const withMaxJobs = (value: string | undefined, fn: () => void) => {
     const prev = process.env['FACTORY_MAX_JOBS'];
@@ -134,8 +155,8 @@ describe('local run budget', () => {
 });
 
 describe('local sessions', () => {
-  it('runs four claude-code sessions at once unless set, and refuses what is not a count', () => {
-    expect(loadConfig(configDir({})).worker.localMaxSessions).toBe(4);
+  it('runs one claude-code session at once unless set, and refuses what is not a count', () => {
+    expect(loadConfig(configDir({})).worker.localMaxSessions).toBe(1);
     expect(loadConfig(configDir({ localMaxSessions: 2 })).worker.localMaxSessions).toBe(2);
     expect(() => loadConfig(configDir({ localMaxSessions: 0 }))).toThrow(/localMaxSessions/);
   });

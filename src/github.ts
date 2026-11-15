@@ -67,14 +67,27 @@ let trusted: Promise<Set<string>> | undefined;
 /**
  * Who may write a factory marker: this runner's own account, and every member
  * of the org that owns the repo. Membership is read with the runner's token, so
- * private members count; a token that cannot see them trusts only itself.
+ * private members count. A repo a user owns has no org, and trusts only the runner.
+ *
+ * A token that reaches the org but cannot see its private members (a
+ * fine-grained PAT without the org's Members: read) gets back a list without
+ * the runner in it. Trusting only itself then is not safe, it is a loop: every
+ * other runner's groom comment reads as a human reply, so each runner's groom
+ * voids the others' and the same epics are groomed on every tick. So that
+ * stops the tick, saying what the token is missing.
  */
 function trustedAuthors(repo: string): Promise<Set<string>> {
   return (trusted ??= (async () => {
     const owner = repo.split('/')[0]!;
-    const members = await gh(['api', '--paginate', `orgs/${owner}/members`, '--jq', '.[].login'])
-      .then((out) => out.split('\n').filter(Boolean), () => []);
-    return new Set([await ghLogin(), ...members]);
+    const [me, members] = await Promise.all([
+      ghLogin(),
+      gh(['api', '--paginate', `orgs/${owner}/members`, '--jq', '.[].login'])
+        .then((out) => out.split('\n').filter(Boolean), () => null),
+    ]);
+    if (members && !members.includes(me)) {
+      throw new Error(`${me}'s token cannot see ${owner}'s members, so other runners' factory comments would read as human replies and their grooms would void each other's. Give the token the organization permission Members: read (or read:org), or run as a member of ${owner}.`);
+    }
+    return new Set([me, ...(members ?? [])]);
   })());
 }
 
@@ -187,11 +200,24 @@ export interface PrData {
 
 const PR_FIELDS = 'number,url,title,state,isDraft,createdAt,mergedAt,closedAt,body,reviews,comments,headRefName,additions,deletions,author';
 
-let login: Promise<string> | undefined;
+let user: Promise<{ login: string; id: number }> | undefined;
 
 /** The account this runner acts as on GitHub, and so the author of every PR it opens. */
 export function ghLogin(): Promise<string> {
-  return (login ??= ghJson<{ login: string }>(['api', 'user']).then((u) => u.login));
+  return (user ??= ghJson<{ login: string; id: number }>(['api', 'user'])).then((u) => u.login);
+}
+
+/**
+ * The author of the commits an agent makes where no git identity is set (a CI
+ * runner, a fresh VM, a container): the runner's own account, by its noreply
+ * address, so GitHub attributes each commit to the account that pushed it. An
+ * address that maps to no account makes a commit "unattributed", and the
+ * target repo's ruleset then holds any PR carrying one for an extra approval:
+ * the factory's fixes on someone else's PR could never merge.
+ */
+export async function ghCommitIdentity(): Promise<{ name: string; email: string }> {
+  const u = await (user ??= ghJson<{ login: string; id: number }>(['api', 'user']));
+  return { name: u.login, email: `${u.id}+${u.login}@users.noreply.github.com` };
 }
 
 export async function listPrsByLabel(repo: string, label: string, state: 'open' | 'closed' | 'merged' | 'all', limit = 50): Promise<PrData[]> {
