@@ -3,12 +3,15 @@
 // for humans operating the factory.
 
 import { admissible, buildContext, buildWorker, candidateTasks, depsInputs, environmentInputs, implementIssues, log, openSet, reviewInputs, runEnvironmentPhase, runDepsPhase, runGroomPhase, runReviewPhase, runSecurityPhase, runSelector, runSimplifyPhase, selectorCandidates, securityInputs, simplifySkip, tick } from './controller.ts';
-import { repoSlug } from './config.ts';
+import { loadConfig, loadPrinciples, loadVerification, projectRoot, repoSlug } from './config.ts';
 import { isEpic, isGroomed, needsGroom, verdict } from './groom.ts';
 import { defaultBranchHead } from './github.ts';
 import type { CodingWorker, CurrentRun } from './types.ts';
 
 const USAGE = `conveyor — thin software-factory control plane around Cursor cloud agents or local Claude Code
+
+Run it from the deployment: the directory holding factory.config.json and principles.md (or set
+FACTORY_ROOT). Where the engine is installed as a package, \`npx factory <command>\` is \`npm run factory -- <command>\`.
 
 Usage:
   npm run factory -- run [--dry-run]   One idempotent tick: groom part of the backlog, then hand the oldest groomed issue to a fresh implementer agent (a selector agent picks instead if selector.enabled).
@@ -38,6 +41,8 @@ Usage:
                                        the capacity gate and without a groom: naming an issue is the verdict that it is
                                        one PR, and the attempt tests it as it would a groom's. Skips any already claimed,
                                        so re-running resumes.
+  npm run factory -- check             Check this deployment's policy without touching GitHub: factory.config.json parses and
+                                       the principles and verification files it names exist. What a deployment's CI runs.
   npm run factory -- status            Show grooming progress, capacity, in-flight jobs, pending PRs, and recent telemetry.
   npm run factory -- abort [--issue N] Abandon stuck local pipelines — all of them, or just issue N's
                                        (cancels the runs if the worker still can).
@@ -46,6 +51,15 @@ Environment: FACTORY_WORKER=cursor|claude-code overrides worker.kind for one inv
              FACTORY_MODEL=<name> runs worker.models.<name> instead of worker.model.
              FACTORY_MAX_JOBS=<n> overrides maxConcurrentJobs.
 `;
+
+/** A deployment's own CI: its policy loads. Needs no token and reaches nothing. */
+function check(): void {
+  const config = loadConfig();
+  loadPrinciples(config);
+  loadVerification(config);
+  const verify = config.verify.file ? `, verification in ${config.verify.file}` : '';
+  console.log(`ok: ${projectRoot} builds ${repoSlug(config)} on the ${config.worker.kind} worker, principles in ${config.groom.principlesFile}${verify}`);
+}
 
 async function groom(opts: { limit?: number; force?: boolean }): Promise<void> {
   const ctx = buildContext();
@@ -319,6 +333,9 @@ async function main(): Promise<void> {
     case 'implement':
       if (issueNumbers.length === 0) throw new Error('implement needs --issue N[,M...]');
       await implementIssues(issueNumbers, parallel);
+      break;
+    case 'check':
+      check();
       break;
     case 'status':
       await status();

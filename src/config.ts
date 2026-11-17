@@ -1,8 +1,8 @@
 import { readFileSync, existsSync } from 'node:fs';
-import { resolve, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { resolve } from 'node:path';
 
 import type { ModelSpec, WorkerKind } from './types.ts';
+import type { Verification } from './prompts.ts';
 import { parseSeverity, type Severity } from './security.ts';
 
 /**
@@ -146,6 +146,13 @@ export interface FactoryConfig {
    *  agent, the lockfile regenerated, and the batch merged on green CI under
    *  the review phase's rules. Off by default: it merges. */
   deps: { enabled: boolean };
+  /** How the factory merges. `bypassApproval` (default false): when the base
+   *  branch requires an approving review and that review is the only thing
+   *  missing — no conflict, every check green, every required check reported —
+   *  merge with `--admin`. For a deployment whose runner is a person's account
+   *  standing in for a service account: it cannot approve the PRs it opened,
+   *  so without this they wait for someone else. Never past a check. */
+  merge: { bypassApproval: boolean };
   /** The security phase: each tick one agent takes the most severe group of
    *  the repo's open Dependabot and code scanning alerts, at or above
    *  `minSeverity`, that one PR can fix, and opens that PR — no issue, no
@@ -159,6 +166,20 @@ export interface FactoryConfig {
    * on one issue is the collision the factory exists to avoid.
    */
   assignedIssues: { groom: boolean; implement: boolean };
+  /** Whether the target repo keeps unit and integration tests. Off (the
+   *  default), agents write none, verify by running the change, and a review
+   *  deletes the ones an outside PR carries. On, for a repo whose tests are
+   *  part of what it ships, agents follow the repo's own practice and never
+   *  weaken or delete a test to make a change pass. */
+  tests: { keep: boolean };
+  /** How a change is shown to work in the target repo. `file` names a
+   *  Markdown file beside this config whose text every agent that vouches for
+   *  a change is handed in place of the built-in live test, and the
+   *  environment agent is handed as the list of what the machine must carry.
+   *  Unset (the default), the built-in stands: start the app, use it through
+   *  its real entry point, look at every screen a change touches. Set it for a
+   *  repo that is proved another way, or where a live run must never happen. */
+  verify: { file?: string };
   telemetryDir: string;
   staleRunHours: number;
   /** The throttle, in one number: how many jobs may exist at once, counting
@@ -167,7 +188,14 @@ export interface FactoryConfig {
   maxConcurrentJobs: number;
 }
 
-export const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+/**
+ * The deployment: the directory whose factory.config.json, principles, .env and
+ * telemetry this run uses. It is where the factory is run from, not where its
+ * code is, so one installed engine serves any number of deployments and a
+ * deployment holds no engine code. `npm run factory` in a checkout of the
+ * engine runs there, which makes that checkout a deployment too.
+ */
+export const projectRoot = resolve(process.env.FACTORY_ROOT || process.cwd());
 
 /** Minimal .env loader: KEY=value lines, no expansion. Never overrides real env. */
 export function loadDotEnv(root: string = projectRoot): void {
@@ -186,7 +214,7 @@ export function loadConfig(root: string = projectRoot): FactoryConfig {
   const path = resolve(root, 'factory.config.json');
   if (!existsSync(path)) {
     throw new Error(
-      `factory.config.json not found at ${path} — copy factory.config.example.json and point it at your target repo.`,
+      `factory.config.json not found at ${path} — run the factory from the directory that holds it (or set FACTORY_ROOT), or copy factory.config.example.json there and point it at your target repo.`,
     );
   }
   const config = JSON.parse(readFileSync(path, 'utf8')) as FactoryConfig;
@@ -271,6 +299,8 @@ export function loadConfig(root: string = projectRoot): FactoryConfig {
   config.review.enabled ??= false;
   config.deps ??= { enabled: false };
   config.deps.enabled ??= false;
+  config.merge ??= { bypassApproval: false };
+  config.merge.bypassApproval ??= false;
   config.review.maxPerTick ??= 3;
   if (!Number.isInteger(config.review.maxPerTick) || config.review.maxPerTick < 1) {
     throw new Error(`review.maxPerTick must be a positive integer, got ${JSON.stringify(config.review.maxPerTick)}`);
@@ -285,6 +315,9 @@ export function loadConfig(root: string = projectRoot): FactoryConfig {
   // that pulls this in without asking for it, so this defaults on rather than
   // preserving the old take-anything behavior.
   config.assignedIssues ??= { groom: true, implement: false };
+  config.tests ??= { keep: false };
+  config.tests.keep ??= false;
+  config.verify ??= {};
   config.environment ??= { enabled: true, maxPrsPerPass: 3 };
   config.environment.maxPrsPerPass ??= 3;
   if (!Number.isInteger(config.environment.maxPrsPerPass) || config.environment.maxPrsPerPass < 1) {
@@ -313,6 +346,17 @@ export function loadPrinciples(config: FactoryConfig, root: string = projectRoot
     throw new Error(`groom.principlesFile not found: ${path}`);
   }
   return readFileSync(path, 'utf8').trim();
+}
+
+/** What agents are told about proving a change in the target repo: whether it
+ *  keeps tests, and the deployment's own verification text where it has one. */
+export function loadVerification(config: FactoryConfig, root: string = projectRoot): Verification {
+  if (!config.verify.file) return { keepTests: config.tests.keep };
+  const path = resolve(root, config.verify.file);
+  if (!existsSync(path)) {
+    throw new Error(`verify.file not found: ${path}`);
+  }
+  return { keepTests: config.tests.keep, live: readFileSync(path, 'utf8').trim() };
 }
 
 export function repoSlug(config: FactoryConfig): string {

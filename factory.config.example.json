@@ -49,6 +49,9 @@
   "deps": {
     "enabled": false
   },
+  "merge": {
+    "bypassApproval": false
+  },
   "security": {
     "enabled": true,
     "minSeverity": "high"
@@ -56,6 +59,9 @@
   "assignedIssues": {
     "groom": true,
     "implement": false
+  },
+  "tests": {
+    "keep": false
   },
   "telemetryDir": "telemetry",
   "staleRunHours": 24,

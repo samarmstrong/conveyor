@@ -330,6 +330,12 @@ describe('review prompt', () => {
     expect(p).toContain('never a reason to close or leave it');
   });
 
+  it('in a repo that keeps its tests, a test the PR weakened is a defect to fix, and none is deleted', () => {
+    const kept = reviewPrompt({ number: 12, url: 'https://github.com/o/r/pull/12', isCrossRepository: false, authorMayChangeGithub: false }, 'PRINCIPLES', { keepTests: true });
+    expect(kept).toContain('a test the PR weakens, skips, or deletes to pass is a defect you fix');
+    expect(kept).not.toContain('delete any the PR carries');
+  });
+
   it('asks for no subagent review, and catches up a conflicting PR itself rather than asking for a rebase', () => {
     expect(p).not.toMatch(/subagent/);
     expect(p).toContain('merge the default branch into it — never rebase or force-push');
