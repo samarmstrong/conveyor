@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { environmentPrompt, fixChecksPrompt, forkFixChecksPrompt, groomEpicPrompt, groomPrompt, implementPrompt, selectPrompt, simplifyPrompt, trackEpicPrompt } from '../src/prompts.ts';
+import { environmentPrompt, fixChecksPrompt, forkFixChecksPrompt, groomEpicPrompt, groomPrompt, implementPrompt, reviewPrompt, securityPrompt, selectPrompt, simplifyPrompt, trackEpicPrompt } from '../src/prompts.ts';
 import type { Task } from '../src/types.ts';
 
 const task: Task = {
@@ -204,6 +204,17 @@ describe('simplification', () => {
     }
   });
 
+  it('a repo that keeps its tests says so to both, in place of the no-tests rule', () => {
+    const kept = [implementPrompt(task, [], { keepTests: true }), simplifyPrompt({ recentPrs: [], declinedPrs: [], budget: { maxRunMinutes: 90 }, verification: { keepTests: true } })];
+    for (const prompt of kept) {
+      expect(prompt).toContain('This repo keeps its tests and CI runs them');
+      expect(prompt).toContain('never weaken, skip, or delete a test to make a change pass');
+      expect(prompt).not.toContain('Do not write unit or integration tests');
+    }
+    expect(p).toContain('Do not write unit or integration tests');
+    expect(p).not.toContain('This repo keeps its tests');
+  });
+
   it('states the line-count rule and names the ways agents cheat it', () => {
     expect(p).toContain('remove more lines than it adds');
     expect(p).toContain('no helper to replace three plain lines');
@@ -305,5 +316,41 @@ describe('credentials reach agents as names, never values', () => {
     expect(environmentPrompt(prs, [], creds)).toContain('`MODEL_API_KEY`');
     expect(environmentPrompt(prs, [], creds)).toContain('skipped by the implementer, not the machine');
     expect(environmentPrompt(prs)).not.toContain('The factory does hold');
+  });
+});
+
+// A repo proved some other way than by starting an app says how in a file of
+// its own, and every agent that vouches for a change is handed that instead.
+describe('a deployment\'s own verification text', () => {
+  const live = 'Run `terraform validate`, then plan against empty local state. Never apply.';
+  const verification = { keepTests: true, live };
+  const budget = { maxRunMinutes: 90 };
+  const pr = { number: 12, url: 'https://github.com/o/r/pull/12', isCrossRepository: false, authorMayChangeGithub: false };
+  const vouching = {
+    implementer: implementPrompt(task, [], verification),
+    simplifier: simplifyPrompt({ recentPrs: [], declinedPrs: [], budget, verification }),
+    security: securityPrompt({ alerts: ['dependabot#1 lodash'], openPrs: [], budget, verification }),
+    reviewer: reviewPrompt(pr, 'PRINCIPLES', verification),
+  };
+
+  it.each(Object.entries(vouching))('replaces the built-in live test for the %s', (_who, prompt) => {
+    expect(prompt).toContain(`## Verifying a change in this repo\n\n${live}`);
+    expect(prompt).toContain('"Verifying a change in this repo" below says how');
+    expect(prompt).not.toContain('agent-browser');
+    expect(prompt).not.toContain('1920 pixels');
+  });
+
+  it('tells the environment agent what the machine must carry', () => {
+    const p = environmentPrompt(['https://github.com/o/r/pull/801'], [], [], verification);
+    expect(p).toContain('every tool the implementers\' verification instructions name');
+    expect(p).toContain(`## Verifying a change in this repo\n\n${live}`);
+    expect(p).not.toContain('agent-browser');
+  });
+
+  it('is absent where a deployment wrote none: the built-in stands, under no heading', () => {
+    for (const prompt of [implementPrompt(task), reviewPrompt(pr, 'PRINCIPLES'), environmentPrompt(['https://github.com/o/r/pull/801'])]) {
+      expect(prompt).toContain('agent-browser');
+      expect(prompt).not.toContain('Verifying a change in this repo');
+    }
   });
 });

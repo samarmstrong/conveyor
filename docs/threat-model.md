@@ -67,7 +67,9 @@ machine. Implementers still run on the host, which is why item 1 below holds.
 
 **Merges are narrow.** The controller merges only the commit the review agent named,
 and only while it is still the PR's head (`--match-head-commit`); only with CI green;
-never with `--admin`, so the repo's own rules hold; and a change under `.github/` only
+never with `--admin`, so the repo's own rules hold (a deployment that sets
+`merge.bypassApproval` lets it pass a missing approval, and only that: the checks still
+have to be green and all there); and a change under `.github/` only
 when its author has write access to the repo (`src/review.ts`, `mayMergeGithub`).
 Workflows run with the repo's secrets, so a fork contributor's workflow change is left
 for a person.

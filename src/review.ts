@@ -11,7 +11,8 @@
 //
 // The judgment is the agent's; what the controller enforces is mechanical:
 // it merges exactly the commit the agent says it verified, only once CI is
-// green on it, never past the repo's own rules (no admin bypass), and never a
+// green on it, never past the repo's own rules (no admin bypass, but for an
+// approval where `merge.bypassApproval` is set), and never a
 // PR that changes `.github/` — workflows run with the repo's secrets, and an
 // outside PR is exactly where a change to them should get a human's eyes.
 //

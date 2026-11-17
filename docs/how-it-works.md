@@ -636,7 +636,11 @@ a teammate's branch — is simpler: its agent works on the PR's own branch.
   runs held for a maintainer's approval are approved by the factory once the review passes,
   since that review is the maintainer's read the hold asks for;
 - within the repo's own rules — never `--admin`, though the factory's token could bypass
-  them, because a merge that needed to is one the repo said no to;
+  them, because a merge that needed to is one the repo said no to. Where the base branch
+  requires an approving review, the factory's merge verdict is that review: it approves
+  as the runner's account, then merges. The one bypass a deployment may ask for is
+  `merge.bypassApproval`, for the PRs the runner opened itself and so cannot approve
+  (see [Policy knobs](#policy-knobs));
 - and a PR that changes anything under `.github/` only when its author has write access to
   the repo. Workflows run with the repo's secrets, and the rule is about who could already
   run one: a collaborator with write can push a workflow to a branch and watch it run, so the
@@ -828,6 +832,46 @@ git remote add upstream https://github.com/samarmstrong/conveyor.git
 git pull upstream main     # engine updates; your policy files are untouched
 ```
 
+### A deployment that installs the engine
+
+A deployment need not carry the engine at all. It can be a small repo of its own that
+holds policy and installs the engine as a package, so a change to the engine arrives as
+a release and there is no fork to keep in step:
+
+```
+factory.config.json   target repo, worker, labels, which phases run   (from factory.config.example.json)
+principles.md         what is worth building in that repo             (from principles.example.md)
+verify.md             how a change is shown to work there, if the built-in live test does not fit
+package.json          names the engine
+.npmrc                package-lock=false
+.gitignore            node_modules/  telemetry/  .env
+```
+
+```json
+{ "name": "my-factory", "private": true,
+  "dependencies": { "conveyor": "github:samarmstrong/conveyor#release" } }
+```
+
+`release` is this repo's `main` at its newest commit whose CI passed, so a red push here
+never reaches a deployment. With no lockfile, `npm update` moves a deployment to the
+newest release. To hold a deployment on one engine instead, name a commit (`#<sha>`) in
+place of `release`.
+
+```bash
+npm install
+npx factory check          # the policy loads: config parses, the files it names exist
+npx factory run --dry-run  # what a tick would do
+```
+
+The engine reads everything from the directory it is run in (`FACTORY_ROOT` overrides):
+`factory.config.json`, the principles and verification files, `.env`, and `telemetry/`.
+`npx factory <command>` there is `npm run factory -- <command>` in a checkout. A
+deployment's CI can be one job that runs `npm install && npx factory check`.
+
+When the engine lacks something a deployment needs, the change goes into the engine
+as a setting with a default that leaves every other deployment as it was. An installed
+package cannot be edited in place, which is the point.
+
 ### Workers
 
 `worker.kind` in `factory.config.json` names the runtime the factory hands its prompts
@@ -993,6 +1037,31 @@ upstream repo.
   vetting an assigned issue costs its assignee nothing, implementing one collides with
   them. Set `implement` to `true` for a repo where assignment means triage rather than
   intent.
+- `factory.config.json` → `tests` — `keep` (default false): whether the target repo keeps
+  unit and integration tests. Off, agents write none, a change is verified by running it,
+  and a review deletes the ones an outside PR carries. On, for a repo whose tests are part
+  of what it ships, agents follow the repo's own practice (update the tests a change makes
+  wrong, add one where the repo would have one) and never weaken, skip, or delete a test
+  to make a change pass; a review fixes a PR that did.
+- `factory.config.json` → `verify` — `file` (default unset): a Markdown file beside the
+  config that says **how a change is shown to work in the target repo**. Unset, agents get
+  the built-in live test: start the app, use the change through its real entry point, and
+  look at every screen it touches in a browser. That suits an app with screens and an API.
+  A repo proved another way (infrastructure that is planned and never applied, a library
+  with nothing to start, a system where a live run touches something shared) writes its
+  own, and the implementer, the simplifier, the security fixer and the reviewer are handed
+  that text in place of the built-in, under a "Verifying a change in this repo" heading.
+  The environment agent is handed it too, as the list of tools the agents' machine has to
+  carry. Write it to the agent: what to run for which kind of change, and what must never
+  be run. Like `principles.md`, it is the deployment's policy and not the engine's.
+- `factory.config.json` → `merge` — `bypassApproval` (default false): when the base branch
+  requires an approving review and that review is the only thing missing (no conflict,
+  every check green, every required check reported), the factory merges with `--admin`.
+  For a deployment whose runner is a person's account standing in for a service account:
+  nobody approves their own PR, so a dependency batch, a review's replacement, or a
+  teammate's PR opened under that same account would wait for someone else. It never
+  passes a red, pending or missing check, and the factory reads the checks itself before
+  it uses it. Prefer a second account that can approve, when there is one.
 - `factory.config.json` → `environment` — `enabled` (default true) and `maxPrsPerPass`
   (default 3): the phase that owns the cloud-agent environment. Off means the factory
   keeps opening PRs whose verification was blocked and never fixes the cause.

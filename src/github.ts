@@ -539,22 +539,75 @@ export async function reopenPr(repo: string, prUrl: string): Promise<void> {
 }
 
 /**
- * Squash-merge exactly `sha`: GitHub refuses if the head has moved since. Never
- * `--admin` — the factory's token can bypass the repo's rules, and a merge that
- * needed to is one the repo's rules said no to.
+ * Squash-merge exactly `sha`: GitHub refuses if the head has moved since. Not
+ * with `--admin` — the factory's token can bypass the repo's rules, and a merge
+ * that needed to is one the repo's rules said no to. The one exception a
+ * deployment may ask for is `bypassApproval` (see approvalIsAllThatIsMissing).
  */
-export async function mergePr(repo: string, prUrl: string, sha: string, body?: string): Promise<void> {
+export async function mergePr(repo: string, prUrl: string, sha: string, body?: string, opts: { bypassApproval?: boolean } = {}): Promise<void> {
   // Reviews merge in parallel, and two landing in the same second race: GitHub
   // refuses the loser with "Base branch was modified" (#1415 lost to #1418).
   // Nothing about the PR is wrong, so the merge is simply tried again.
+  let approved = false;
+  let admin = false;
   for (let attempt = 1; ; attempt++) {
     try {
-      await gh(['pr', 'merge', prUrl, '-R', repo, '--squash', '--match-head-commit', sha, ...(body !== undefined ? ['--body', body] : [])]);
+      await gh(['pr', 'merge', prUrl, '-R', repo, '--squash', '--match-head-commit', sha, ...(admin ? ['--admin'] : []), ...(body !== undefined ? ['--body', body] : [])]);
       return;
     } catch (err) {
-      if (attempt >= 4 || !/base branch was modified/i.test((err as Error).message)) throw err;
+      const message = (err as Error).message;
+      if (!approved && /base branch policy prohibits/i.test(message)) {
+        approved = true;
+        if (await approveIfRequired(repo, prUrl, sha)) continue;
+        if (opts.bypassApproval && await approvalIsAllThatIsMissing(repo, prUrl)) {
+          admin = true;
+          continue;
+        }
+      }
+      if (attempt >= 4 || !/base branch was modified/i.test(message)) throw err;
       await new Promise((r) => setTimeout(r, attempt * 5_000));
     }
+  }
+}
+
+/**
+ * Where the base branch wants an approving review before a merge, the
+ * factory's decision to merge is that review: it approves as the runner's
+ * account and the merge is tried again. False when no review is what holds the
+ * PR, or when GitHub will not take one from this account — nobody approves
+ * their own PR, so one the factory opened itself still waits for a person.
+ */
+async function approveIfRequired(repo: string, prUrl: string, sha: string): Promise<boolean> {
+  try {
+    const { reviewDecision } = await ghJson<{ reviewDecision: string }>(['pr', 'view', prUrl, '-R', repo, '--json', 'reviewDecision']);
+    if (reviewDecision !== 'REVIEW_REQUIRED') return false;
+    await gh(['pr', 'review', prUrl, '-R', repo, '--approve', '--body', `🏭 Approving ${sha.slice(0, 12)}: the factory's review answered merge.`]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether an approving review is the only thing GitHub's rules still want of a
+ * PR: it has no conflict, every check that reported passed, and every check the
+ * base branch requires did report. Only then may a deployment that set
+ * `merge.bypassApproval` merge with `--admin`: where the runner's account
+ * stands in for a service account, nobody can give its own PRs the approval a
+ * branch asks for. `--admin` would pass a red or missing check too, so this
+ * reads the checks itself rather than trusting the caller to have.
+ */
+export async function approvalIsAllThatIsMissing(repo: string, prUrl: string): Promise<boolean> {
+  try {
+    const pr = await ghJson<{ reviewDecision: string; mergeable: string; baseRefName: string }>(
+      ['pr', 'view', prUrl, '-R', repo, '--json', 'reviewDecision,mergeable,baseRefName']);
+    if (pr.reviewDecision !== 'REVIEW_REQUIRED' || pr.mergeable !== 'MERGEABLE') return false;
+    const checks = await prChecks(repo, prUrl);
+    if (checks.some((c) => c.bucket !== 'pass' && c.bucket !== 'skipping')) return false;
+    const reported = new Set(checks.map((c) => c.name));
+    return (await requiredChecks(repo, pr.baseRefName)).every((name) => reported.has(name));
+  } catch {
+    return false;
   }
 }
 

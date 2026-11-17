@@ -30,7 +30,7 @@
 
 import { resolve } from 'node:path';
 import type { CodingWorker, CurrentRun, DepsRecord, EnvRecord, GroomRecord, ReviewRecord, RunHandle, RunRecord, RunResult, SecurityRecord, SimplifyRecord, Task, TokenUsage } from './types.ts';
-import { agentCredentials, claudeBin, epicGroomModel, githubTokenForAgents, reviewModel, loadConfig, loadDotEnv, loadPrinciples, projectRoot, repoSlug, requireCursorApiKey, type FactoryConfig } from './config.ts';
+import { agentCredentials, claudeBin, epicGroomModel, githubTokenForAgents, reviewModel, loadConfig, loadDotEnv, loadPrinciples, loadVerification, projectRoot, repoSlug, requireCursorApiKey, type FactoryConfig } from './config.ts';
 import { RunBudgetExceeded } from './types.ts';
 import { CursorWorker } from './worker.ts';
 import { ClaudeCodeWorker } from './claudeCodeWorker.ts';
@@ -425,7 +425,7 @@ export async function runEnvironmentPhase(
   log(`environment: reading ${prUrls.length} factory PR(s) for verification the agents could not run: ${prUrls.join(' ')}`);
 
   const startedAt = new Date().toISOString();
-  const handle = await worker.start(environmentPrompt(prUrls, verdicts, agentCredentials(config).present), {
+  const handle = await worker.start(environmentPrompt(prUrls, verdicts, agentCredentials(config).present, loadVerification(config)), {
     autoCreatePR: true,
     name: 'factory-env',
   });
@@ -565,6 +565,7 @@ async function simplifyPromptFor(ctx: FactoryContext): Promise<string> {
     recentPrs: recentlyMergedFactoryPrs(merged, 5),
     declinedPrs: declinedSimplifications(closed),
     budget: ctx.config.worker,
+    verification: loadVerification(ctx.config),
   });
 }
 
@@ -741,7 +742,8 @@ export async function runReviewPhase(ctx: FactoryContext, worker: CodingWorker, 
  * a race with another merge, CI not finished, no CI yet. The PR is unchanged
  * since the review (`mergeDue`), so its head is the commit the agent verified,
  * and the rules are the ones `mergeVerified` holds every merge to: `.github/`
- * only from an author who could run it anyway, green checks, no admin bypass.
+ * only from an author who could run it anyway, green checks, no admin bypass
+ * (but for an approval, where `merge.bypassApproval` is set).
  * Checks still running, or GitHub refusing, leaves the stamp as it is, and the
  * next tick tries again. A conflict or red checks on the PR itself are not
  * waited out — nothing would change them — so the stamp is superseded by one
@@ -808,7 +810,7 @@ async function retryMerge(config: FactoryConfig, pr: ReviewPr): Promise<void> {
   }
   try {
     const body = replacement ? supersedesBody(pr, coAuthorTrailer(pr.author, await userId(pr.author.login))) : undefined;
-    await mergePr(repo, target, view.headRefOid, body);
+    await mergePr(repo, target, view.headRefOid, body, config.merge);
   } catch (err) {
     log(`review: #${pr.number} is pending a merge${replacement ? ` of #${replacement}` : ''}; GitHub refused again, so the next tick tries again — ${(err as Error).message.slice(0, 300)}`);
     return;
@@ -843,7 +845,7 @@ async function reviewOne(ctx: FactoryContext, worker: CodingWorker, pr: ReviewPr
   // checked out by Cursor or pushed to, so its agent starts on the default
   // branch, and a session branch it commits to becomes the replacement PR.
   // It verifies against a fresh instance of the app, on a machine of its own.
-  const handle = await worker.start(reviewPrompt({ ...pr, authorMayChangeGithub }, principles), {
+  const handle = await worker.start(reviewPrompt({ ...pr, authorMayChangeGithub }, principles, loadVerification(config)), {
     ...(pr.isCrossRepository ? { autoCreatePR: true, pushOnly: true } : { prUrl: pr.url }),
     withholdCredentials: true,
     container: true,
@@ -944,7 +946,8 @@ type ReviewAct = { outcome: ReviewOutcome; stamped: boolean; mergePending?: bool
  * a fork PR that needed fixes, the replacement its session branch became —
  * a change under `.github/` comes only from an author with write access, CI
  * is green on it after at most one fix round by the same agent, and GitHub's
- * own rules allow the merge without an admin bypass.
+ * own rules allow the merge without an admin bypass (but for an approval,
+ * where `merge.bypassApproval` is set).
  */
 async function actOnReview(
   config: FactoryConfig,
@@ -1125,7 +1128,7 @@ async function mergeVerified(
   if (ci.checks === 'unsettled') return { outcome: 'left', stamped: true, mergePending: true, reason: 'checks unsettled', note: `The factory will merge it, but CI had not finished within ${CHECKS_WAIT_MS / 60_000} minutes.`, ci };
 
   try {
-    await mergePr(repo, target, after.headRefOid, opts.body);
+    await mergePr(repo, target, after.headRefOid, opts.body, config.merge);
   } catch (err) {
     const msg = (err as Error).message.slice(0, 500);
     return { outcome: 'left', stamped: true, mergePending: true, reason: `merge refused: ${msg}`, note: `The factory will merge it, but GitHub refused this time: ${msg}`, ci };
@@ -1343,6 +1346,7 @@ function securityPromptFor(config: FactoryConfig, inputs: { offered: OfferedAler
     advisories: inputs.offered.filter((o) => o.alert.kind === 'advisory').map(offeredLine),
     openPrs: inputs.openPrs,
     budget: { maxRunMinutes: config.worker.maxRunMinutes },
+    verification: loadVerification(config),
   });
 }
 
@@ -1817,7 +1821,7 @@ async function dryRun(ctx: FactoryContext, allCandidates: Task[]): Promise<void>
   } else {
     const prUrls = unread.fresh.slice(0, config.environment.maxPrsPerPass);
     log(`environment: would read ${prUrls.length} of ${unread.fresh.length} unread factory PR(s)${unread.stale.length ? `, ignoring ${unread.stale.length} written before the environment changed` : ''}. Its prompt would be:`);
-    console.log(`\n${environmentPrompt(prUrls, verdicts, agentCredentials(ctx.config).present)}\n`);
+    console.log(`\n${environmentPrompt(prUrls, verdicts, agentCredentials(ctx.config).present, loadVerification(ctx.config))}\n`);
   }
 
   const review = await reviewInputs(config);
@@ -1828,7 +1832,7 @@ async function dryRun(ctx: FactoryContext, allCandidates: Task[]): Promise<void>
     const due = [...review.reopen, ...review.open];
     if (due.length) {
       log(`review: would review ${Math.min(due.length, config.review.maxPerTick)} of ${due.length} PR(s) from outside the factory — ${due.map((p) => `#${p.number}${review.reopen.includes(p) ? ' (reopen)' : ''}`).join(' ')}. Prompt for #${due[0]!.number}:`);
-      console.log(`\n${reviewPrompt({ ...due[0]!, authorMayChangeGithub: mayMergeGithub(await collaboratorPermission(repoSlug(config), due[0]!.author.login)) }, '<principles.md>')}\n`);
+      console.log(`\n${reviewPrompt({ ...due[0]!, authorMayChangeGithub: mayMergeGithub(await collaboratorPermission(repoSlug(config), due[0]!.author.login)) }, '<principles.md>', loadVerification(config))}\n`);
     }
   }
 
@@ -1870,7 +1874,7 @@ async function runPipeline(
   const { config, state } = ctx;
   const startedAt = new Date().toISOString();
 
-  const handle = await worker.start(implementPrompt(task, agentCredentials(config).present), {
+  const handle = await worker.start(implementPrompt(task, agentCredentials(config).present, loadVerification(config)), {
     autoCreatePR: true,
     name: `factory: #${task.issueNumber} ${task.title}`.slice(0, 100),
   });

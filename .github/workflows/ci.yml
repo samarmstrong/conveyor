@@ -16,3 +16,25 @@ jobs:
           node-version: 24
       - run: npm ci
       - run: npm run check
+
+  # Deployments that install this engine as a package depend on the `release`
+  # branch, which is main's newest commit whose check passed: a red push to
+  # main never reaches them. Only ever fast-forwarded, so an older run that
+  # finishes late moves nothing back.
+  release:
+    needs: check
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: |
+          if git fetch -q origin release 2>/dev/null && ! git merge-base --is-ancestor FETCH_HEAD "$GITHUB_SHA"; then
+            echo "release is already past ${GITHUB_SHA:0:7}; left alone"
+            exit 0
+          fi
+          git push origin "$GITHUB_SHA:refs/heads/release"

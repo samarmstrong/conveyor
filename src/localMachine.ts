@@ -25,6 +25,7 @@
 
 import { execFile } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
@@ -97,8 +98,11 @@ const sq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
  */
 export function installBin(paths: MachinePaths, docker: string | null): void {
   for (const dir of [paths.bin, paths.waits, paths.sessions]) mkdirSync(dir, { recursive: true });
+  // The engine's own files, wherever it is installed; tsx is found the way Node
+  // finds it from here, since an installed engine's dependencies sit beside it
+  // and not under it.
   const factoryRoot = fileURLToPath(new URL('..', import.meta.url));
-  const tsx = resolve(factoryRoot, 'node_modules', 'tsx', 'dist', 'cli.mjs');
+  const tsx = createRequire(import.meta.url).resolve('tsx/cli');
   const write = (name: string, body: string) => {
     const file = resolve(paths.bin, name);
     writeFileSync(file, body);
